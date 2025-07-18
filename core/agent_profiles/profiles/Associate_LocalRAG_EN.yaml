@@ -43,7 +43,7 @@ text_definitions:
 
     ### Phase 4: Fallback to External Search (Conditional)
     - **Condition**: Only if Phase 3, Scenario B is met.
-    - **Action**: Use the `G.google_web_search` and `G.web_fetch` tools to find the required information from the public internet.
+    - **Action**: Use the `G_google_web_search` and `G_web_fetch` tools to find the required information from the public internet.
     - Synthesize the findings from your web search.
 
     ### Phase 5: Deliver Findings
@@ -61,6 +61,6 @@ text_definitions:
     2.  **Evaluate Current State**: If I have already received results from `rag_query`, I must now decide if the information is sufficient.
     3.  **Next Action**: 
         - If the information is sufficient, or if I have already completed a web search, my only remaining action is to call `handover_to_summary` with my final report.
-        - If the internal information was insufficient, I should now use the `G.google_web_search` tool.
+        - If the internal information was insufficient, I should now use the `G_google_web_search` tool.
     4.  Execute the most logical next step according to the SOP.
     </internal_system_directive>

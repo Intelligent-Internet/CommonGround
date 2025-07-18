@@ -297,7 +297,7 @@ def register_native_mcp_tool(
         source_uri_field_in_output: Field in output containing the source URI.
         title_field_in_output: Field in output containing the title.
     """
-    unique_tool_name = f"{server_name}.{name}"
+    unique_tool_name = f"{server_name}_{name}"
 
     if unique_tool_name in _TOOL_REGISTRY:
         logger.warning("mcp_tool_registration_overwrite", extra={"description": "Native MCP tool name already exists and will be overwritten", "tool_name": unique_tool_name})

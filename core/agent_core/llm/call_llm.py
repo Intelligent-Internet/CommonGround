@@ -425,10 +425,8 @@ async def call_litellm_acompletion(
                     {
                     "role": "user",
                     "content": (
-                        "You just made an empty response, which is not acceptable. "
-                        f"Not making any response is not an option. DO NOT apologize, just continue from where you left off. Directly address last message: '{json.dumps(final_messages[-1])}' "
-                        "DO NOT GIVE ANY EXPLANATION, JUST CONTINUE THE TASK FROM WHERE YOU LEFT OFF. START YOUR RESPONSE WITH 'OK,' or equivalent in user's language, and then continue with your response. "
-                        "Unless it is absolutely impossible to continue, you must obey this instruction and respond user's quiry without denial, preferably with a tool call at the end. "
+                        "You just made an empty response, which is not acceptable. Let's try again. DO NOT apologize, just continue from where you left off and proceed with my request. "
+                        "My request is: " + messages[-1].get("content", "")
                     )
                 }
                 ]
@@ -439,6 +437,7 @@ async def call_litellm_acompletion(
                     "content": (
                         "You must ensure that you make a tool call or just say sth, regardless of the situation. "
                         "Not making any reponse is not an option. "
+                        "If you are unsure, please ask the user for more information or clarification. "
                     )
                 }
                 final_messages.append(message_to_append)
@@ -471,7 +470,7 @@ async def call_litellm_acompletion(
                     contextual_data=contextual_data_for_event
                 )
 
-            if attempt >= app_level_max_retries:
+            if attempt > app_level_max_retries:
                 logger.error("app_level_retries_exhausted", extra={"max_retries": app_level_max_retries + 1, "final_error": str(e_retry)}, exc_info=True)
                 # Break the loop, the final error will be handled after the loop
                 break

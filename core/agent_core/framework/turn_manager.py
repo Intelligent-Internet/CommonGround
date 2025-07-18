@@ -171,6 +171,31 @@ class TurnManager:
                     logger.debug("tool_interaction_result_updated", extra={"turn_id": turn['turn_id'], "tool_call_id": tool_call_id, "status": ti['status']})
                     return # Found and updated, can exit
 
+    def record_failed_tool_interaction(self, context: Dict, tool_call: Dict, error_reason: str):
+        """Records a completed error interaction in the current Turn for an invalid or immediately failed tool call."""
+        state = context["state"]
+        team_state = context['refs']['team']
+        turn_id = state.get("current_turn_id")
+        current_turn = self._get_turn_by_id(team_state, turn_id)
+        if not current_turn:
+            logger.error("turn_not_found_for_failed_tool_interaction", extra={"turn_id": turn_id})
+            return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        failed_interaction: ToolInteraction = {
+            "tool_call_id": tool_call.get("id"),
+            "tool_name": tool_call.get("function", {}).get("name"),
+            "start_time": now_iso,
+            "end_time": now_iso,
+            "status": "error",
+            "input_params": {},
+            "result_payload": None,
+            "error_details": error_reason,
+        }
+        current_turn.setdefault("tool_interactions", []).append(failed_interaction)
+        logger.warning("failed_tool_interaction_recorded", extra={"turn_id": turn_id, "tool_name": failed_interaction['tool_name'], "reason": error_reason})
+
     def update_llm_interaction_end(self, context: Dict, llm_response: Dict):
         """Updates the final result of the LLM interaction for the current Turn."""
         state = context["state"]

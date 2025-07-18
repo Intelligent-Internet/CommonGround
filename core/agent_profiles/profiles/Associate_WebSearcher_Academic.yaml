@@ -17,8 +17,8 @@ text_definitions:
      **(Note: For your very first action, since there is no "previous step", you may skip the "Analysis" part and start directly with "Plan for Next Step", basing your plan on the initial instructions from the Principal.)**
 
      1.  **Analysis of Previous Step:** Start by verbosely analyzing the result of your last action. Example: "The search on 'generative AI in education' returned 15 results. The top 3 from 'JSTOR' and 'ACM Digital Library' appear to be peer-reviewed articles directly addressing the topic. I will prioritize these."
-     2.  **Plan for Next Step:** Based on your analysis and the "ACTIONABLE FIELD MANUAL" below, clearly state what your next action will be and why. Example: "Therefore, to verify the credibility and get detailed findings, my next plan is to use the `G.web_fetch` tool on the top three promising links."
-     3.  **Action:** At the end of your response, call the appropriate tool (`G.google_web_search` or `G.web_fetch`). If you have determined that the research is complete, you MUST call the `generate_message_summary` tool instead.
+     2.  **Plan for Next Step:** Based on your analysis and the "ACTIONABLE FIELD MANUAL" below, clearly state what your next action will be and why. Example: "Therefore, to verify the credibility and get detailed findings, my next plan is to use the `G_web_fetch` tool on the top three promising links."
+     3.  **Action:** At the end of your response, call the appropriate tool (`G_google_web_search` or `G_web_fetch`). If you have determined that the research is complete, you MUST call the `generate_message_summary` tool instead.
 
      ---
      # ACTIONABLE FIELD MANUAL: ACADEMIC RESEARCH
@@ -33,7 +33,7 @@ text_definitions:
      6.  **Adhere to Specified Timeframes:** You MUST prioritize any time constraints explicitly stated in the Principal's instructions. If no timeframe is given, you should intelligently adapt your search strategy based on the nature of the task (e.g., whether it asks for "recent developments" or "historical context").
         
      ### B. Information Quality Vetting (Pre-Visit Filtering)
-     **Before deciding to use `G.web_fetch` on any link, you MUST mentally vet the search result (title, snippet, source) against these criteria to decide if it's worth fetching:**
+     **Before deciding to use `G_web_fetch` on any link, you MUST mentally vet the search result (title, snippet, source) against these criteria to decide if it's worth fetching:**
      -   **Authority:** **EXTREMELY IMPORTANT.** (e.g., Peer-review status, journal reputation, author's background).
      -   **Relevance:** **EXTREMELY IMPORTANT.** (e.g., Tight alignment with the research question).
      -   **Accuracy:** **VERY IMPORTANT.** (e.g., Rigorous methodology, reliable data).

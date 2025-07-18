@@ -10,9 +10,21 @@ system_prompt_construction:
       order: 1
     - id: response_language
       type: static_text
-      content: "You must default your respond in English, unless user explicitly requests otherwise. Which means, even user original message is in Chinese, you should still respond in English unless user asks otherwise."
+      content: "Default the respond in English, unless user explicitly requests otherwise. Which means, even user original message is in Chinese, you should still respond in English unless user asks otherwise."
       order: 2
     - id: must_reply
       type: static_text
-      content: "You must reply to every user message, referably with a function call to a tool. If you don't know how to answer, you should ask the user for more information or clarification. Not responding is not an option. STRICTLY NO SILENCE."
+      content: "You must reply to every user message, referably with a function call to a tool. "
       order: 3
+    - id: tool_caller
+      type: static_text
+      content: |
+        In this environment you have access to a set of tools you can use to answer the user's question. 
+        You can use one or more tools per message, and will receive the result of that tool use in the user's response. 
+        You use tools step-by-step to accomplish a given task, with each tool use informed by the result of the previous tool use.
+      order: 4
+      
+    - id: bonus
+      type: static_text
+      content: "Now Begin! If you solve the task correctly, your team will receive a reward of $1,000,000, if you fail, you might got fired by your Managing Director."
+      order: 100

@@ -378,6 +378,28 @@ class AgentNode(AsyncNode):
             tool_arguments_str = tool_call_to_process.get("function", {}).get("arguments", "{}")
             tool_call_id = tool_call_to_process.get("id")
             
+            # Step 1: Validate if the tool exists
+            tool_info = get_tool_by_name(tool_name)
+            if not tool_info:
+                error_msg = f"LLM called an unregistered tool: '{tool_name}'."
+                logger.error("tool_not_registered", extra={"agent_id": self.agent_id, "tool_name": tool_name, "tool_call_id": tool_call_id}, exc_info=True)
+                
+                # Step 1a: Record this failed attempt in the Turn
+                if turn_manager:
+                    turn_manager.record_failed_tool_interaction(context, tool_call_to_process, error_msg)
+
+                # Step 1b: Send an error result to the agent's inbox so it knows it made a mistake
+                state.setdefault("inbox", []).append({
+                    "item_id": f"inbox_error_{uuid.uuid4().hex[:8]}",
+                    "source": "TOOL_RESULT",
+                    "payload": {"tool_name": tool_name, "tool_call_id": tool_call_id, "is_error": True, "content": error_msg},
+                    "consumption_policy": "consume_on_read",
+                    "metadata": {"created_at": datetime.now(timezone.utc).isoformat()}
+                })
+                state["current_action"] = None # Clear action
+                return # Return early
+            
+            # Normal flow: Only proceed to parse arguments and create a 'running' interaction if the tool is valid.
             try:
                 arguments = json_repair.loads(tool_arguments_str)
                 if not isinstance(arguments, dict):
@@ -385,7 +407,10 @@ class AgentNode(AsyncNode):
             except Exception as e:
                 error_msg = f"LLM provided invalid JSON arguments for tool '{tool_name}': {e}. Arguments string: '{tool_arguments_str}'"
                 logger.error("tool_arguments_invalid", extra={"agent_id": self.agent_id, "tool_name": tool_name, "tool_call_id": tool_call_id, "arguments_string": tool_arguments_str, "error_message": str(e)}, exc_info=True)
-                # Create an error inbox item
+                
+                if turn_manager:
+                    turn_manager.record_failed_tool_interaction(context, tool_call_to_process, error_msg)
+
                 state.setdefault("inbox", []).append({
                     "item_id": f"inbox_error_{uuid.uuid4().hex[:8]}",
                     "source": "TOOL_RESULT",
@@ -393,7 +418,7 @@ class AgentNode(AsyncNode):
                     "consumption_policy": "consume_on_read",
                     "metadata": {"created_at": datetime.now(timezone.utc).isoformat()}
                 })
-                state["current_action"] = None # Clear action
+                state["current_action"] = None
                 return
 
             if turn_manager:
@@ -401,20 +426,6 @@ class AgentNode(AsyncNode):
             else:
                 logger.error("turn_manager_not_found_for_tool_interaction", extra={"agent_id": self.agent_id, "tool_name": tool_name}, exc_info=True)
 
-            tool_info = get_tool_by_name(tool_name)
-            if not tool_info:
-                error_msg = f"LLM called an unregistered tool: '{tool_name}'."
-                logger.error("tool_not_registered", extra={"agent_id": self.agent_id, "tool_name": tool_name, "tool_call_id": tool_call_id}, exc_info=True)
-                state.setdefault("inbox", []).append({
-                    "item_id": f"inbox_error_{uuid.uuid4().hex[:8]}",
-                    "source": "TOOL_RESULT",
-                    "payload": {"tool_name": tool_name, "tool_call_id": tool_call_id, "is_error": True, "content": error_msg},
-                    "consumption_policy": "consume_on_read",
-                    "metadata": {"created_at": datetime.now(timezone.utc).isoformat()}
-                })
-                state["current_action"] = None # Clear action
-                return
-            
             state["current_action"] = {
                 "type": tool_name, "tool_name": tool_name, **arguments,
                 "implementation_type": tool_info.get("implementation_type", "internal"),
