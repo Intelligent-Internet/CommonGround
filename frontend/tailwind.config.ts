@@ -9,6 +9,15 @@ export default {
   ],
   theme: {
   	extend: {
+      animation: {
+        'blink': 'blink 1.4s infinite both',
+      },
+      keyframes: {
+        'blink': {
+          '0%, 100%': { opacity: '0.2' },
+          '50%': { opacity: '1' },
+        },
+      },
   		fontFamily: {
   			montserrat: [
   				'var(--font-montserrat)'

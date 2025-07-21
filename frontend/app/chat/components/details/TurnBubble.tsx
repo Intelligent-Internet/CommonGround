@@ -14,6 +14,7 @@ import {
 import { Code, Info } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip';
+import { ThinkingDots } from './ThinkingDots';
 
 interface ToolInteractionData {
   tool_name: string;
@@ -146,6 +147,7 @@ export const TurnBubble = observer(({ turn, isHighlighted = false, onNodeIdClick
             <AvatarFallback>{agentDisplayName.charAt(0)}</AvatarFallback>
           </Avatar>
           <span className="font-bold text-sm">{agentDisplayName}</span>
+          {turn.status === 'running' && <ThinkingDots className="text-gray-500" />}
           <span 
             className={`text-xs text-gray-400 ${handleNodeClick ? 'hover:underline cursor-pointer' : ''}`}
             onClick={handleNodeClick}
