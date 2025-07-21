@@ -74,7 +74,7 @@ def generic_message_ingestor(payload: Any, params: Dict, context: Dict) -> str:
 
 @register_ingestor("tool_result_ingestor")
 def tool_result_ingestor(payload: Any, params: Dict, context: Dict) -> str:
-    """(Fixed in V5) Intelligently formats tool results."""
+    """Intelligently formats tool results, prioritizing Markdown over JSON when appropriate."""
     if not isinstance(payload, dict):
         return str(payload)
 
@@ -82,34 +82,34 @@ def tool_result_ingestor(payload: Any, params: Dict, context: Dict) -> str:
     content = payload.get("content", {})
     is_error = payload.get("is_error", False)
 
-    # If content is a string, it means it has been dehydrated into a token.
-    # The ingestor's responsibility is to return this token directly for later hydration logic to handle.
-    if isinstance(content, str):
+    # If it's a dehydrated token, return it directly
+    if isinstance(content, str) and content.startswith("<#CGKB-"):
         return content
     
-    # Enhanced generic error handling: if is_error is true, serialize the entire payload to JSON.
-    # This ensures that all error context (including instruction_for_llm provided by MCPProxyNode) is passed.
+    # For errors, use JSON to preserve full context with clear wrapping tags
     if is_error:
-        # Format the entire payload (including tool_name, content, is_error, etc.) to give the LLM the most complete error context.
         error_report = {
             "tool_execution_failed": True,
             "tool_name": tool_name,
-            "error_payload": content # content is now the structured error payload
+            "error_details": content
         }
-        return json.dumps(error_report, indent=2, ensure_ascii=False)
+        return f"<tool_error_report>\n{json.dumps(error_report, indent=2, ensure_ascii=False)}\n</tool_error_report>"
 
-    # --- Special handling logic for success cases remains unchanged ---
+    # Special handling for dispatch_submodules
     if tool_name == "dispatch_submodules":
         return dispatch_result_ingestor(payload, params, context)
 
-    # --- Default handling logic remains unchanged ---
-    if isinstance(content, (dict, list)):
-        if "main_content_for_llm" in content:
-            main_content = content["main_content_for_llm"]
-            return json.dumps(main_content, indent=2, ensure_ascii=False)
-        return json.dumps(content, indent=2, ensure_ascii=False)
+    # Prioritize "main_content_for_llm" if specified in content
+    if isinstance(content, dict) and "main_content_for_llm" in content:
+        main_content = content["main_content_for_llm"]
+        return "\n".join(_recursive_markdown_formatter(main_content, {}, level=0))
 
-    return str(content)
+    # (Rule 5: (New) Add an escape hatch if the tool really needs to return raw JSON)
+    if isinstance(content, dict) and "_raw_json" in content:
+        return json.dumps(content["_raw_json"], indent=2, ensure_ascii=False)
+
+    # Default behavior - use Markdown formatter
+    return "\n".join(_recursive_markdown_formatter(content, {}, level=0))
 
 @register_ingestor("markdown_formatter_ingestor")
 def markdown_formatter_ingestor(payload: Any, params: Dict, context: Dict) -> str:
@@ -134,78 +134,54 @@ def markdown_formatter_ingestor(payload: Any, params: Dict, context: Dict) -> st
 
 @register_ingestor("work_modules_ingestor")
 def work_modules_ingestor(payload: Any, params: Dict, context: Dict) -> str:
-    """Formats the work_modules dictionary into a Markdown string."""
+    """Formats work_modules dictionary as Markdown using the generic formatter."""
     if not isinstance(payload, dict):
         return "Work modules data is not in the expected format (dictionary)."
     
     lines = [params.get("title", "### Current Work Modules Status")]
     if not payload:
         lines.append("No work modules are currently defined.")
-        return "\n".join(lines)
-
-    for module_id, module_data in payload.items():
-        module_name = module_data.get('name', 'Unnamed Module')
-        module_status = module_data.get('status', 'unknown')
-        module_desc = module_data.get('description', 'No description provided.')
-        lines.append(f"- **{module_name}** (ID: `{module_id}`, Status: `{module_status}`)")
-        lines.append(f"  - **Description**: {module_desc}")
+    else:
+        # Use the formatter to handle the entire dictionary
+        formatted_modules = _recursive_markdown_formatter(payload, {}, level=0)
+        lines.extend(formatted_modules)
+        
     return "\n".join(lines)
 
 @register_ingestor("available_associates_ingestor")
 def available_associates_ingestor(payload: Any, params: Dict, context: Dict) -> str:
-    """
-    (Fixed) Formats a list of Associate Profile instance IDs into a Markdown string.
-    """
-    # payload is now a list of instance IDs
+    """Formats available Associate list as Markdown with separated data preparation and presentation logic."""
     profile_instance_ids = payload
     if not isinstance(profile_instance_ids, list):
-        return "Available associates list (instance IDs) is not in the expected format (list)."
+        return "Available associates list is not in the expected format (list)."
 
-    # Safely get the profile store from the context
     agent_profiles_store = context.get('refs', {}).get('run', {}).get('config', {}).get('agent_profiles_store')
     if not agent_profiles_store:
-        logger.error("available_associates_ingestor: 'agent_profiles_store' not found in context.")
+        logger.error("available_associates_ingestor: 'agent_profiles_store' not found.")
         return "Error: Profile store not available."
 
-    lines = [params.get("title", "### Available Associate Agent Profiles for Team Configuration")]
-    
-    associate_profiles_found = []
+    # Step 1: Prepare a clean, structured list of Python objects
+    profiles_for_llm = []
     for instance_id in profile_instance_ids:
-        # Use the ID to parse the complete profile dictionary from the store
         profile_dict = get_profile_by_instance_id(agent_profiles_store, instance_id)
-        
-        if not profile_dict or profile_dict.get("is_deleted") or not profile_dict.get("is_active"):
+        if not profile_dict or profile_dict.get("is_deleted") or not profile_dict.get("is_active") or profile_dict.get("type") != "associate":
             continue
         
-        # Only include profiles of type "associate"
-        if profile_dict.get("type") != "associate":
-            continue
-        
-        associate_profiles_found.append(profile_dict)
+        profiles_for_llm.append({
+            "profile_name": profile_dict.get('name', 'Unknown'),
+            "description": profile_dict.get('description_for_human', 'No description.'),
+            "key_toolsets": profile_dict.get("tool_access_policy", {}).get("allowed_toolsets", [])
+        })
 
-    if not associate_profiles_found:
+    # Step 2: Hand the prepared data to the formatter for presentation
+    lines = [params.get("title", "### Available Associate Agent Profiles")]
+    if not profiles_for_llm:
         lines.append("No 'associate' type profiles are currently available.")
-        return "\n".join(lines)
-
-    # Sort by name for stable output
-    sorted_profiles = sorted(associate_profiles_found, key=lambda p: p.get('name', ''))
-
-    for profile in sorted_profiles:
-        profile_name = profile.get('name', 'UnknownProfileName')
-        description = profile.get('description_for_human', 'No description available.')
+    else:
+        sorted_profiles = sorted(profiles_for_llm, key=lambda p: p.get('profile_name', ''))
+        formatted_profiles = _recursive_markdown_formatter(sorted_profiles, {}, level=0)
+        lines.extend(formatted_profiles)
         
-        lines.append(f"\n#### Profile Name: `{profile_name}`")
-        lines.append(f"   Description: {description}")
-        
-        # Minor fix: get the toolset from the correct top-level key "tool_access_policy"
-        profile_tap = profile.get("tool_access_policy", {})
-        toolsets = profile_tap.get("allowed_toolsets", [])
-
-        if toolsets:
-            lines.append(f"   **Key Toolsets**: {', '.join(f'`{ts}`' for ts in toolsets)}")
-        else:
-            lines.append(f"   **Key Toolsets**: None specified.")
-            
     return "\n".join(lines)
 
 @register_ingestor("principal_history_summary_ingestor")
@@ -247,9 +223,7 @@ def principal_history_summary_ingestor(payload: Any, params: Dict, context: Dict
 
 @register_ingestor("json_history_ingestor")
 def json_history_ingestor(payload: Any, params: Dict, context: Dict) -> str:
-    """
-    (Restored) Serializes the message history list into a JSON string and wraps it with tags.
-    """
+    """Serializes the message history list into a JSON string and wraps it with tags."""
     if not isinstance(payload, list):
         logger.warning("json_history_ingestor_expected_list", extra={"payload_type": type(payload).__name__})
         return "[Error: Message history for JSON ingestion was not a list.]"
@@ -263,9 +237,7 @@ def json_history_ingestor(payload: Any, params: Dict, context: Dict) -> str:
 
 @register_ingestor("tagged_content_ingestor")
 def tagged_content_ingestor(payload: Any, params: Dict, context: Dict) -> str:
-    """
-    (Restored) Wraps the payload content with specified XML tags.
-    """
+    """Wraps the payload content with specified XML tags."""
     wrapper_tags = params.get("wrapper_tags")
     content = str(payload)
     
@@ -277,16 +249,14 @@ def tagged_content_ingestor(payload: Any, params: Dict, context: Dict) -> str:
 
 @register_ingestor("observer_failure_ingestor")
 def observer_failure_ingestor(payload: Any, params: Dict, context: Dict) -> str:
-    """
-    (New) Formats Observer failure events for injection into the LLM context.
-    """
+    """Formats Observer failure events for injection into the LLM context."""
     if not isinstance(payload, dict):
         return "[Error: Observer failure payload was malformed.]"
 
     failed_observer_id = payload.get("failed_observer_id", "unknown_observer")
     error_message = payload.get("error_message", "unknown_error")
 
-    # Consistent with the error format above, but from a different source
+    # Consistent with the error format above
     return (
         f"<system_error context_source='internal_observer'>\n"
         f"  <error_details>\n"
@@ -304,16 +274,13 @@ def observer_failure_ingestor(payload: Any, params: Dict, context: Dict) -> str:
 
 @register_ingestor("dispatch_result_ingestor")
 def dispatch_result_ingestor(payload: Any, params: Dict, context: Dict) -> str:
-    """
-    Formats the result of the 'dispatch_submodules' tool into a detailed report containing the complete work record.
-    This is a core part of high-fidelity context passing, allowing the Principal to see the Associate's full work process.
-    """
+    """Formats 'dispatch_submodules' results into detailed, human and LLM-readable Markdown reports."""
     if not isinstance(payload, dict) or "content" not in payload:
         return "[Error: Dispatch result format is invalid or content is missing]"
     
     content = payload.get("content", {})
     
-    # 1. Overall operation summary (unchanged)
+    # Overall operation summary
     overall_status = content.get('status', 'UNKNOWN')
     message = content.get('message', 'No message.')
     summary_parts = [
@@ -322,16 +289,14 @@ def dispatch_result_ingestor(payload: Any, params: Dict, context: Dict) -> str:
         f"- **Details**: {message}"
     ]
     
-    # 2. Failed preparation tasks (unchanged)
+    # Failed preparation tasks
     failed_prep = content.get("failed_preparation_details", [])
     if failed_prep:
         summary_parts.append("\n**Assignments Failed Before Execution:**")
-        for failure in failed_prep:
-            module_id = failure.get('input', {}).get('module_id_to_assign', 'N/A')
-            reason = failure.get('reason', 'Unknown reason.')
-            summary_parts.append(f"- **Module `{module_id}`**: Failed pre-check. Reason: {reason}")
-    
-    # 3. Detailed work records of executed modules (refactored part)
+        # Use the formatter to show failure details
+        summary_parts.extend(_recursive_markdown_formatter(failed_prep, {}, level=0))
+
+    # Detailed work records of executed modules
     exec_results = content.get("assignment_execution_results", [])
     if exec_results:
         summary_parts.append("\n**Executed Modules - Detailed Work Records:**")
@@ -341,35 +306,23 @@ def dispatch_result_ingestor(payload: Any, params: Dict, context: Dict) -> str:
             
             summary_parts.append(f"\n--- Start of Record for Module `{module_id}` (Status: `{exec_status}`) ---")
             
-            # 3.1. Display final deliverables (if they exist)
+            # Display final deliverables
             deliverables = result.get('deliverables', {})
-            if deliverables and deliverables.get("primary_summary"):
-                summary_parts.append("#### Final Deliverable (Summary from Associate):")
-                # Use a json code block to preserve the structure
-                summary_parts.append(f"```json\n{json.dumps(deliverables, indent=2, ensure_ascii=False)}\n```")
-            else:
-                summary_parts.append("#### Final Deliverable: None provided.")
+            summary_parts.append("#### Final Deliverable (from Associate):")
+            summary_parts.extend(_recursive_markdown_formatter(deliverables, {}, level=0))
 
-            # 3.2. Display the full net-added message history
+            # Display the full net-added message history
             new_messages = result.get('new_messages_from_associate', [])
             if new_messages:
                 summary_parts.append("\n#### Full Work Log from Associate:")
                 for msg in new_messages:
                     role = msg.get("role", "unknown").upper()
                     msg_content = str(msg.get("content", "[No Content]")).strip()
-                    
-                    # Special formatting for Tool Calls
                     tool_calls = msg.get("tool_calls")
+                    
                     if tool_calls:
                         summary_parts.append(f"**[{role} -> TOOL_CALL]**:")
-                        try:
-                            # Try to pretty-print JSON, fallback to string conversion on failure
-                            tools_str = json.dumps(tool_calls, indent=2, ensure_ascii=False)
-                            summary_parts.append(f"```json\n{tools_str}\n```")
-                        except TypeError:
-                             summary_parts.append(f"```\n{str(tool_calls)}\n```")
-                    
-                    # Formatting for regular content
+                        summary_parts.extend(_recursive_markdown_formatter(tool_calls, {}, level=1))
                     elif msg_content:
                        summary_parts.append(f"**[{role}]**: {msg_content}")
             
@@ -379,23 +332,20 @@ def dispatch_result_ingestor(payload: Any, params: Dict, context: Dict) -> str:
 
 @register_ingestor("user_prompt_ingestor")
 def user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -> str:
-    """
-    A simple ingestor to extract the user prompt from the payload.
-    """
+    """A simple ingestor to extract the user prompt from the payload."""
     if isinstance(payload, dict):
         return payload.get("prompt", "")
     return str(payload)
 
 def _recursive_markdown_formatter(data: Any, schema: Dict, level: int = 0) -> List[str]:
     """
-    Intelligently formats data recursively.
-    If a detailed schema is provided, it renders according to the schema.
-    Otherwise, it intelligently renders based on the data's own type (dict, list, primitive).
+    Intelligently formats data recursively into LLM-friendly Markdown.
+    Prioritizes schema-based rendering with graceful handling of empty structures.
     """
     lines = []
     indent = "  " * level
 
-    # Prioritize rendering using the detailed schema
+    # Prioritize rendering using schema
     if schema.get("type") == "object" and "properties" in schema and isinstance(data, dict):
         for prop_name, prop_schema in schema.get("properties", {}).items():
             if prop_name in data:
@@ -406,36 +356,37 @@ def _recursive_markdown_formatter(data: Any, schema: Dict, level: int = 0) -> Li
                 lines.extend(sub_lines)
         return lines
     
-    # Fallback logic for when no detailed schema is available
+    # Smart fallback logic when no detailed schema is available
     if isinstance(data, dict):
-        # Intelligently render dictionaries
-        for key, value in sorted(data.items()): # Sort by key to ensure stable output
+        if not data:
+            lines.append(f"{indent}  (empty)")
+            return lines
+        for key, value in sorted(data.items()):
             title = str(key).replace('_', ' ').title()
             lines.append(f"{indent}* **{title}:**")
-            # Pass an empty schema for the value to continue using intelligent rendering
             sub_lines = _recursive_markdown_formatter(value, {}, level + 1)
             lines.extend(sub_lines)
     elif isinstance(data, list):
-        # Intelligently render lists
+        if not data:
+            lines.append(f"{indent}  (empty)")
+            return lines
         for item in data:
-            # List items themselves do not add indentation; their content (like dicts) determines it
+            # List items themselves don't add indent
             sub_lines = _recursive_markdown_formatter(item, schema.get("items", {}), level)
             lines.extend(sub_lines)
     elif isinstance(data, str):
-        # Render strings
+        # Handle multi-line strings correctly
         for line in data.strip().split('\n'):
             lines.append(f"{indent}  {line}")
     else:
-        # Render other primitive types
+        # Handle other primitive types
         lines.append(f"{indent}  {str(data)}")
         
     return lines
 
 @register_ingestor("protocol_aware_ingestor")
 def protocol_aware_ingestor(payload: Any, params: Dict, context: Dict) -> str:
-    """
-    Renders a payload generated by HandoverService using its accompanying schema.
-    """
+    """Renders a payload generated by HandoverService using its accompanying schema."""
     if not isinstance(payload, dict) or "data" not in payload or "schema_for_rendering" not in payload:
         logger.warning("protocol_aware_ingestor_invalid_payload", extra={"payload": payload})
         return "[Error: Malformed handover payload]"
