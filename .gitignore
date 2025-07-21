@@ -1,4 +1,9 @@
 .aider*
-.venv
+.venv/
 .env
+.vscode/
 __pycache__/
+frontend/env.local
+frontend/node_modules/
+
+repomix-*
