@@ -1,0 +1,57 @@
+# version: "3.9"
+
+services:
+  bridge:
+    build:
+      context: ./gemini-cli-mcp-openai-bridge
+      dockerfile: Dockerfile
+    image: intelligentinternet/gemini-cli-mcp-openai-bridge
+    working_dir: /app/gemini-cli/packages/bridge-server
+    command: ["npm", "run", "start", "--", "--host", "0.0.0.0", "--resolve-redirects"]
+    ports:
+      - "8765:8765"
+    environment:
+      # Uncomment and set the following environment variables if you prefer to use API key authentication
+      # instead of OAuth authentication. These variables should be set in the bridge service.
+      # - GEMINI_API_KEY=your_gemini_api_key_here
+      
+      # IMPORTANT: If you encounter "GOOGLE_CLOUD_PROJECT env var" error during login,
+      # you MUST uncomment and set this variable with your Google Cloud Project ID
+      # - GOOGLE_CLOUD_PROJECT=your_google_cloud_project_id_here
+      
+      # Additional Vertex AI configuration (optional)
+      # - VERTEXAI_PROJECT=your_vertex_ai_project_id_here
+      # - VERTEXAI_LOCATION=global
+      
+      # OAuth callback configuration (required for OAuth authentication)
+      - OAUTH_CALLBACK_PORT=8766
+      - OAUTH_CALLBACK_HOST=0.0.0.0
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    healthcheck:
+      test: ["CMD", "node", "-e", "const net = require('net'); const client = net.createConnection({port: 8765}, () => {console.log('OK'); client.end(); process.exit(0);}); client.on('error', () => process.exit(1)); setTimeout(() => process.exit(1), 5000);"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+
+  core:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: intelligentinternet/common_ground_core
+    depends_on:
+      bridge:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./projects:/app/projects
+      - ./mcp.json:/app/mcp.json
+      - ../core/agent_profiles/llm_configs:/app/agent_profiles/llm_configs
+      - ../core/agent_profiles/profiles:/app/agent_profiles/profiles
+    environment:
+      - GEMINI_BRIDGE_URL=http://bridge:8765/v1 # Disable this if you are not using Gemini CLI as provider
+      # - JINA_KEY=<your_jina_key> # Uncomment and set your Jina key if you want to use Jina for web search and visit. Don't forget to change the tool settings in `core/agent_profiles/profiles/Base_Associate_EN.yaml`
+    restart: unless-stopped

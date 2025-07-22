@@ -97,6 +97,27 @@ This is the easiest way to get the full system running, including the pre-config
     * If you prefer to use other authentication methods other than automatic OAuth, installing and configuring the `gemini-cli` tool on your host machine is recommended. You can then point the `gemini-cli-bridge` to your local `.gemini` directory, and comment out the `login` service in the `docker-compose.yaml` file.
       * Don't forget to set environment variables in the `bridge` service section of `docker-compose.yaml` if you want to use API key authentication instead of OAuth.
     * You can safely quit the Gemini CLI after logging in, as the credentials are saved in the `.gemini` directory.
+
+    **Alternative: Using API Key Authentication**
+    
+    If you prefer to use a Gemini API key instead of OAuth authentication, you can skip the login step entirely:
+    
+    1. Set your Gemini API key as an environment variable:
+       ```bash
+       export GEMINI_API_KEY=your_gemini_api_key_here
+       ```
+       Or on Windows PowerShell:
+       ```powershell
+       $env:GEMINI_API_KEY = "your_gemini_api_key_here"
+       ```
+    
+    2. Use the API key configuration file to start the services:
+       ```bash
+       docker compose -f ./docker-compose.api-key.yaml up
+       ```
+    
+    This approach bypasses the OAuth flow and directly uses your API key for authentication with Google's Gemini service.
+
 5.  **Start All Services**:
     This command builds the images (if they don't exist) and starts all services.
     ```bash
