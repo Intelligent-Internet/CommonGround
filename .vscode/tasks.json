@@ -1,0 +1,206 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "source-envrc",
+            "type": "shell",
+            "command": "bash",
+            "args": ["-c", "source ${workspaceFolder}/.envrc && env > ${workspaceFolder}/.env_vars.tmp"],
+            "presentation": {
+                "reveal": "silent",
+                "close": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Ensure Environment Files",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "cd ${workspaceFolder}/core && [ ! -f .env ] && cp env.sample .env || echo 'Backend .env exists'; cd ${workspaceFolder}/frontend && [ ! -f .env.example ] && echo 'Frontend .env.example not found' || ([ ! -f .env.local ] && cp .env.example .env.local || echo 'Frontend .env.local exists')"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "silent",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Install Backend Dependencies",
+            "type": "shell",
+            "command": "uv",
+            "args": ["sync"],
+            "options": {
+                "cwd": "${workspaceFolder}/core"
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Initialize Backend Environment (uv)",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "echo 'Initializing uv environment...' && uv venv && echo 'Virtual environment created' && uv sync && echo 'Dependencies installed'"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/core"
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Install Frontend Dependencies", 
+            "type": "shell",
+            "command": "npm",
+            "args": ["install"],
+            "options": {
+                "cwd": "${workspaceFolder}/frontend"
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Initialize Frontend Environment (npm)",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "echo 'Initializing frontend environment...' && npm install && echo 'Frontend dependencies installed'"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/frontend"
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Install Bridge Dependencies",
+            "type": "shell",
+            "command": "npm",
+            "args": ["run", "prepare"],
+            "options": {
+                "cwd": "${workspaceFolder}/deployment/gemini-cli-mcp-openai-bridge"
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Clean Backend Environment",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "echo 'Cleaning backend environment...' && rm -rf .venv && echo 'Virtual environment removed'"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/core"
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Clean Frontend Environment",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "echo 'Cleaning frontend environment...' && rm -rf node_modules package-lock.json && echo 'Frontend cleaned'"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/frontend"
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Rebuild Backend Environment",
+            "dependsOn": [
+                "Clean Backend Environment",
+                "Initialize Backend Environment (uv)"
+            ],
+            "dependsOrder": "sequence",
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "Rebuild Frontend Environment",
+            "dependsOn": [
+                "Clean Frontend Environment",
+                "Initialize Frontend Environment (npm)"
+            ],
+            "dependsOrder": "sequence",
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "Setup Development Environment",
+            "dependsOn": [
+                "Ensure Environment Files",
+                "Install Backend Dependencies",
+                "Install Frontend Dependencies",
+                "Install Bridge Dependencies"
+            ],
+            "dependsOrder": "sequence"
+        }
+    ]
+} 

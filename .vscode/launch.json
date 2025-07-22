@@ -1,0 +1,87 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Backend: Python Server (core)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/core/run_server.py",
+            "args": ["--host", "127.0.0.1", "--port", "8000", "--reload", "--log-level", "INFO"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/core",
+            "python": "${workspaceFolder}/core/.venv/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/core${pathSeparator}${env:PYTHONPATH}",
+            },
+            "justMyCode": true,
+            "envFile": "${workspaceFolder}/core/.env"
+        },
+        {
+            "name": "Backend: Python Server (via uv run)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "uvicorn",
+            "args": ["api.server:app", "--host", "127.0.0.1", "--port", "8000", "--reload", "--log-level", "info"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/core",
+            "python": "${workspaceFolder}/core/.venv/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/core${pathSeparator}${env:PYTHONPATH}",
+            },
+            "justMyCode": true,
+            "envFile": "${workspaceFolder}/core/.env"
+        },
+        {
+            "name": "Frontend: Next.js Dev Server",
+            "type": "node",
+            "request": "launch",
+            "runtimeExecutable": "npm",
+            "runtimeArgs": ["run", "dev"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/frontend",
+            "env": {
+                "NODE_ENV": "development"
+            },
+            "envFile": "${workspaceFolder}/frontend/.env.local",
+            "skipFiles": ["<node_internals>/**"]
+        },
+        {
+            "name": "Bridge: Gemini CLI MCP/OpenAI Bridge",
+            "type": "node",
+            "request": "launch",
+            "runtimeExecutable": "npm",
+            "runtimeArgs": ["run", "start", "--", "--mode=edit", "--port=8765", "--debug"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/deployment/gemini-cli-mcp-openai-bridge",
+            "env": {
+                "NODE_ENV": "development"
+            },
+            "skipFiles": ["<node_internals>/**"]
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Start Full Stack (Backend + Frontend)",
+            "configurations": [
+                "Backend: Python Server (core)",
+                "Frontend: Next.js Dev Server"
+            ],
+            "stopAll": true,
+            "preLaunchTask": "Ensure Environment Files"
+        },
+        {
+            "name": "Start Complete System (Backend + Frontend + Bridge)",
+            "configurations": [
+                "Backend: Python Server (core)",
+                "Frontend: Next.js Dev Server",
+                "Bridge: Gemini CLI MCP/OpenAI Bridge"
+            ],
+            "stopAll": true,
+            "preLaunchTask": "Ensure Environment Files"
+        }
+    ]
+}
