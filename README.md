@@ -183,6 +183,29 @@ graph TD
 ```
 For a deeper dive into the architecture, please see our [architecture documentation](./docs/architecture.md), and framework documents in the `docs/` directory.
 
+## 📈 Changelog
+
+### Recent Updates (July 2025)
+
+#### v0.1.1 - Tool Calling Improvements and UI Enhancements
+*Released: July 22, 2025*
+
+**🛠️ Tool System Enhancements**
+- **Refactored Ingestor System**: Implemented a new recursive Markdown formatter for better content presentation to LLMs
+- **Robust Tool Calling**: Significantly improved tool execution reliability and error handling
+- **Updated Tool Naming**: Changed tool name separator from dot to underscore for consistency <- This fixes issues with Gemini-CLI tool calls
+- **Better Error Recovery**: Enhanced retry mechanisms and failure handling for tool operations
+- **Improved Agent Prompts**: Refined system prompts for better agent performance and clearer instructions
+
+**🎨 Frontend Enhancements**
+- **New Thinking Indicator**: Added visual "thinking" dots to chat bubbles when agents are processing, providing real-time feedback on system activity
+- **Improved User Feedback**: Better visual cues for running agent turns to enhance user experience
+
+**🔧 Miscellaneous**
+- **Documentation Updates**: Improved clarity and detail in Gemini-CLI API key setup instructions
+
+#### v0.1.0 - Initial Release
+
 ## 🧑‍💻 Contributing
 
 We welcome contributions! Please read our [**Contribution Guide**](./CONTRIBUTING.md) and check out the detailed guides in the `docs/` directory to get started.
