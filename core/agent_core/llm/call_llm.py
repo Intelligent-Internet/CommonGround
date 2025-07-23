@@ -52,7 +52,8 @@ def robust_retry_with_backoff(
                     Timeout,
                     APIConnectionError,
                     ServiceUnavailableError,
-                    InternalServerError
+                    InternalServerError, 
+                    APIError
                 ) as e:
                     last_exception = e
                     if attempt >= max_retries:
@@ -66,7 +67,7 @@ def robust_retry_with_backoff(
                     logger.warning("llm_recoverable_error_retry", extra={"error_type": type(e).__name__, "error_message": str(e), "attempt": attempt + 1, "max_attempts": max_retries + 1, "wait_time": wait_time})
                     await asyncio.sleep(wait_time)
                     delay *= backoff_factor
-                except (AuthenticationError, BadRequestError, ContextWindowExceededError, APIError) as e:
+                except (AuthenticationError, BadRequestError, ContextWindowExceededError) as e:
                     # For unrecoverable errors, fail and raise immediately
                     logger.error("llm_unrecoverable_error", extra={"error_type": type(e).__name__, "error_message": str(e)}, exc_info=True)
                     raise e
