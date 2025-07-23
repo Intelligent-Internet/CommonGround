@@ -85,6 +85,27 @@ class LaunchPrincipalExecutionTool(AsyncNode):
         current_action = partner_context.get("state", {}).get("current_action", {})
 
         iteration_mode = prep_res["iteration_mode"]
+
+        # --- START: Pre-launch check for an actionable plan ---
+        # In 'start_fresh' mode, ensure that there is a plan with pending tasks before launching the Principal.
+        if iteration_mode == "start_fresh":
+            work_modules = team_state_global.get("work_modules", {})
+            # Define what constitutes a "non-completed" status that requires action.
+            non_completed_statuses = {"pending", "pending_review", "in_progress", "ongoing"}
+            
+            # Check if there is at least one module in a non-completed state.
+            has_uncompleted_modules = any(
+                module.get("status") in non_completed_statuses for module in work_modules.values()
+            )
+
+            # If the plan is empty or contains no actionable tasks, prevent launch and guide the Partner.
+            if not work_modules or not has_uncompleted_modules:
+                logger.warning("launch_principal_prevented_empty_plan", extra={"run_id": run_context_global['meta'].get("run_id")})
+                return {
+                    "status": "ignored_empty_plan",
+                    "message": "The project plan (Work Modules) is empty or contains no pending tasks. You MUST call the 'manage_work_modules' tool first to create a plan before launching the Principal."
+                }
+        # --- END: Pre-launch check for an actionable plan ---
         force_terminate_and_relaunch = prep_res.get("force_terminate_and_relaunch", False)
         principal_sub_context_obj = None
         run_id_for_log = run_context_global['meta'].get("run_id", "UNKNOWN_RUN_ID")
