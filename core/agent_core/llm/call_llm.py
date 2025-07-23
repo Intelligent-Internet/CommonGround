@@ -284,8 +284,19 @@ class LLMResponseAggregator:
             "actual_usage": self.actual_usage # <--- Add to the return value
         }
 
-# Apply the new decorator
+
+# <--- NEW: Core function responsible only for network calls ---
 @robust_retry_with_backoff(max_retries=2, initial_delay=5, max_delay=60)
+async def _invoke_litellm_stream(params_for_litellm: Dict[str, Any]) -> Any:
+    """
+    Core function to invoke litellm.acompletion.
+    This function is decorated for network-level retries and contains no application logic.
+    """
+    logger.debug("invoking_litellm_stream", extra={"model": params_for_litellm.get("model")})
+    return await litellm.acompletion(**params_for_litellm)
+
+
+# <--- REFACTORED: call_litellm_acompletion is now the "orchestrator" ---
 async def call_litellm_acompletion(
     messages: List[Dict[str, Any]],
     llm_config: Dict[str, Any],
@@ -298,17 +309,17 @@ async def call_litellm_acompletion(
     agent_id_for_event: Optional[str] = None,
     run_id_for_event: Optional[str] = None,
     contextual_data_for_event: Optional[Dict] = None,
-    run_context: Optional[Dict] = None, # <--- Added run_context parameter
+    run_context: Optional[Dict] = None,
     **kwargs
 ) -> Dict[str, Any]:
-    
-    # ==================== START OF REFACTOR ====================
-    # 1. Introduce application-level retry loop
-    app_level_max_retries = llm_config.get("max_retries", 2) # Get retry count from config
+    """
+    Orchestrates the LLM call, handling application-level logic like retrying on empty responses.
+    It delegates the actual network call to a decorated helper function.
+    """
+    app_level_max_retries = llm_config.get("max_retries", 2)
     last_app_level_exception = None
     
     final_messages = list(messages)
-    # Only process system_prompt_content on the first attempt
     if system_prompt_content:
         if final_messages and final_messages[0].get("role") == "system":
             final_messages[0]["content"] = system_prompt_content
@@ -316,7 +327,6 @@ async def call_litellm_acompletion(
             final_messages.insert(0, {"role": "system", "content": system_prompt_content})
 
     for attempt in range(app_level_max_retries + 1):
-        # Move stream_id generation inside the loop to ensure a new ID for each retry
         current_stream_id = stream_id or str(uuid.uuid4())
         
         try:
@@ -324,23 +334,15 @@ async def call_litellm_acompletion(
             if not model_name:
                 raise ValueError("The 'model' key is missing in the provided llm_config.")
 
-            base_params = {
-                **llm_config,
-                "messages": final_messages,
-                "stream": True,
-                **kwargs
-            }
-            
+            base_params = {**llm_config, "messages": final_messages, "stream": True, **kwargs}
             if api_tools_list:
                 base_params["tools"] = api_tools_list
                 if tool_choice:
                     base_params["tool_choice"] = tool_choice
-            
             if stream:
                 base_params.setdefault("stream_options", {})["include_usage"] = True
-
-            base_params = {k: v for k, v in base_params.items() if v is not None}
             
+            base_params = {k: v for k, v in base_params.items() if v is not None}
             params_for_this_attempt = {**base_params, "stream_id": current_stream_id}
 
             if events and agent_id_for_event and run_id_for_event:
@@ -360,6 +362,9 @@ async def call_litellm_acompletion(
             FILTERED_KEYS = ["stream_id", "parent_agent_id", "wait_seconds_on_retry", "max_retries"]
             params_for_litellm = {k: v for k, v in params_for_this_attempt.items() if k not in FILTERED_KEYS}
             
+            # Call the core network function
+            llm_response_stream = await _invoke_litellm_stream(params_for_litellm)
+            
             response_aggregator = LLMResponseAggregator(
                 agent_id=agent_id_for_event,
                 parent_agent_id=kwargs.get('parent_agent_id'),
@@ -372,23 +377,16 @@ async def call_litellm_acompletion(
                 dispatch_id_for_event=contextual_data_for_event.get("dispatch_id") if contextual_data_for_event else None
             )
 
-            llm_response_stream = await litellm.acompletion(**params_for_litellm)
-            
             async for chunk in llm_response_stream:
                 await response_aggregator.process_chunk(chunk)
 
             aggregated_response = response_aggregator.get_aggregated_response(messages_for_llm=final_messages)
-
-            content = aggregated_response.get("content", "").strip()
-            tool_calls = aggregated_response.get("tool_calls", [])
-            reasoning = aggregated_response.get("reasoning", "").strip()
             
-            if not content and not tool_calls:
+            if not aggregated_response.get("content", "").strip() and not aggregated_response.get("tool_calls", []):
                 raise FunctionCallErrorException("Received completely empty response from LLM, forcing retry.")
 
             aggregated_response['final_stream_id'] = current_stream_id
             
-            # ... (token usage stats logic as before) ...
             if run_context:
                 stats = run_context['runtime']['token_usage_stats']
                 usage = aggregated_response.get("actual_usage")
@@ -413,10 +411,10 @@ async def call_litellm_acompletion(
                     stream_id=current_stream_id, contextual_data=contextual_data_for_event
                 )
 
-            # Success, return the result directly and break the loop
             return aggregated_response
 
         except FunctionCallErrorException as e_retry:
+            # Handle application-level retry
             last_app_level_exception = e_retry
             logger.warning("app_level_retry_triggered", extra={"stream_id": current_stream_id, "reason": str(e_retry), "attempt": attempt + 1, "max_attempts": app_level_max_retries + 1})
 
@@ -452,6 +450,7 @@ async def call_litellm_acompletion(
                     )
                 }
                 final_messages.append(message_to_append)
+
             if run_context:
                 stats = run_context['runtime']['token_usage_stats']
                 stats["total_failed_calls"] += 1
@@ -460,7 +459,7 @@ async def call_litellm_acompletion(
                         run_id=run_id_for_event,
                         message={"type": "token_usage_update", "data": stats}
                     )
-            
+
             if events and agent_id_for_event and run_id_for_event:
                 await events.emit_llm_stream_failed(
                     run_id=run_id_for_event, 
@@ -471,17 +470,26 @@ async def call_litellm_acompletion(
                     contextual_data=contextual_data_for_event
                 )
 
-            if attempt > app_level_max_retries:
+            if attempt >= app_level_max_retries:
                 logger.error("app_level_retries_exhausted", extra={"max_retries": app_level_max_retries + 1, "final_error": str(e_retry)}, exc_info=True)
-                # Break the loop, the final error will be handled after the loop
                 break
             
-            # Wait for a short period before retrying
             await asyncio.sleep(llm_config.get("wait_seconds_on_retry", 3) * (attempt + 1)) # Exponential backoff
-            continue # Continue to the next iteration
+            continue
+
+        except (AuthenticationError, BadRequestError, ContextWindowExceededError) as e_unrecoverable:
+            # Catch unrecoverable errors raised from _invoke_litellm_stream
+            logger.error("llm_unrecoverable_error_in_orchestrator", extra={"error_type": type(e_unrecoverable).__name__, "error_message": str(e_unrecoverable)}, exc_info=True)
+            if events and agent_id_for_event and run_id_for_event:
+                 await events.emit_llm_stream_failed(
+                    run_id=run_id_for_event, agent_id=agent_id_for_event, parent_agent_id=kwargs.get('parent_agent_id'),
+                    stream_id=current_stream_id, reason=f"Unrecoverable error: {type(e_unrecoverable).__name__} - {str(e_unrecoverable)}", 
+                    contextual_data=contextual_data_for_event
+                )
+            return {"error": f"{type(e_unrecoverable).__name__}: {str(e_unrecoverable)}", "error_type": type(e_unrecoverable).__name__, "actual_usage": None, "content": None, "tool_calls": [], "reasoning": None, "model_id_used": None}
 
         except asyncio.CancelledError:
-            # ... (CancelledError handling logic remains unchanged) ...
+            # If CancelledError is caught, it must be re-raised
             logger.warning("llm_call_cancelled", extra={"stream_id": current_stream_id})
             if events and agent_id_for_event and run_id_for_event:
                  await events.emit_llm_stream_failed(
@@ -493,35 +501,21 @@ async def call_litellm_acompletion(
                     contextual_data=contextual_data_for_event
                 )
             raise
-            
-        except Exception as e_outer:
-            # ... (Other exception handling logic remains unchanged) ...
-            # Note: The return here will break out of our retry loop, which is correct because these are unrecoverable errors
-            if isinstance(e_outer, (RateLimitError, Timeout, APIConnectionError, ServiceUnavailableError, InternalServerError)):
-                if run_context:
-                    stats = run_context['runtime']['token_usage_stats']
-                    stats["total_failed_calls"] += 1
-                    if events:
-                        await events.send_json(
-                            run_id=run_id_for_event,
-                            message={"type": "token_usage_update", "data": stats}
-                        )
-            
-            logger.error("call_litellm_outer_error", extra={"error_type": type(e_outer).__name__, "error_message": str(e_outer)}, exc_info=True)
+
+        except Exception as e_final:
+            # Catch any other unexpected errors
+            logger.error("call_litellm_orchestrator_unexpected_error", extra={"error_type": type(e_final).__name__, "error_message": str(e_final)}, exc_info=True)
             if events and agent_id_for_event and run_id_for_event:
                  await events.emit_llm_stream_failed(
                     run_id=run_id_for_event, agent_id=agent_id_for_event, parent_agent_id=kwargs.get('parent_agent_id'),
-                    stream_id=current_stream_id, reason=f"Unrecoverable error: {type(e_outer).__name__} - {str(e_outer)}", 
+                    stream_id=current_stream_id, reason=f"Unexpected error: {type(e_final).__name__} - {str(e_final)}", 
                     contextual_data=contextual_data_for_event
                 )
-            return {"error": f"{type(e_outer).__name__}: {str(e_outer)}", "error_type": type(e_outer).__name__, "actual_usage": None, "content": None, "tool_calls": [], "reasoning": None, "model_id_used": None}
+            return {"error": f"Unexpected error: {str(e_final)}", "error_type": type(e_final).__name__, "actual_usage": None, "content": None, "tool_calls": [], "reasoning": None, "model_id_used": None}
 
-    # 2. If the loop finishes without success, return the final error
     if last_app_level_exception:
         final_error_message = f"LLM call failed after all application-level retries. Last reason: {last_app_level_exception}"
         logger.error("final_app_level_error", extra={"error_message": final_error_message}, exc_info=True)
         return {"error": final_error_message, "error_type": "ForceRetryExhausted", "actual_usage": None, "content": None, "tool_calls": [], "reasoning": None, "model_id_used": None}
     
-    # This point should not be reached in theory
     raise RuntimeError("LLM call logic finished unexpectedly.")
-    # ===================== END OF REFACTOR =====================
