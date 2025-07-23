@@ -362,6 +362,17 @@ async def call_litellm_acompletion(
                 "max_attempts": app_level_max_retries + 1
             })
 
+            # --- ADDED: Failure Counting Logic ---
+            if run_context:
+                stats = run_context['runtime']['token_usage_stats']
+                stats["total_failed_calls"] += 1
+                if events:
+                    await events.send_json(
+                        run_id=run_id_for_event,
+                        message={"type": "token_usage_update", "data": stats}
+                    )
+            # --- END OF ADDED LOGIC ---
+
             # Emit stream failed event for the current attempt
             if events and agent_id_for_event and run_id_for_event:
                 await events.emit_llm_stream_failed(
