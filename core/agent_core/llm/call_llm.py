@@ -287,13 +287,20 @@ class LLMResponseAggregator:
 
 # <--- NEW: Core function responsible only for network calls ---
 @robust_retry_with_backoff(max_retries=2, initial_delay=5, max_delay=60)
-async def _invoke_litellm_stream(params_for_litellm: Dict[str, Any]) -> Any:
+async def _invoke_litellm_stream(params_for_litellm: Dict[str, Any]):
     """
-    Core function to invoke litellm.acompletion.
-    This function is decorated for network-level retries and contains no application logic.
+    Core function to invoke litellm.acompletion and yield chunks from the stream.
+    This function is decorated for network-level retries. If any error occurs
+    during the streaming iteration, the decorator will re-invoke this entire function.
     """
     logger.debug("invoking_litellm_stream", extra={"model": params_for_litellm.get("model")})
-    return await litellm.acompletion(**params_for_litellm)
+    
+    # 1. Get the stream object
+    llm_response_stream = await litellm.acompletion(**params_for_litellm)
+    
+    # 2. Iterate over the stream *inside* the decorated function
+    async for chunk in llm_response_stream:
+        yield chunk # 3. Yield each chunk back to the caller
 
 
 # <--- REFACTORED: call_litellm_acompletion is now the "orchestrator" ---
@@ -362,8 +369,8 @@ async def call_litellm_acompletion(
             FILTERED_KEYS = ["stream_id", "parent_agent_id", "wait_seconds_on_retry", "max_retries"]
             params_for_litellm = {k: v for k, v in params_for_this_attempt.items() if k not in FILTERED_KEYS}
             
-            # Call the core network function
-            llm_response_stream = await _invoke_litellm_stream(params_for_litellm)
+            # Call the core network function. This now returns our own async generator.
+            llm_response_stream = _invoke_litellm_stream(params_for_litellm)
             
             response_aggregator = LLMResponseAggregator(
                 agent_id=agent_id_for_event,
