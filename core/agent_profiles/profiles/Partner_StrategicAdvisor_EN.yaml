@@ -7,7 +7,7 @@ is_active: true
 is_deleted: false
 timestamp: "2025-05-27T10:00:00.000Z" # Please replace with a real timestamp
 description_for_human: "Strategic advisor AI that interacts with the user, defines research scope, and (later) launches Principal, monitors progress, and facilitates iterative research."
-llm_config_ref: "local_llm" # Partner might use a powerful LLM
+llm_config_ref: "principal_llm" # Partner might use a powerful LLM
 
 base_profile: Base_Agent
 system_prompt_construction:

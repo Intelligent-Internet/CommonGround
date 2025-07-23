@@ -29,7 +29,7 @@
 name: Base_Associate
 base_profile: Base_Agent
 type: associate
-llm_config_ref: "local_llm"
+llm_config_ref: "associate_llm"
 
 tool_access_policy:
   allowed_toolsets:
