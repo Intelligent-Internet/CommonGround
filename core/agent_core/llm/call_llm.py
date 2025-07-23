@@ -46,7 +46,12 @@ def robust_retry_with_backoff(
 
             for attempt in range(max_retries + 1):
                 try:
-                    return await func(*args, **kwargs)
+                    # func is an async generator, so calling it returns an async generator object.
+                    # We must iterate over it and yield from it.
+                    async for chunk in func(*args, **kwargs):
+                        yield chunk
+                    # If the stream completes without error, we break the retry loop.
+                    return
                 except (
                     RateLimitError,
                     Timeout,
