@@ -119,6 +119,25 @@ class HandoverService:
                     if resolved_path:
                         inherited_data = get_nested_value_from_context(source_context, resolved_path)
 
+                # If the inherited data is a list of messages (identified by the payload_key),
+                # filter out any messages that are marked with the `_no_handover` internal flag.
+                if inherited_data and payload_key == "inherited_messages" and isinstance(inherited_data, list):
+                    original_count = len(inherited_data)
+                    inherited_data = [
+                        msg for msg in inherited_data if not msg.get("_internal", {}).get("_no_handover")
+                    ]
+                    # Log only if messages were actually filtered out.
+                    if original_count > len(inherited_data):
+                        logger.debug(
+                            "handover_service_filtered_messages", 
+                            extra={
+                                "protocol_name": protocol_name, 
+                                "payload_key": payload_key, 
+                                "original_count": original_count, 
+                                "filtered_count": len(inherited_data)
+                            }
+                        )
+
                 # Inject data and rendering schema
                 if inherited_data is not None:
                     final_payload[payload_key] = inherited_data
