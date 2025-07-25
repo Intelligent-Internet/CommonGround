@@ -208,6 +208,24 @@ For a deeper dive into the architecture, please see our [architecture documentat
 
 ### Recent Updates (July 2025)
 
+#### v0.1.2 - Core Logic Refinements and Developer Experience
+*Released: July 25, 2025*
+
+[Important BUG FIX] This release includes a critical fix to address context leaking, significantly reducing token usage and improving overall system performance.
+
+**🧠 Core Agent & LLM Enhancements**
+- **Internal Message Handling**: Added an `_internal._no_handover` flag to prevent handover of inherited messages between agents.
+- **Smarter Pre-execution Checks**: Added a pre-launch check to ensure an actionable plan exists before tool execution.
+
+**🎨 Frontend & UX**
+- **Real-time Project Sync**: Project updates are now broadcast to all active user sessions, ensuring state consistency.
+
+**🔧 Developer Experience & Miscellaneous**
+- **VS Code Integration**: Added Visual Studio Code launch and task configurations for easier backend and frontend development.
+  - Note: you might need to adjust these files to match your local environment.
+- **Configuration Updates**: Updated the model name for `gemini-flash-lite`, removed unused configuration files, and corrected LLM configuration references in agent profiles.
+- **Documentation Fixes**: Removed an outdated Discord link from the documentation.
+
 #### v0.1.1 - Tool Calling Improvements and UI Enhancements
 *Released: July 22, 2025*
 
