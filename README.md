@@ -1,7 +1,6 @@
 # Common Ground
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Discord](https://img.shields.io/discord/VBD2yybb?label=discord&logo=discord&color=7289da)](https://discord.gg/VBD2yybb)
 [![Twitter Follow](https://img.shields.io/twitter/follow/ii_posts?style=social)](https://twitter.com/ii_posts)
 
 ![Common Ground Title Image](assets/title.png)
