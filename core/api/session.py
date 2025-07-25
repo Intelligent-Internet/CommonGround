@@ -1,6 +1,6 @@
 import uuid
 import logging
-from typing import Dict, TYPE_CHECKING
+from typing import Dict, TYPE_CHECKING, List
 from datetime import datetime # Ensure datetime is imported
 
 if TYPE_CHECKING:
@@ -15,6 +15,9 @@ pending_websocket_sessions: Dict[str, datetime] = {}
 # New: Global run store for storing active business run contexts
 # Key: server_run_id, Value: run_context (Dict)
 active_runs_store: Dict[str, Dict] = {}
+
+# New: Global list to store all active event managers
+active_event_managers: List['SessionEventManager'] = []
 
 
 async def create_session() -> dict:

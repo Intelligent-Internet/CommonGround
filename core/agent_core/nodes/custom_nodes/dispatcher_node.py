@@ -256,8 +256,7 @@ class DispatcherNode(AsyncParallelBatchNode):
             "refs": { "run": run_context_global, "team": team_state_global }
         }
         
-        initial_message_count = len(associate_sub_context_state.get("messages", []))
-        logger.info("dispatcher_associate_starting", extra={"executing_associate_id": executing_associate_id, "initial_message_count": initial_message_count})
+        logger.info("dispatcher_associate_starting", extra={"executing_associate_id": executing_associate_id})
         
         completed_associate_context = None
         associate_exec_status = "error"
@@ -291,7 +290,13 @@ class DispatcherNode(AsyncParallelBatchNode):
             error_details_from_associate = final_associate_state.get("error_message")
             
             all_messages = final_associate_state.get("messages", [])
-            new_messages_from_associate = all_messages[initial_message_count:]
+            
+            # Filter out messages that are marked as not for handover (e.g., initial briefings).
+            # The msg.get("_internal", {}) ensures safe access even if the _internal key doesn't exist.
+            new_messages_from_associate = [
+                msg for msg in all_messages if not msg.get("_internal", {}).get("_no_handover")
+            ]
+
             logger.info("dispatcher_messages_extracted", extra={"executing_associate_id": executing_associate_id, "new_message_count": len(new_messages_from_associate)})
 
             history_entry_to_update = next((h for h in team_state_global.get("dispatch_history", []) if h.get("dispatch_id") == executing_associate_id), None)

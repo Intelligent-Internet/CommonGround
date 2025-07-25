@@ -4,7 +4,7 @@ type: llm_config
 description_for_human: "LLM config for fast, low-cost utility tasks like naming or simple formatting."
 
 config:
-  model: "openai/gemini-2.5-flash-lite-preview-06-17"
+  model: "openai/gemini-2.5-flash-lite"
   base_url:
     _type: "from_env"
     var: "GEMINI_BRIDGE_URL"

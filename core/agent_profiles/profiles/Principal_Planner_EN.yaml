@@ -6,7 +6,7 @@ is_active: true
 is_deleted: false
 timestamp: "2025-05-27T10:00:00.000Z"
 description_for_human: "Orchestrator responsible for high-level planning, task decomposition, and overall research direction."
-llm_config_ref: "principal_llm"
+llm_config_ref: "principal_llm" # Principal uses a powerful LLM
 
 tool_access_policy:
   allowed_toolsets:

@@ -250,6 +250,14 @@ class InboxProcessor:
                 is_persistent = params.get("is_persistent_in_memory", False)
                 
                 new_message = {"role": role, "content": injected_content}
+
+                # If this message comes from the startup briefing, add an internal flag
+                # to prevent it from being handed over again in the future.
+                if source == "AGENT_STARTUP_BRIEFING":
+                    new_message["_internal"] = {
+                        "_no_handover": True,
+                        "_source_event": "AGENT_STARTUP_BRIEFING"
+                    }
                 
                 if role == "tool":
                     new_message["tool_call_id"] = dehydrated_payload.get("tool_call_id")

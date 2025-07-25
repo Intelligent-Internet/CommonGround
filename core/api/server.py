@@ -14,7 +14,7 @@ from agent_core.iic.core.event_handler import EventHandler as IICEventHandler
 
 # Remove imports for get_session, remove_session as they are part of the old session management
 # create_session is still needed, but its invocation will change
-from .session import create_session, pending_websocket_sessions, active_runs_store # <--- Modified import
+from .session import create_session, pending_websocket_sessions, active_runs_store, active_event_managers # <--- Modified import
 from api.events import SessionEventManager
 from agent_core.iic.core.iic_handlers import list_projects, get_project, create_project, delete_project, update_project, update_run_meta, delete_run, update_run_name, move_iic
 # Import server_manager startup/shutdown functions
@@ -122,6 +122,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         # Attach the event_manager to websocket.state, making it available throughout the connection lifecycle
         websocket.state.event_manager.connect(websocket)
         websocket.state.event_manager.attach(iic_eh.on_message)
+        # Add the event_manager to the global list
+        active_event_managers.append(event_manager)
         # websocket.state.event_manager.attach(iic_eh.on_message)
         logger.info("websocket_connection_accepted", extra={"session_id": session_id})
 
@@ -226,6 +228,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         if hasattr(websocket.state, 'active_run_tasks'):
             websocket.state.active_run_tasks.clear()
         
+        # Remove event_manager from the global list upon disconnect
+        if event_manager in active_event_managers:
+            active_event_managers.remove(event_manager)
+
         if hasattr(websocket.state, 'event_manager') and websocket.state.event_manager:
             await websocket.state.event_manager.disconnect()
         

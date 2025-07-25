@@ -8,7 +8,7 @@ import json
 import copy
 from datetime import datetime, timezone
 
-from .session import active_runs_store # Import global run store
+from .session import active_runs_store, active_event_managers # Import global stores
 logger = logging.getLogger(__name__)
 
 class SessionEventManager:
@@ -527,7 +527,7 @@ async def broadcast_project_structure_update(reason: str, details: Dict[str, Any
         reason (str): The reason for the update (e.g., "rename_run", "delete_project").
         details (Dict[str, Any]): A dictionary containing the details of the operation.
     """
-    logger.info("project_structure_update_broadcast", extra={"reason": reason})
+    logger.info("project_structure_update_broadcast", extra={"reason": reason, "active_sessions": len(active_event_managers)})
     message = {
         "type": "project_structure_updated",
         "data": {
@@ -536,6 +536,11 @@ async def broadcast_project_structure_update(reason: str, details: Dict[str, Any
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
     }
-    for run_context in list(active_runs_store.values()):
-        if run_context and (event_manager := run_context.get("runtime", {}).get("event_manager")):
-            await event_manager.send_json(run_id=None, message=message)
+
+    # Broadcast to all connected clients by iterating over the global list of event managers
+    broadcast_tasks = [
+        manager.send_json(run_id=None, message=message)
+        for manager in active_event_managers if manager.is_connected
+    ]
+    if broadcast_tasks:
+        await asyncio.gather(*broadcast_tasks)
