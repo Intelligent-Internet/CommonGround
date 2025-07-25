@@ -256,8 +256,7 @@ class DispatcherNode(AsyncParallelBatchNode):
             "refs": { "run": run_context_global, "team": team_state_global }
         }
         
-        initial_message_count = len(associate_sub_context_state.get("messages", []))
-        logger.info("dispatcher_associate_starting", extra={"executing_associate_id": executing_associate_id, "initial_message_count": initial_message_count})
+        logger.info("dispatcher_associate_starting", extra={"executing_associate_id": executing_associate_id})
         
         completed_associate_context = None
         associate_exec_status = "error"
