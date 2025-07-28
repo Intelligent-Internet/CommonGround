@@ -74,7 +74,7 @@ This is the easiest way to get the full system running, including the pre-config
     docker compose run --rm --service-ports login
     ```
     Follow the on-screen instructions, set the theme, select authentication method, and click the authorization link. Your credentials will be saved in `~/.gemini/` on your host machine for future use. You can then exit the CLI with `ctrl+c` or `/quit`.
-    * `Login with Google` is recommended - It runs Gemini-CLI via Code Assist Subscription, which is free for personal use as of today (July 2025), see [Gemini CLI](https://github.com/google/gemini-cli) for more details.
+    * `Login with Google` is recommended - It runs Gemini-CLI via Code Assist Subscription, which is free for personal use as of today (July 2025), see [Gemini CLI](https://github.com/google-gemini/gemini-cli) for more details.
     > **📌 Troubleshooting: `GOOGLE_CLOUD_PROJECT` Error**
     >
     > If you encounter an error like `Failed to login. Message: This account requires setting the GOOGLE_CLOUD_PROJECT env var`, you must explicitly provide your Google Cloud Project ID.
