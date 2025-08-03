@@ -34,7 +34,8 @@ class InboxProcessor:
         team_state = self.team_state
         
         prompt_content = item.get("payload", {}).get("prompt")
-        if not prompt_content:
+        images_content = item.get("payload", {}).get("images", [])
+        if not prompt_content and not images_content:
             return None
 
         user_turn_id = f"turn_user_{uuid.uuid4().hex[:8]}"
@@ -62,7 +63,7 @@ class InboxProcessor:
             "end_time": item.get("metadata", {}).get("created_at", datetime.now(timezone.utc).isoformat()),
             "source_turn_ids": [last_agent_turn_id] if last_agent_turn_id else [],
             "source_tool_call_id": None,
-            "inputs": {"prompt": prompt_content},
+            "inputs": {"prompt": prompt_content, "images": images_content} if images_content else {"prompt": prompt_content},
             "outputs": {},
             "llm_interaction": None,
             "tool_interactions": [],
@@ -249,7 +250,65 @@ class InboxProcessor:
                 role = params.get("role", "user")
                 is_persistent = params.get("is_persistent_in_memory", False)
                 
-                new_message = {"role": role, "content": injected_content}
+                # 处理多模态内容（图像）
+                has_image_content = False
+                content_parts = []
+                
+                # 检查是否有图像内容（支持两种格式）
+                if source in ["USER_PROMPT", "USER_PROMPT_WITH_IMAGE"] and isinstance(dehydrated_payload, dict):
+                    # 新格式：image_info（来自 send_image_message）
+                    if dehydrated_payload.get("image_info"):
+                        has_image_content = True
+                        # 添加文本内容
+                        if injected_content:
+                            content_parts.append({
+                                "type": "text",
+                                "text": injected_content
+                            })
+                        
+                        # 添加图像内容
+                        image_info = dehydrated_payload["image_info"]
+                        content_parts.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_info.get("url", ""),
+                                "detail": "high"  # Can be "low", "high", or "auto"
+                            }
+                        })
+                        logger.debug("multimodal_message_processed_from_image_info", extra={
+                            "agent_id": self.agent_id,
+                            "image_url": image_info.get("url", ""),
+                            "text_content_length": len(injected_content) if injected_content else 0
+                        })
+                    
+                    # 旧格式：images（向后兼容）
+                    elif dehydrated_payload.get("images"):
+                        has_image_content = True
+                        # 添加文本内容
+                        if injected_content:
+                            content_parts.append({
+                                "type": "text",
+                                "text": injected_content
+                            })
+                        
+                        # 添加图像内容
+                        for image_data in dehydrated_payload["images"]:
+                            content_parts.append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{image_data['mimeType']};base64,{image_data['data']}"
+                                }
+                            })
+                        logger.debug("multimodal_message_processed_from_images", extra={
+                            "agent_id": self.agent_id,
+                            "image_count": len(dehydrated_payload["images"]),
+                            "text_content_length": len(injected_content) if injected_content else 0
+                        })
+                
+                if has_image_content:
+                    new_message = {"role": role, "content": content_parts}
+                else:
+                    new_message = {"role": role, "content": injected_content}
 
                 # If this message comes from the startup briefing, add an internal flag
                 # to prevent it from being handed over again in the future.

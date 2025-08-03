@@ -239,6 +239,7 @@ async def call_litellm_acompletion(
     run_id_for_event: Optional[str] = None,
     contextual_data_for_event: Optional[Dict] = None,
     run_context: Optional[Dict] = None,
+    image_info: Optional[Dict[str, Any]] = None,  # New parameter for image data
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -254,6 +255,52 @@ async def call_litellm_acompletion(
             final_messages[0]["content"] = system_prompt_content
         else:
             final_messages.insert(0, {"role": "system", "content": system_prompt_content})
+    
+    # Process image information if provided
+    if image_info and final_messages:
+        # Find the last user message and add image to it
+        for i in range(len(final_messages) - 1, -1, -1):
+            if final_messages[i].get("role") == "user":
+                current_content = final_messages[i].get("content", "")
+                
+                # Check if content is already in multimodal format (list)
+                if isinstance(current_content, list):
+                    # Already multimodal, append image to existing content
+                    current_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_info.get("url", ""),
+                            "detail": "high"  # Can be "low", "high", or "auto"
+                        }
+                    })
+                    logger.debug("image_added_to_multimodal_message", extra={
+                        "agent_id": agent_id_for_event,
+                        "image_url": image_info.get("url", ""),
+                        "existing_parts_count": len(current_content) - 1
+                    })
+                else:
+                    # Convert text-only message to multimodal format
+                    multimodal_content = [
+                        {
+                            "type": "text",
+                            "text": current_content
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_info.get("url", ""),
+                                "detail": "high"  # Can be "low", "high", or "auto"
+                            }
+                        }
+                    ]
+                    
+                    final_messages[i]["content"] = multimodal_content
+                    logger.debug("text_message_converted_to_multimodal", extra={
+                        "agent_id": agent_id_for_event,
+                        "image_url": image_info.get("url", ""),
+                        "text_content_length": len(current_content)
+                    })
+                break
 
     for attempt in range(app_level_max_retries + 1):
         # --- KEY CHANGE: Generate a NEW stream_id for EVERY attempt ---

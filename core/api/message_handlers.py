@@ -862,6 +862,7 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
     run_status = run_context['meta'].get('status')
     run_type = run_context['meta'].get('run_type')
     prompt_content = message_payload.get("prompt")
+    images_content = message_payload.get("images", [])
 
     try:
         # --- Branch 1: Activate a pending run ---
@@ -879,10 +880,15 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
                 team_state = run_context['team_state']
                 partner_state = partner_context['state']
 
+                # 构建payload，包含文本和图像
+                payload = {"prompt": prompt_content}
+                if images_content:
+                    payload["images"] = images_content
+                
                 inbox_item = {
                     "item_id": f"inbox_{uuid.uuid4().hex[:8]}",
                     "source": "USER_PROMPT", # Use standardized event source
-                    "payload": {"prompt": prompt_content},
+                    "payload": payload,
                     "consumption_policy": "consume_on_read",
                     "metadata": {"created_at": datetime.now(timezone.utc).isoformat()}
                 }
@@ -921,10 +927,15 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
                 team_state = run_context['team_state']
 
                 # --- Core modification: Similarly, only create an InboxItem ---
+                # 构建payload，包含文本和图像
+                payload = {"prompt": prompt_content}
+                if images_content:
+                    payload["images"] = images_content
+                
                 inbox_item = {
                     "item_id": f"inbox_{uuid.uuid4().hex[:8]}",
                     "source": "USER_PROMPT",
-                    "payload": {"prompt": prompt_content},
+                    "payload": payload,
                     "consumption_policy": "consume_on_read",
                     "metadata": {"created_at": datetime.now(timezone.utc).isoformat()}
                 }
@@ -949,12 +960,153 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
         logger.error("send_to_run_processing_error", extra={"session_id": session_id_for_log, "target_run_id": target_run_id, "run_type": run_type, "error_message": str(e)}, exc_info=True)
         await event_manager.emit_error(run_id=target_run_id, agent_id="System", error_message=f"Error processing message for run {target_run_id}: {str(e)}")
 
+async def handle_send_image_message(ws_state: Dict, data: Dict):
+    """
+    Handles 'send_image_message' messages, routing client messages with image data to the specified active business run.
+    This is similar to handle_send_to_run_message but specifically designed for multimodal messages.
+    """
+    event_manager = ws_state.event_manager
+    session_id_for_log = event_manager.session_id
+
+    target_run_id = data.get("run_id")
+    run_id_var.set(target_run_id)  # Set context variable
+    message_payload = data.get("message_payload")
+    image_info = data.get("image_info")
+
+    logger.info("send_image_message_received", extra={
+        "session_id": session_id_for_log, 
+        "target_run_id": target_run_id, 
+        "message_preview": str(message_payload)[:100],
+        "has_image_info": bool(image_info)
+    })
+
+    if not target_run_id or message_payload is None or image_info is None:
+        err_msg = "'send_image_message' requires 'run_id', 'message_payload', and 'image_info'."
+        logger.warning("send_image_message_missing_params", extra={
+            "session_id": session_id_for_log, 
+            "data": data, 
+            "has_run_id": bool(target_run_id), 
+            "has_message_payload": message_payload is not None,
+            "has_image_info": image_info is not None
+        })
+        await event_manager.emit_error(run_id=target_run_id, agent_id="System", error_message=err_msg)
+        return
+
+    run_context = active_runs_store.get(target_run_id)
+    if not run_context:
+        err_msg = f"Target run {target_run_id} not found or not active."
+        logger.warning("send_image_message_target_not_found", extra={"session_id": session_id_for_log, "target_run_id": target_run_id})
+        await event_manager.emit_error(run_id=target_run_id, agent_id="System", error_message=err_msg)
+        return
+
+    run_status = run_context['meta'].get('status')
+    run_type = run_context['meta'].get('run_type')
+    prompt_content = message_payload.get("prompt")
+
+    try:
+        # --- Branch 1: Activate a pending run with image ---
+        if run_status == 'CREATED':
+            logger.debug("run_activation_with_image_started", extra={"run_id": target_run_id, "run_type": run_type})
+            
+            if prompt_content is None:
+                raise ValueError("First message to a new run must contain a 'prompt'.")
+            
+            run_context['team_state']['question'] = prompt_content
+            
+            task = None
+            if run_type == "partner_interaction":
+                partner_context = run_context['sub_context_refs']['_partner_context_ref']
+                team_state = run_context['team_state']
+                partner_state = partner_context['state']
+
+                # 构建payload，包含文本和图像信息
+                payload = {
+                    "prompt": prompt_content,
+                    "image_info": image_info  # Add image info to payload
+                }
+                
+                inbox_item = {
+                    "item_id": f"inbox_{uuid.uuid4().hex[:8]}",
+                    "source": "USER_PROMPT_WITH_IMAGE", # Use specialized event source
+                    "payload": payload,
+                    "consumption_policy": "consume_on_read",
+                    "metadata": {"created_at": datetime.now(timezone.utc).isoformat()}
+                }
+                partner_state.setdefault("inbox", []).append(inbox_item)
+                
+                # 2. Start the task
+                task = asyncio.create_task(run_partner_interaction_async(partner_context=partner_context))
+            else:
+                raise ValueError(f"Run type '{run_type}' does not support activation via 'send_image_message'.")
+
+            ws_state.active_run_tasks[target_run_id] = task
+            task.add_done_callback(
+                lambda t: logger.info("run_task_finished", extra={"run_id": target_run_id, "run_type": run_type, "session_id": session_id_for_log})
+                if not t.cancelled() else
+                logger.info("run_task_cancelled", extra={"run_id": target_run_id, "run_type": run_type, "session_id": session_id_for_log})
+            )
+            
+            run_context['meta']['status'] = 'AWAITING_INPUT'
+            logger.debug("run_activation_with_image_completed", extra={"run_id": target_run_id, "status": "AWAITING_INPUT"})
+
+            # 3. Wake up the task
+            if run_type == "partner_interaction":
+                new_input_event = run_context['sub_context_refs']['_partner_context_ref']['runtime_objects'].get("new_user_input_event")
+                if new_input_event:
+                    new_input_event.set()
+            return  # Critical: Return immediately after handling activation
+
+        # --- Branch 2: Send an image message to a running session ---
+        elif run_status in ['RUNNING', 'AWAITING_INPUT']:
+            if prompt_content is None:
+                raise ValueError("Message payload must contain a 'prompt'.")
+
+            if run_type == "partner_interaction":
+                partner_context = run_context['sub_context_refs']['_partner_context_ref']
+                partner_state = partner_context['state']
+                team_state = run_context['team_state']
+
+                # --- Core modification: Create an InboxItem with image info ---
+                payload = {
+                    "prompt": prompt_content,
+                    "image_info": image_info  # Add image info to payload
+                }
+                
+                inbox_item = {
+                    "item_id": f"inbox_{uuid.uuid4().hex[:8]}",
+                    "source": "USER_PROMPT_WITH_IMAGE",
+                    "payload": payload,
+                    "consumption_policy": "consume_on_read",
+                    "metadata": {"created_at": datetime.now(timezone.utc).isoformat()}
+                }
+                partner_state.setdefault("inbox", []).append(inbox_item)
+
+                # Wake up the task
+                new_input_event = partner_context['runtime_objects'].get("new_user_input_event")
+                if new_input_event:
+                    new_input_event.set()
+                    logger.info("partner_task_notified_with_image", extra={"run_id": target_run_id, "notification_method": "inbox"})
+                else:
+                    logger.error("partner_notification_failed", extra={"run_id": target_run_id, "reason": "new_user_input_event_not_found"}, exc_info=True)
+            
+        # --- Branch 3: Handle invalid states ---
+        else:
+            err_msg = f"Cannot send image message to run {target_run_id} because its status is '{run_status}'."
+            logger.warning("send_image_message_invalid_status", extra={"session_id": session_id_for_log, "run_id": target_run_id, "run_status": run_status})
+            await event_manager.emit_error(run_id=target_run_id, agent_id="System", error_message=err_msg)
+            return
+
+    except Exception as e:
+        logger.error("send_image_message_processing_error", extra={"session_id": session_id_for_log, "target_run_id": target_run_id, "run_type": run_type, "error_message": str(e)}, exc_info=True)
+        await event_manager.emit_error(run_id=target_run_id, agent_id="System", error_message=f"Error processing image message for run {target_run_id}: {str(e)}")
+
 # --- MESSAGE_HANDLERS registry (Dango's version, with adapted function names) ---
 MESSAGE_HANDLERS: Dict[str, callable] = {
     "start_run": handle_start_run_message,
     "stop_run": handle_stop_run_message,
     "request_available_toolsets": handle_request_available_toolsets,
     "send_to_run": handle_send_to_run_message, # Added by Dango, adapted
+    "send_image_message": handle_send_image_message, # New handler for multimodal messages
     "stop_managed_principal": handle_stop_managed_principal_message, # Added by Dango, adapted
     "request_run_profiles": handle_request_run_profiles_message, # Added by Dango, adapted
     "request_run_context": handle_request_run_context_message, # Added by Dango, adapted

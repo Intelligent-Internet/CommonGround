@@ -337,6 +337,28 @@ def user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -> str:
         return payload.get("prompt", "")
     return str(payload)
 
+@register_ingestor("multimodal_user_prompt_ingestor")
+def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -> str:
+    """处理包含图像的用户输入，返回适合LLM的格式"""
+    if not isinstance(payload, dict):
+        return str(payload)
+    
+    prompt = payload.get("prompt", "")
+    images = payload.get("images", [])
+    
+    # 如果没有图像，返回普通文本
+    if not images:
+        return prompt
+    
+    # 如果有图像，需要特殊处理
+    # 这里我们将图像信息标记在文本中，实际的图像数据会在消息构建时处理
+    image_info = f"[用户上传了{len(images)}张图像]"
+    if prompt:
+        return f"{prompt}\n\n{image_info}"
+    else:
+        return image_info
+    return str(payload)
+
 def _recursive_markdown_formatter(data: Any, schema: Dict, level: int = 0) -> List[str]:
     """
     Intelligently formats data recursively into LLM-friendly Markdown.

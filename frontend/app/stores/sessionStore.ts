@@ -888,20 +888,53 @@ class SessionStore {
     }
   }
 
-  async sendMessage(message: string, runId: string) {
+  async sendMessage(message: string, runId: string, images?: any[]) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
         console.error("Cannot send message, WebSocket is not open.");
         this.error = "Connection failed. Cannot send message.";
         return;
     }
 
+    // 处理图像数据
+    const imageData = images ? await Promise.all(
+      images.map(async (img) => {
+        // 将文件转换为base64
+        const base64 = await this.fileToBase64(img.file);
+        return {
+          type: 'image',
+          data: base64,
+          name: img.name,
+          mimeType: img.file.type
+        };
+      })
+    ) : [];
+
+    const messagePayload: any = { prompt: message };
+    if (imageData.length > 0) {
+      messagePayload.images = imageData;
+    }
+
     this.ws.send(JSON.stringify({
         type: 'send_to_run',
         data: {
             run_id: runId,
-            message_payload: { prompt: message }
+            message_payload: messagePayload
         }
     }));
+  }
+
+  private fileToBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        // 移除data:image/xxx;base64,前缀，只保留base64数据
+        const base64Data = result.split(',')[1];
+        resolve(base64Data);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
   }
 
   async stopExecution(runId: string) {
