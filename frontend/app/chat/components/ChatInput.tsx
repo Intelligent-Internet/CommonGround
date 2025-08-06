@@ -2,6 +2,7 @@ import React, { useState, useRef, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { X, Image as ImageIcon, Paperclip } from 'lucide-react';
+import { randomUUID } from 'node:crypto';
 
 interface ImageAttachment {
   id: string;
@@ -68,7 +69,7 @@ export function ChatInput({
     reader.onload = (e) => {
       const dataUrl = e.target?.result as string;
       const newImage: ImageAttachment = {
-        id: Date.now().toString(),
+        id: randomUUID(),
         file,
         dataUrl,
         name: file.name
