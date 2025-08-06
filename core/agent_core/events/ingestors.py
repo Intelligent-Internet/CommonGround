@@ -357,7 +357,6 @@ def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -
         return f"{prompt}\n\n{image_info}"
     else:
         return image_info
-    return str(payload)
 
 def _recursive_markdown_formatter(data: Any, schema: Dict, level: int = 0) -> List[str]:
     """
