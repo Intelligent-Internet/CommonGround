@@ -1,7 +1,13 @@
 import logging
 import uuid
+import os
+import base64
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
+import asyncio
+import time
+import httpx
+from litellm import create_file
 
 from ..events.event_strategies import EVENT_STRATEGY_REGISTRY
 from ..events.ingestors import INGESTOR_REGISTRY, markdown_formatter_ingestor
@@ -34,8 +40,8 @@ class InboxProcessor:
         team_state = self.team_state
         
         prompt_content = item.get("payload", {}).get("prompt")
-        images_content = item.get("payload", {}).get("images", [])
-        if not prompt_content and not images_content:
+        files_content = item.get("payload", {}).get("files", [])
+        if not prompt_content and not files_content:
             return None
 
         user_turn_id = f"turn_user_{uuid.uuid4().hex[:8]}"
@@ -63,7 +69,10 @@ class InboxProcessor:
             "end_time": item.get("metadata", {}).get("created_at", datetime.now(timezone.utc).isoformat()),
             "source_turn_ids": [last_agent_turn_id] if last_agent_turn_id else [],
             "source_tool_call_id": None,
-            "inputs": {"prompt": prompt_content, "images": images_content} if images_content else {"prompt": prompt_content},
+            "inputs": (
+                {"prompt": prompt_content, "files": files_content}
+                if files_content else {"prompt": prompt_content}
+            ),
             "outputs": {},
             "llm_interaction": None,
             "tool_interactions": [],
@@ -250,62 +259,129 @@ class InboxProcessor:
                 role = params.get("role", "user")
                 is_persistent = params.get("is_persistent_in_memory", False)
                 
-                # 处理多模态内容（图像）
-                has_image_content = False
+                # 处理多模态内容（仅文件）
+                has_multimodal_content = False
                 content_parts = []
                 
-                # 检查是否有图像内容（支持两种格式）
-                if source in ["USER_PROMPT", "USER_PROMPT_WITH_IMAGE"] and isinstance(dehydrated_payload, dict):
-                    # 新格式：image_info（来自 send_image_message）
-                    if dehydrated_payload.get("image_info"):
-                        has_image_content = True
-                        # 添加文本内容
-                        if injected_content:
+                # 检查是否有文件内容
+                if source in ["USER_PROMPT", "USER_PROMPT_WITH_FILES"] and isinstance(dehydrated_payload, dict):
+                    # 处理文件内容：将附件上传到 Gemini 并构造成 file 引用
+                    files = dehydrated_payload.get("files", [])
+                    if files:
+                        has_multimodal_content = True
+                        # 添加文本内容（若尚未添加）
+                        if injected_content and not any(part.get("type") == "text" for part in content_parts):
                             content_parts.append({
                                 "type": "text",
                                 "text": injected_content
                             })
-                        
-                        # 添加图像内容
-                        image_info = dehydrated_payload["image_info"]
-                        content_parts.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": image_info.get("url", ""),
-                                "detail": "high"  # Can be "low", "high", or "auto"
-                            }
-                        })
-                        logger.debug("multimodal_message_processed_from_image_info", extra={
-                            "agent_id": self.agent_id,
-                            "image_url": image_info.get("url", ""),
-                            "text_content_length": len(injected_content) if injected_content else 0
-                        })
-                    
-                    # 旧格式：images（向后兼容）
-                    elif dehydrated_payload.get("images"):
-                        has_image_content = True
-                        # 添加文本内容
-                        if injected_content:
-                            content_parts.append({
-                                "type": "text",
-                                "text": injected_content
-                            })
-                        
-                        # 添加图像内容
-                        for image_data in dehydrated_payload["images"]:
-                            content_parts.append({
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{image_data['mimeType']};base64,{image_data['data']}"
-                                }
-                            })
-                        logger.debug("multimodal_message_processed_from_images", extra={
-                            "agent_id": self.agent_id,
-                            "image_count": len(dehydrated_payload["images"]),
-                            "text_content_length": len(injected_content) if injected_content else 0
-                        })
+
+                        for f in files:
+                            try:
+                                file_bytes = None
+                                filename = f.get("name") or f.get("filename") or f"file_{uuid.uuid4().hex[:6]}"
+                                mime_type = f.get("mimeType") or f.get("mime_type") or "application/octet-stream"
+
+                                if f.get("file_id"):
+                                    # Already uploaded
+                                    file_id = f["file_id"]
+                                    logger.info("gemini_file_upload_skipped_existing", extra={
+                                        "agent_id": self.agent_id,
+                                        "filename": filename,
+                                        "mime_type": mime_type,
+                                        "file_id": file_id,
+                                    })
+                                else:
+                                    size_bytes = None
+                                    if f.get("url"):
+                                        # Async fetch
+                                        async with httpx.AsyncClient(timeout=20) as client:
+                                            resp = await client.get(f["url"])
+                                            resp.raise_for_status()
+                                            file_bytes = resp.content
+                                        size_bytes = len(file_bytes) if file_bytes is not None else None
+                                    elif f.get("data"):
+                                        # base64 string possibly without header
+                                        data_str = f["data"]
+                                        # Strip data URL prefix if present
+                                        if data_str.startswith("data:"):
+                                            data_str = data_str.split(",", 1)[1]
+                                        file_bytes = base64.b64decode(data_str)
+                                        size_bytes = len(file_bytes)
+                                    else:
+                                        # Unsupported entry, skip
+                                        logger.warning("file_entry_missing_data", extra={"agent_id": self.agent_id, "filename": filename})
+                                        continue
+
+                                    # Prefer API key from project LLM config; fallback to env var
+                                    try:
+                                        resolver = LLMConfigResolver(shared_llm_configs=self.run_context.get("config", {}).get("shared_llm_configs_ref", {}))
+                                        llm_config = resolver.resolve(self.profile)
+                                    except Exception:
+                                        llm_config = {}
+                                    gemini_key = (
+                                        (llm_config.get("api_key") if isinstance(llm_config, dict) else None)
+                                        or os.getenv("GEMINI_API_KEY")
+                                    )
+                                    if not gemini_key:
+                                        logger.error(
+                                            "gemini_api_key_missing",
+                                            extra={
+                                                "agent_id": self.agent_id,
+                                                "hint": "Provide api_key in active LLM config or set GEMINI_API_KEY env var"
+                                            }
+                                        )
+                                        continue
+
+                                    # Structured start log
+                                    logger.info("gemini_file_upload_start", extra={
+                                        "agent_id": self.agent_id,
+                                        "filename": filename,
+                                        "mime_type": mime_type,
+                                        "size_bytes": size_bytes,
+                                    })
+                                    t0 = time.perf_counter()
+
+                                    # Offload blocking create_file to a thread
+                                    created = await asyncio.to_thread(
+                                        create_file,
+                                        file=file_bytes,
+                                        purpose="user_data",
+                                        extra_body={"custom_llm_provider": "gemini"},
+                                        api_key=gemini_key,
+                                    )
+                                    file_id = getattr(created, "id", None) if created is not None else None
+                                    if not file_id:
+                                        logger.error("gemini_file_upload_failed", extra={
+                                            "filename": filename,
+                                            "mime_type": mime_type,
+                                            "size_bytes": size_bytes,
+                                            "duration_ms": int((time.perf_counter() - t0) * 1000),
+                                        })
+                                        continue
+                                    else:
+                                        logger.info("gemini_file_upload_success", extra={
+                                            "agent_id": self.agent_id,
+                                            "filename": filename,
+                                            "mime_type": mime_type,
+                                            "size_bytes": size_bytes,
+                                            "file_id": file_id,
+                                            "duration_ms": int((time.perf_counter() - t0) * 1000),
+                                        })
+
+                                # Append file reference content part
+                                content_parts.append({
+                                    "type": "file",
+                                    "file": {
+                                        "file_id": file_id,
+                                        "filename": filename,
+                                        "format": mime_type
+                                    }
+                                })
+                            except Exception as ex:
+                                logger.error("file_processing_failed", extra={"error": str(ex)}, exc_info=True)
                 
-                if has_image_content:
+                if has_multimodal_content:
                     new_message = {"role": role, "content": content_parts}
                 else:
                     new_message = {"role": role, "content": injected_content}

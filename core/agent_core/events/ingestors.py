@@ -339,24 +339,36 @@ def user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -> str:
 
 @register_ingestor("multimodal_user_prompt_ingestor")
 def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -> str:
-    """处理包含图像的用户输入，返回适合LLM的格式"""
+    """处理包含图像/文件的用户输入，返回适合LLM的简要文本描述（实际数据在消息构建时处理）。"""
     if not isinstance(payload, dict):
         return str(payload)
-    
+
     prompt = payload.get("prompt", "")
     images = payload.get("images", [])
-    
-    # 如果没有图像，返回普通文本
-    if not images:
+    files = payload.get("files", [])
+
+    # 没有图像和文件时，直接返回文本
+    if not images and not files:
         return prompt
-    
-    # 如果有图像，需要特殊处理
-    # 这里我们将图像信息标记在文本中，实际的图像数据会在消息构建时处理
-    image_info = f"[用户上传了{len(images)}张图像]"
-    if prompt:
-        return f"{prompt}\n\n{image_info}"
-    else:
-        return image_info
+
+    # 构造一个简短的附件说明
+    parts = []
+    if images:
+        parts.append(f"用户上传了{len(images)}张图像")
+    if files:
+        # 可选：列出最多前3个文件名
+        names = []
+        for f in files[:3]:
+            name = f.get("name") or f.get("filename")
+            if name:
+                names.append(name)
+        if names:
+            parts.append(f"并附带{len(files)}个文件（示例：{', '.join(names)}{'' if len(files) <= 3 else ' 等'}）")
+        else:
+            parts.append(f"并附带{len(files)}个文件")
+
+    note = "[" + "，".join(parts) + "]"
+    return f"{prompt}\n\n{note}" if prompt else note
 
 def _recursive_markdown_formatter(data: Any, schema: Dict, level: int = 0) -> List[str]:
     """

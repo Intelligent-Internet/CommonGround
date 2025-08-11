@@ -7,7 +7,7 @@ import { ChatInput } from './ChatInput';
 interface WelcomeScreenProps {
   currentInput: string;
   onInputChange: (value: string) => void;
-  onSendMessage: (images?: any[]) => void;
+  onSendMessage: (files?: any[]) => void;
   onKeyPress: (e: React.KeyboardEvent) => void;
   isLoading: boolean;
 }

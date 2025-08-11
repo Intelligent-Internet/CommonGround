@@ -30,8 +30,8 @@ export default observer(function ChatPage() {
     selectionStore.clearSelection();
   }, []);
 
-  const sendMessage = useCallback(async (images?: any[]) => {
-    if ((!store.currentInput.trim() && !images?.length) || store.isLoading || store.isCreatingRun) return;
+  const sendMessage = useCallback(async (files?: any[]) => {
+    if ((!store.currentInput.trim() && !files?.length) || store.isLoading || store.isCreatingRun) return;
     
     // Close the sidebar (if on mobile or first message)
     if (sidebarContext) {
@@ -55,7 +55,7 @@ export default observer(function ChatPage() {
         
         // Send message
         store.setIsLoading(true);
-        await sessionStore.sendMessage(messageToSend, newRunId, images);
+        await sessionStore.sendMessage(messageToSend, newRunId, files);
 
         // Redirect to the newly created run page
         router.push(`/r?id=${newRunId}`);
