@@ -217,7 +217,7 @@ class InboxProcessor:
             try:
                 payload = item["payload"]
                 
-                if item.get("source") == "USER_PROMPT":
+                if item.get("source") in ["USER_PROMPT", "USER_PROMPT_WITH_FILES"]:
                     new_user_turn_id = self._create_user_turn_from_inbox_item(item)
                     if new_user_turn_id:
                         # Pass the "baton" so the next agent_turn can correctly link to this user_turn.
@@ -278,106 +278,170 @@ class InboxProcessor:
 
                         for f in files:
                             try:
-                                file_bytes = None
                                 filename = f.get("name") or f.get("filename") or f"file_{uuid.uuid4().hex[:6]}"
                                 mime_type = f.get("mimeType") or f.get("mime_type") or "application/octet-stream"
 
                                 if f.get("file_id"):
-                                    # Already uploaded
+                                    # Already uploaded, use file reference
                                     file_id = f["file_id"]
                                     logger.info("gemini_file_upload_skipped_existing", extra={
                                         "agent_id": self.agent_id,
-                                        "filename": filename,
+                                        "file_name": filename,
                                         "mime_type": mime_type,
                                         "file_id": file_id,
                                     })
+                                    # Use file reference
+                                    content_parts.append({
+                                        "type": "file",
+                                        "file": {
+                                            "file_id": file_id,
+                                            "filename": filename,
+                                            "format": mime_type
+                                        }
+                                    })
                                 else:
-                                    size_bytes = None
-                                    if f.get("url"):
+                                    # Check if we have direct base64 data from frontend
+                                    if f.get("data"):
+                                        # Frontend sent base64 data - use directly without file upload
+                                        data_str = f["data"]
+                                        
+                                        if isinstance(mime_type, str) and mime_type.startswith("image/"):
+                                            # Ensure proper data URL format for images
+                                            if not data_str.startswith("data:"):
+                                                image_url = f"data:{mime_type};base64,{data_str}"
+                                            else:
+                                                image_url = data_str
+                                            
+                                            content_parts.append({
+                                                "type": "image_url",
+                                                "image_url": {
+                                                    "url": image_url,
+                                                    "detail": "high"
+                                                }
+                                            })
+                                            
+                                            logger.info("image_processed_as_base64", extra={
+                                                "agent_id": self.agent_id,
+                                                "file_name": filename,
+                                                "mime_type": mime_type,
+                                                "method": "direct_base64"
+                                            })
+                                        else:
+                                            # Non-image files with base64 data
+                                            logger.info("non_image_file_with_base64", extra={
+                                                "agent_id": self.agent_id,
+                                                "file_name": filename,
+                                                "mime_type": mime_type,
+                                                "note": "Non-image files may not be fully supported"
+                                            })
+                                    
+                                    elif f.get("url"):
+                                        # URL-based file - need to fetch and potentially upload
+                                        file_bytes = None
+                                        
                                         # Async fetch
                                         async with httpx.AsyncClient(timeout=20) as client:
                                             resp = await client.get(f["url"])
                                             resp.raise_for_status()
                                             file_bytes = resp.content
+                                        
                                         size_bytes = len(file_bytes) if file_bytes is not None else None
-                                    elif f.get("data"):
-                                        # base64 string possibly without header
-                                        data_str = f["data"]
-                                        # Strip data URL prefix if present
-                                        if data_str.startswith("data:"):
-                                            data_str = data_str.split(",", 1)[1]
-                                        file_bytes = base64.b64decode(data_str)
-                                        size_bytes = len(file_bytes)
-                                    else:
-                                        # Unsupported entry, skip
-                                        logger.warning("file_entry_missing_data", extra={"agent_id": self.agent_id, "filename": filename})
-                                        continue
+                                        max_base64_size = 20 * 1024 * 1024  # 20MB
+                                        
+                                        if size_bytes and size_bytes < max_base64_size:
+                                            # Small file from URL - convert to base64
+                                            if isinstance(mime_type, str) and mime_type.startswith("image/"):
+                                                base64_data = base64.b64encode(file_bytes).decode()
+                                                image_url = f"data:{mime_type};base64,{base64_data}"
+                                                
+                                                content_parts.append({
+                                                    "type": "image_url",
+                                                    "image_url": {
+                                                        "url": image_url,
+                                                        "detail": "high"
+                                                    }
+                                                })
+                                                
+                                                logger.info("url_file_converted_to_base64", extra={
+                                                    "agent_id": self.agent_id,
+                                                    "file_name": filename,
+                                                    "mime_type": mime_type,
+                                                    "size_bytes": size_bytes
+                                                })
+                                            else:
+                                                logger.info("non_image_url_file_skipped", extra={
+                                                    "agent_id": self.agent_id,
+                                                    "file_name": filename,
+                                                    "mime_type": mime_type
+                                                })
+                                        else:
+                                            # Large file from URL - use Gemini file upload
+                                            # Prefer API key from project LLM config; fallback to env var
+                                            try:
+                                                resolver = LLMConfigResolver(shared_llm_configs=self.run_context.get("config", {}).get("shared_llm_configs_ref", {}))
+                                                llm_config = resolver.resolve(self.profile)
+                                            except Exception:
+                                                llm_config = {}
+                                            gemini_key = (
+                                                (llm_config.get("api_key") if isinstance(llm_config, dict) else None)
+                                                or os.getenv("GEMINI_API_KEY")
+                                            )
+                                            if not gemini_key:
+                                                logger.error(
+                                                    "gemini_api_key_missing",
+                                                    extra={
+                                                        "agent_id": self.agent_id,
+                                                        "hint": "Provide api_key in active LLM config or set GEMINI_API_KEY env var"
+                                                    }
+                                                )
+                                                continue
 
-                                    # Prefer API key from project LLM config; fallback to env var
-                                    try:
-                                        resolver = LLMConfigResolver(shared_llm_configs=self.run_context.get("config", {}).get("shared_llm_configs_ref", {}))
-                                        llm_config = resolver.resolve(self.profile)
-                                    except Exception:
-                                        llm_config = {}
-                                    gemini_key = (
-                                        (llm_config.get("api_key") if isinstance(llm_config, dict) else None)
-                                        or os.getenv("GEMINI_API_KEY")
-                                    )
-                                    if not gemini_key:
-                                        logger.error(
-                                            "gemini_api_key_missing",
-                                            extra={
+                                            # Structured start log
+                                            logger.info("gemini_file_upload_start", extra={
                                                 "agent_id": self.agent_id,
-                                                "hint": "Provide api_key in active LLM config or set GEMINI_API_KEY env var"
-                                            }
-                                        )
-                                        continue
+                                                "file_name": filename,
+                                                "mime_type": mime_type,
+                                                "size_bytes": size_bytes,
+                                                "reason": "file_too_large_for_base64"
+                                            })
+                                            t0 = time.perf_counter()
 
-                                    # Structured start log
-                                    logger.info("gemini_file_upload_start", extra={
-                                        "agent_id": self.agent_id,
-                                        "filename": filename,
-                                        "mime_type": mime_type,
-                                        "size_bytes": size_bytes,
-                                    })
-                                    t0 = time.perf_counter()
+                                            # Offload blocking create_file to a thread
+                                            created = await asyncio.to_thread(
+                                                create_file,
+                                                file=file_bytes,
+                                                purpose="user_data",
+                                                custom_llm_provider="gemini",
+                                                api_key=gemini_key,
+                                            )
+                                            file_id = getattr(created, "id", None) if created is not None else None
+                                            if not file_id:
+                                                logger.error("gemini_file_upload_failed", extra={
+                                                    "file_name": filename,
+                                                    "mime_type": mime_type,
+                                                    "size_bytes": size_bytes,
+                                                    "duration_ms": int((time.perf_counter() - t0) * 1000),
+                                                })
+                                                continue
+                                            else:
+                                                logger.info("gemini_file_upload_success", extra={
+                                                    "agent_id": self.agent_id,
+                                                    "file_name": filename,
+                                                    "mime_type": mime_type,
+                                                    "size_bytes": size_bytes,
+                                                    "file_id": file_id,
+                                                    "duration_ms": int((time.perf_counter() - t0) * 1000),
+                                                })
 
-                                    # Offload blocking create_file to a thread
-                                    created = await asyncio.to_thread(
-                                        create_file,
-                                        file=file_bytes,
-                                        purpose="user_data",
-                                        extra_body={"custom_llm_provider": "gemini"},
-                                        api_key=gemini_key,
-                                    )
-                                    file_id = getattr(created, "id", None) if created is not None else None
-                                    if not file_id:
-                                        logger.error("gemini_file_upload_failed", extra={
-                                            "filename": filename,
-                                            "mime_type": mime_type,
-                                            "size_bytes": size_bytes,
-                                            "duration_ms": int((time.perf_counter() - t0) * 1000),
-                                        })
-                                        continue
-                                    else:
-                                        logger.info("gemini_file_upload_success", extra={
-                                            "agent_id": self.agent_id,
-                                            "filename": filename,
-                                            "mime_type": mime_type,
-                                            "size_bytes": size_bytes,
-                                            "file_id": file_id,
-                                            "duration_ms": int((time.perf_counter() - t0) * 1000),
-                                        })
-
-                                # Append file reference content part
-                                content_parts.append({
-                                    "type": "file",
-                                    "file": {
-                                        "file_id": file_id,
-                                        "filename": filename,
-                                        "format": mime_type
-                                    }
-                                })
+                                            # Append file reference content part for large files
+                                            content_parts.append({
+                                                "type": "file",
+                                                "file": {
+                                                    "file_id": file_id,
+                                                    "filename": filename,
+                                                    "format": mime_type
+                                                }
+                                            })
                             except Exception as ex:
                                 logger.error("file_processing_failed", extra={"error": str(ex)}, exc_info=True)
                 

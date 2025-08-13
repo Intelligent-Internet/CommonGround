@@ -931,9 +931,13 @@ class AgentNode(AsyncNode):
                 if key in msg:
                     value = msg[key]
                     
-                    # Ensure content is a string
+                    # Handle content based on type - preserve multimodal structure
                     if key == "content":
-                        if isinstance(value, dict):
+                        if isinstance(value, list):
+                            # Multimodal content (list of parts) - preserve structure for LLM
+                            cleaned_msg[key] = value
+                            logger.debug("multimodal_content_preserved", extra={"message_role": msg.get('role'), "parts_count": len(value)})
+                        elif isinstance(value, dict):
                             # If content is a dictionary, convert it to a JSON string
                             import json
                             cleaned_msg[key] = json.dumps(value, ensure_ascii=False)
@@ -952,7 +956,53 @@ class AgentNode(AsyncNode):
             
             cleaned_messages.append(cleaned_msg)
         
+        # Validate message sequence for OpenAI API compliance
+        cleaned_messages = self._validate_message_sequence(cleaned_messages)
+        
         return cleaned_messages
+    
+    def _validate_message_sequence(self, messages: List[Dict]) -> List[Dict]:
+        """Validate and fix message sequence to ensure compliance with OpenAI API requirements."""
+        if not messages:
+            return messages
+            
+        # Check for invalid sequences and log warnings
+        for i in range(1, len(messages)):
+            prev_msg = messages[i-1]
+            curr_msg = messages[i]
+            
+            prev_role = prev_msg.get("role")
+            curr_role = curr_msg.get("role")
+            has_tool_calls = bool(curr_msg.get("tool_calls"))
+            
+            # Check for invalid function call sequences
+            if has_tool_calls and curr_role == "assistant":
+                # Function calls should come after user messages or tool responses
+                if prev_role not in ["user", "tool"]:
+                    logger.warning("invalid_function_call_sequence", extra={
+                        "agent_id": self.agent_id,
+                        "prev_role": prev_role,
+                        "curr_role": curr_role,
+                        "has_tool_calls": has_tool_calls,
+                        "position": i,
+                        "fix": "This may cause OpenAI API 400 errors"
+                    })
+            
+            # Check for consecutive assistant messages without tool interaction
+            if prev_role == "assistant" and curr_role == "assistant":
+                prev_has_tools = bool(prev_msg.get("tool_calls"))
+                curr_is_tool_response = bool(curr_msg.get("tool_call_id"))
+                
+                if not prev_has_tools and not curr_is_tool_response:
+                    logger.warning("consecutive_assistant_messages", extra={
+                        "agent_id": self.agent_id,
+                        "position": i,
+                        "prev_has_tools": prev_has_tools,
+                        "curr_is_tool_response": curr_is_tool_response,
+                        "fix": "This may cause message sequence issues"
+                    })
+        
+        return messages
 
     def _finalize_dangling_tool_in_turn(self, context: Dict):
         """
