@@ -202,7 +202,7 @@ export function ChatInput({
 
   return (
     <div className="p-3">
-      {/* 附件预览区域 */}
+      {/* Attachment preview area */}
       {files.length > 0 && (
         <div className="mb-3 p-3 bg-gray-50 rounded-lg">
           <div className="flex flex-wrap gap-2">
