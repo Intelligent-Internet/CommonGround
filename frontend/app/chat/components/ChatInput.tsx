@@ -137,7 +137,7 @@ export function ChatInput({
     }
   }, [addFile]);
 
-  // 处理文件选择
+  // Handle file selection
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (files) {
