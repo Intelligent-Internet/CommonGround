@@ -354,7 +354,7 @@ def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -
     # 构造一个简短的附件说明
     parts = []
     if images:
-        parts.append(f"用户上传了{len(images)}张图像")
+        parts.append(f"User uploaded {len(images)} image(s)")
     if files:
         # 可选：列出最多前3个文件名
         names = []
