@@ -339,7 +339,7 @@ def user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -> str:
 
 @register_ingestor("multimodal_user_prompt_ingestor")
 def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -> str:
-    """处理包含图像/文件的用户输入，返回适合LLM的简要文本描述（实际数据在消息构建时处理）。"""
+    """Processes user input containing images/files and returns a concise text description suitable for LLMs (actual data is handled during message construction)."""
     if not isinstance(payload, dict):
         return str(payload)
 
