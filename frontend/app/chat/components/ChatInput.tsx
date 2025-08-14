@@ -160,7 +160,7 @@ export function ChatInput({
     });
   }, []);
 
-  // 处理发送消息
+  // Handle sending message
   const handleSendMessage = useCallback(async () => {
     if (files.length > 0) {
       // Prefer file; convert to base64 dataUrl for all files <20MB (image/audio/video/text/document)
