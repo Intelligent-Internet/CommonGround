@@ -82,7 +82,14 @@ export function ChatInput({
     const isImage = file.type.startsWith('image/');
     const isAudio = file.type.startsWith('audio/');
     const isVideo = file.type.startsWith('video/');
-    // 文档类型：application/* 或 text/*，或通过拓展名兜底
+  // Paste event handler is defined below to ensure addFile is already declared
+
+  // Add file (image/audio/video/document)
+  const addFile = useCallback((file: File) => {
+    const isImage = file.type.startsWith('image/');
+    const isAudio = file.type.startsWith('audio/');
+    const isVideo = file.type.startsWith('video/');
+    // Document type: application/* or text/*, or fallback by extension
     const ext = file.name.split('.').pop()?.toLowerCase() || '';
     const docExts = new Set(['pdf','doc','docx','xls','xlsx','ppt','pptx','txt','rtf','md','csv']);
     const isDocByMime = file.type.startsWith('application/') || file.type.startsWith('text/');
