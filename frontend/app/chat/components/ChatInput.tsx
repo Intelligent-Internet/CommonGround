@@ -188,7 +188,7 @@ export function ChatInput({
     setFiles([]);
   }, [onSendMessage, files, fileToDataUrl]);
 
-  // 处理键盘事件
+  // Handle keyboard events
   const handleKeyPress = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
