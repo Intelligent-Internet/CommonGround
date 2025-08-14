@@ -365,7 +365,7 @@ def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -
         if names:
             parts.append(f"并附带{len(files)}个文件（示例：{', '.join(names)}{'' if len(files) <= 3 else ' 等'}）")
         else:
-            parts.append(f"并附带{len(files)}个文件")
+            parts.append(f"and attached {len(files)} files")
 
     note = "[" + "，".join(parts) + "]"
     return f"{prompt}\n\n{note}" if prompt else note
