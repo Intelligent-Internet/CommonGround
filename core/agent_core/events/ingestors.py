@@ -356,7 +356,7 @@ def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -
     if images:
         parts.append(f"User uploaded {len(images)} image(s)")
     if files:
-        # 可选：列出最多前3个文件名
+        # Optional: list up to the first 3 file names
         names = []
         for f in files[:3]:
             name = f.get("name") or f.get("filename")
