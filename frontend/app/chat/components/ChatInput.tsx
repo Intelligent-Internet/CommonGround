@@ -296,7 +296,7 @@ export function ChatInput({
         )}
       </div>
       
-      {/* 隐藏的文件输入 */}
+      {/* Hidden file input */}
       <input
         ref={fileInputRef}
         type="file"
