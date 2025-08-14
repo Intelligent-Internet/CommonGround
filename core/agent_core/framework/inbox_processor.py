@@ -263,7 +263,7 @@ class InboxProcessor:
                 has_multimodal_content = False
                 content_parts = []
                 
-                # 检查是否有文件内容
+                # Check if there is file content
                 if source in ["USER_PROMPT", "USER_PROMPT_WITH_FILES"] and isinstance(dehydrated_payload, dict):
                     # 处理文件内容：将附件上传到 Gemini 并构造成 file 引用
                     files = dehydrated_payload.get("files", [])
