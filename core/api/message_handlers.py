@@ -939,7 +939,7 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
                 partner_state = partner_context['state']
                 team_state = run_context['team_state']
 
-                # --- Core modification: Create an InboxItem with multimodal info (files only) ---
+                # --- Core modification: Create an InboxItem with multimodal info (text and/or files) ---
                 payload = {"prompt": prompt_content}
                 if files_content:
                     payload["files"] = files_content
