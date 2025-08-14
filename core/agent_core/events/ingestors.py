@@ -363,7 +363,7 @@ def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -
             if name:
                 names.append(name)
         if names:
-            parts.append(f"并附带{len(files)}个文件（示例：{', '.join(names)}{'' if len(files) <= 3 else ' 等'}）")
+            parts.append(f"and attached {len(files)} files (e.g., {', '.join(names)}{'' if len(files) <= 3 else ' etc.'})")
         else:
             parts.append(f"and attached {len(files)} files")
 
