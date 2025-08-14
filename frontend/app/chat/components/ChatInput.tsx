@@ -149,7 +149,7 @@ export function ChatInput({
     }
   }, [addFile]);
 
-  // 移除图像
+  // Remove image
   const removeFile = useCallback((id: string) => {
     setFiles(prev => {
       const target = prev.find(img => img.id === id);
