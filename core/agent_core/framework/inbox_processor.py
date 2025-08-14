@@ -259,7 +259,7 @@ class InboxProcessor:
                 role = params.get("role", "user")
                 is_persistent = params.get("is_persistent_in_memory", False)
                 
-                # 处理多模态内容（仅文件）
+                # Handle multimodal content (files only)
                 has_multimodal_content = False
                 content_parts = []
                 
