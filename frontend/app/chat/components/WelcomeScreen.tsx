@@ -1,14 +1,13 @@
 import React from 'react';
 import { observer } from 'mobx-react-lite';
-import { Button } from '@/components/ui/button';
-import { Textarea } from '@/components/ui/textarea';
 import { SidebarTrigger } from '@/components/ui/sidebar';
 import { selectionStore } from '@/app/stores/selectionStore';
+import { ChatInput } from './ChatInput';
 
 interface WelcomeScreenProps {
   currentInput: string;
   onInputChange: (value: string) => void;
-  onSendMessage: () => void;
+  onSendMessage: (files?: any[]) => void;
   onKeyPress: (e: React.KeyboardEvent) => void;
   isLoading: boolean;
 }
@@ -28,23 +27,16 @@ export const WelcomeScreen = observer(function WelcomeScreen({ currentInput, onI
       </div>
       <div className="flex-1 flex flex-col items-center justify-center">
         <h1 className="text-[32px] font-medium mb-12">What can I help you with?</h1>
-        <div className="w-[600px] relative mb-12">
-          <div className="rounded-lg border focus-within:border-black overflow-hidden transition-colors">
-            <Textarea
-              value={currentInput}
-              onChange={(e) => onInputChange(e.target.value)}
-              onKeyPress={onKeyPress}
-              placeholder="Enter message..."
-              className="min-h-[150px] resize-none w-full border-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
-            />
-          </div>
-          <Button 
-            onClick={onSendMessage}
-            disabled={!currentInput.trim() || isLoading}
-            className="absolute right-4 bottom-4 bg-black hover:bg-black/90 "
-          >
-            Send
-          </Button>
+        <div className="w-[600px] mb-12">
+          <ChatInput
+            currentInput={currentInput}
+            onInputChange={onInputChange}
+            onKeyPress={onKeyPress}
+            onSendMessage={onSendMessage}
+            isStreaming={false}
+            isLoading={isLoading}
+            onStopExecution={() => {}}
+          />
         </div>
         {/* <div className="flex flex-col items-start justify-center">
           <p className="font-medium text-lg">From the Community</p>

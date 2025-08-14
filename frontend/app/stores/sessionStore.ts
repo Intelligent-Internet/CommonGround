@@ -888,20 +888,50 @@ class SessionStore {
     }
   }
 
-  async sendMessage(message: string, runId: string) {
+  async sendMessage(message: string, runId: string, files?: any[]) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
         console.error("Cannot send message, WebSocket is not open.");
         this.error = "Connection failed. Cannot send message.";
         return;
     }
 
+    // 处理附件为统一的 files 数组（base64 data URL 或纯 base64）
+    const filesData = files ? await Promise.all(
+      files.map(async (f) => {
+        const base64 = await this.fileToBase64(f.file);
+        return {
+          data: base64,
+          name: f.name,
+          mimeType: f.file.type,
+        } as { data: string; name: string; mimeType: string };
+      })
+    ) : [];
+
+    const messagePayload: any = { prompt: message };
+    if (filesData.length > 0) {
+      messagePayload.files = filesData;
+    }
+
     this.ws.send(JSON.stringify({
         type: 'send_to_run',
         data: {
             run_id: runId,
-            message_payload: { prompt: message }
+            message_payload: messagePayload
         }
     }));
+  }
+
+  private fileToBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        const base64Data = result.split(',')[1];
+        resolve(base64Data);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
   }
 
   async stopExecution(runId: string) {

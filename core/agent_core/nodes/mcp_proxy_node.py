@@ -2,6 +2,7 @@ import logging
 import asyncio
 import anyio
 from typing import Dict, Any
+from pathlib import Path
 
 # Import the new base class
 from .base_tool_node import BaseToolNode
@@ -45,6 +46,38 @@ class MCPProxyNode(BaseToolNode):
             error_msg = f"MCPProxyNode ({self.unique_tool_name}): Agent's context-specific MCP Session Group not found."
             logger.error("mcp_proxy_session_group_not_found", extra={"unique_tool_name": self.unique_tool_name})
             return {"status": "error", "error_message": error_msg}
+
+        # 2.5 Normalize Windows paths in common parameters to avoid relative-path issues
+        def _normalize_paths_in_params(params: Dict[str, Any], tool_info: Dict[str, Any]) -> None:
+            if not isinstance(params, dict) or not isinstance(tool_info, dict):
+                return
+
+            properties = tool_info.get("parameters", {}).get("properties", {})
+            for param_name, schema in properties.items():
+                # Heuristic: Find string params that look like paths
+                is_path_like = (
+                    schema.get("type") == "string" and 
+                    ("path" in param_name.lower() or schema.get("format") == "uri-reference")
+                )
+
+                if is_path_like:
+                    value = params.get(param_name)
+                    if isinstance(value, str) and value.strip():
+                        p = Path(value)
+                        if not p.is_absolute():
+                            abs_p = (Path.cwd() / p).resolve()
+                            params[param_name] = str(abs_p)
+                            try:
+                                logger.debug("mcp_param_path_normalized", extra={
+                                    "unique_tool_name": self.unique_tool_name, 
+                                    "param": param_name, 
+                                    "original_path": value,
+                                    "abs_path": str(abs_p)
+                                })
+                            except Exception:
+                                pass
+
+        _normalize_paths_in_params(tool_params, self._tool_info)
 
         # 3. Execute the original business logic
         logger.info("mcp_proxy_tool_call_begin", extra={"unique_tool_name": self.unique_tool_name})

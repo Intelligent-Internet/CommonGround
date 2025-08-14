@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { observer } from 'mobx-react-lite';
 import { Button } from '@/components/ui/button';
-import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 import { SidebarTrigger } from '@/components/ui/sidebar';
 import {
@@ -22,11 +21,12 @@ import { projectStore } from '@/app/stores/projectStore';
 import { selectionStore } from '@/app/stores/selectionStore';
 import LoadingSpinner from '@/components/layout/LoadingSpinner';
 import { ProjectWithRuns } from '@/lib/types';
+import { ChatInput } from './ChatInput';
 
 interface ProjectPageProps {
   currentInput: string;
   onInputChange: (value: string) => void;
-  onSendMessage: () => void;
+  onSendMessage: (files?: any[]) => void;
   onKeyPress: (e: React.KeyboardEvent) => void;
   isLoading: boolean;
 }
@@ -285,22 +285,15 @@ export const ProjectPage = observer(function ProjectPage({
             {/* Chat Input Section */}
             <div>
               <h2 className="text-lg font-semibold mb-3">What can I help you?</h2>
-              <div className="relative">
-                <Textarea
-                  value={currentInput}
-                  onChange={(e) => onInputChange(e.target.value)}
-                  onKeyPress={onKeyPress}
-                  placeholder="Enter message..."
-                  className="min-h-[120px] resize-none w-full rounded-lg border p-4 pr-24 focus-visible:ring-1 focus-visible:ring-black"
-                />
-                <Button
-                  onClick={onSendMessage}
-                  disabled={!currentInput.trim() || isLoading}
-                  className="absolute right-3 bottom-3 bg-black hover:bg-black/90"
-                >
-                  Send
-                </Button>
-              </div>
+              <ChatInput
+                currentInput={currentInput}
+                onInputChange={onInputChange}
+                onKeyPress={onKeyPress}
+                onSendMessage={onSendMessage}
+                isStreaming={false}
+                isLoading={isLoading}
+                onStopExecution={() => {}}
+              />
             </div>
 
             {/* Project Instructions Section */}

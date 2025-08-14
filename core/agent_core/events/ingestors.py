@@ -337,6 +337,39 @@ def user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -> str:
         return payload.get("prompt", "")
     return str(payload)
 
+@register_ingestor("multimodal_user_prompt_ingestor")
+def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -> str:
+    """Processes user input containing images/files and returns a concise text description suitable for LLMs (actual data is handled during message construction)."""
+    if not isinstance(payload, dict):
+        return str(payload)
+
+    prompt = payload.get("prompt", "")
+    images = payload.get("images", [])
+    files = payload.get("files", [])
+
+    # If there are no images or files, return the text directly
+    if not images and not files:
+        return prompt
+
+    # Construct a brief attachment description
+    parts = []
+    if images:
+        parts.append(f"User uploaded {len(images)} image(s)")
+    if files:
+        # Optional: list up to the first 3 file names
+        names = []
+        for f in files[:3]:
+            name = f.get("name") or f.get("filename")
+            if name:
+                names.append(name)
+        if names:
+            parts.append(f"and attached {len(files)} files (e.g., {', '.join(names)}{'' if len(files) <= 3 else ' etc.'})")
+        else:
+            parts.append(f"and attached {len(files)} files")
+
+    note = "[" + ", ".join(parts) + "]"
+    return f"{prompt}\n\n{note}" if prompt else note
+
 def _recursive_markdown_formatter(data: Any, schema: Dict, level: int = 0) -> List[str]:
     """
     Intelligently formats data recursively into LLM-friendly Markdown.

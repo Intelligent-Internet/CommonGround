@@ -834,7 +834,7 @@ async def handle_manage_work_modules_request(ws_state: Dict, data: Dict):
 async def handle_send_to_run_message(ws_state: Dict, data: Dict):
     """
     Handles 'send_to_run' messages, routing client messages to the specified active business run.
-    This function is now also responsible for "activating" runs that are in the CREATED state.
+    Also handles multimodal payloads (files), and is responsible for activating runs in CREATED state.
     """
     event_manager = ws_state.event_manager
     session_id_for_log = event_manager.session_id
@@ -843,8 +843,17 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
     run_id_var.set(target_run_id)  # Set context variable
     message_payload = data.get("message_payload")
     extra_payload = data.get("extra_payload")
+    files_content = (message_payload or {}).get("files", [])
 
-    logger.info("send_to_run_received", extra={"session_id": session_id_for_log, "target_run_id": target_run_id, "message_preview": str(message_payload)[:100]})
+    logger.info(
+        "send_to_run_received",
+        extra={
+            "session_id": session_id_for_log,
+            "target_run_id": target_run_id,
+            "message_preview": str(message_payload)[:100],
+            "has_files": bool(files_content),
+        },
+    )
 
     if not target_run_id or message_payload is None:
         err_msg = "'send_to_run' requires 'run_id' and 'message_payload'."
@@ -868,10 +877,12 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
         if run_status == 'CREATED':
             logger.debug("run_activation_started", extra={"run_id": target_run_id, "run_type": run_type})
             
-            if prompt_content is None:
-                raise ValueError("First message to a new run must contain a 'prompt'.")
+            # Allow activation if there is either text or multimodal content
+            if (prompt_content is None) and (not files_content):
+                raise ValueError("First message must contain either 'prompt' text or attachments (files).")
             
-            run_context['team_state']['question'] = prompt_content
+            # If no text but attachments exist, use empty string to initialize question
+            run_context['team_state']['question'] = prompt_content or ""
             
             task = None
             if run_type == "partner_interaction":
@@ -879,10 +890,17 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
                 team_state = run_context['team_state']
                 partner_state = partner_context['state']
 
+                # Construct payload, using only the unified 'files' multimodal path
+                payload = {"prompt": prompt_content}
+                if files_content:
+                    payload["files"] = files_content
+                
                 inbox_item = {
                     "item_id": f"inbox_{uuid.uuid4().hex[:8]}",
-                    "source": "USER_PROMPT", # Use standardized event source
-                    "payload": {"prompt": prompt_content},
+                    "source": (
+                        "USER_PROMPT_WITH_FILES" if files_content else "USER_PROMPT"
+                    ), # Standardized source with multimodal marker when applicable
+                    "payload": payload,
                     "consumption_policy": "consume_on_read",
                     "metadata": {"created_at": datetime.now(timezone.utc).isoformat()}
                 }
@@ -912,19 +930,24 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
 
         # --- Branch 2: Send a message to a running session ---
         elif run_status in ['RUNNING', 'AWAITING_INPUT']:
-            if prompt_content is None:
-                raise ValueError("Message payload must contain a 'prompt'.")
+            # Allow sending if text or attachments exist
+            if (prompt_content is None) and (not files_content):
+                raise ValueError("Message must contain either 'prompt' text or attachments (files).")
 
             if run_type == "partner_interaction":
                 partner_context = run_context['sub_context_refs']['_partner_context_ref']
                 partner_state = partner_context['state']
                 team_state = run_context['team_state']
 
-                # --- Core modification: Similarly, only create an InboxItem ---
+                # --- Core modification: Create an InboxItem with multimodal info (text and/or files) ---
+                payload = {"prompt": prompt_content}
+                if files_content:
+                    payload["files"] = files_content
+                
                 inbox_item = {
                     "item_id": f"inbox_{uuid.uuid4().hex[:8]}",
-                    "source": "USER_PROMPT",
-                    "payload": {"prompt": prompt_content},
+                    "source": ("USER_PROMPT_WITH_FILES" if files_content else "USER_PROMPT"),
+                    "payload": payload,
                     "consumption_policy": "consume_on_read",
                     "metadata": {"created_at": datetime.now(timezone.utc).isoformat()}
                 }
@@ -949,12 +972,13 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
         logger.error("send_to_run_processing_error", extra={"session_id": session_id_for_log, "target_run_id": target_run_id, "run_type": run_type, "error_message": str(e)}, exc_info=True)
         await event_manager.emit_error(run_id=target_run_id, agent_id="System", error_message=f"Error processing message for run {target_run_id}: {str(e)}")
 
+
 # --- MESSAGE_HANDLERS registry (Dango's version, with adapted function names) ---
 MESSAGE_HANDLERS: Dict[str, callable] = {
     "start_run": handle_start_run_message,
     "stop_run": handle_stop_run_message,
     "request_available_toolsets": handle_request_available_toolsets,
-    "send_to_run": handle_send_to_run_message, # Added by Dango, adapted
+    "send_to_run": handle_send_to_run_message, # Unified handler
     "stop_managed_principal": handle_stop_managed_principal_message, # Added by Dango, adapted
     "request_run_profiles": handle_request_run_profiles_message, # Added by Dango, adapted
     "request_run_context": handle_request_run_context_message, # Added by Dango, adapted

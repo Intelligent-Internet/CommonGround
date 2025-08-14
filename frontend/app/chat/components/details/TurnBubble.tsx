@@ -177,6 +177,39 @@ export const TurnBubble = observer(({ turn, isHighlighted = false, onNodeIdClick
               {displayContent && (
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayContent}</ReactMarkdown>
               )}
+              
+              {/* Display uploaded images for user messages */}
+              {isUserTurn && turn.inputs?.files && turn.inputs.files.length > 0 && (
+                <div className="mt-3 space-y-2">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {turn.inputs.files.map((file, index) => (
+                      <div key={index} className="relative">
+                        {file.mimeType.startsWith('image/') ? (
+                          <div className="relative">
+                            <img
+                              src={file.data.startsWith('data:') ? file.data : `data:${file.mimeType};base64,${file.data}`}
+                              alt={file.name}
+                              className="max-w-full h-auto rounded-lg border border-gray-200 shadow-sm hover:shadow-md transition-shadow"
+                              style={{ maxHeight: '200px' }}
+                            />
+                            <div className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-50 text-white text-xs px-2 py-1 rounded-b-lg truncate">
+                              {file.name}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex items-center p-3 border border-gray-200 rounded-lg bg-gray-50">
+                            <div className="flex-1">
+                              <div className="text-sm font-medium text-gray-900 truncate">{file.name}</div>
+                              <div className="text-xs text-gray-500">{file.mimeType}</div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              
               {turn.tool_interactions?.map((interaction) => (
                 <ToolInteraction key={interaction.tool_call_id} interaction={interaction} />
               ))}

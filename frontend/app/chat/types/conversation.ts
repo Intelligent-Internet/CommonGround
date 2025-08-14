@@ -11,6 +11,11 @@ export interface Turn {
   end_time?: string | null;
   inputs?: {
     prompt?: string;
+    files?: Array<{
+      data: string;
+      name: string;
+      mimeType: string;
+    }>;
   } | null;
   llm_interaction?: {
     status?: 'running' | 'completed' | 'error';
