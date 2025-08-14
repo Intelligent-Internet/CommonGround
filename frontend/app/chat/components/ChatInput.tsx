@@ -97,7 +97,7 @@ export function ChatInput({
     // 小于 20MB 的所有文件（图片/音频/视频/文本/文档）在发送时统一转换为 dataUrl，
     // 大于等于 20MB 的文件在发送时通过 file 交给后端上传。
 
-    // 对图片生成 Blob URL 预览；音频/视频/文档仅保留文件与名称
+    // Generate Blob URL preview for images; for audio, video, and documents, only keep the file and name
     const objectUrl = isImage ? URL.createObjectURL(file) : '';
     const newAttachment: FileAttachment = {
       id: crypto.randomUUID(),
