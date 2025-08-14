@@ -119,7 +119,7 @@ export function ChatInput({
     setFiles(prev => [...prev, newAttachment]);
   }, [showError]);
 
-  // 处理粘贴事件（仅支持图片）
+  // Handle paste event (only supports images)
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
     const items = e.clipboardData?.items;
     if (!items) return;
