@@ -367,7 +367,7 @@ def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -
         else:
             parts.append(f"and attached {len(files)} files")
 
-    note = "[" + "，".join(parts) + "]"
+    note = "[" + ", ".join(parts) + "]"
     return f"{prompt}\n\n{note}" if prompt else note
 
 def _recursive_markdown_formatter(data: Any, schema: Dict, level: int = 0) -> List[str]:
