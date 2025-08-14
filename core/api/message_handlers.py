@@ -890,7 +890,7 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
                 team_state = run_context['team_state']
                 partner_state = partner_context['state']
 
-                # 构建payload，仅使用统一的 files 多模态路径
+                # Construct payload, using only the unified 'files' multimodal path
                 payload = {"prompt": prompt_content}
                 if files_content:
                     payload["files"] = files_content
