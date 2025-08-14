@@ -77,7 +77,7 @@ export function ChatInput({
 
   // 粘贴事件处理在下方定义，以确保依赖的 addFile 已声明
 
-  // 添加文件（图片/音频/视频/文档）
+  // Add file (image/audio/video/document)
   const addFile = useCallback((file: File) => {
     const isImage = file.type.startsWith('image/');
     const isAudio = file.type.startsWith('audio/');
