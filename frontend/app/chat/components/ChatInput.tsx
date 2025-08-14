@@ -251,7 +251,7 @@ export function ChatInput({
           files.forEach((f) => addFile(f));
         }}
       >
-        {/* 文件上传按钮 */}
+        {/* File upload button */}
         <Button
           variant="ghost"
           size="icon"
