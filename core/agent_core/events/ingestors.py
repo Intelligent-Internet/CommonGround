@@ -347,7 +347,7 @@ def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -
     images = payload.get("images", [])
     files = payload.get("files", [])
 
-    # 没有图像和文件时，直接返回文本
+    # If there are no images or files, return the text directly
     if not images and not files:
         return prompt
 
