@@ -351,7 +351,7 @@ def multimodal_user_prompt_ingestor(payload: Any, params: Dict, context: Dict) -
     if not images and not files:
         return prompt
 
-    # 构造一个简短的附件说明
+    # Construct a brief attachment description
     parts = []
     if images:
         parts.append(f"User uploaded {len(images)} image(s)")
