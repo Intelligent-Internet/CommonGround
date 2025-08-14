@@ -143,7 +143,7 @@ export function ChatInput({
     if (files) {
       Array.from(files).forEach(addFile);
     }
-    // 清空input值以允许重复选择同一文件
+    // Clear the input value to allow selecting the same file again
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
