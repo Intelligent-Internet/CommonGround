@@ -9,6 +9,15 @@ x-app-base: &app_base
     CG_CONFIG_TOML: /app/config.toml
     PROJECT_ID: ${PROJECT_ID:-proj_mvp_001}
     UV_PROJECT_ENVIRONMENT: /tmp/.venv
+    ZAI_API_KEY: ${ZAI_API_KEY:-}
+    MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+    MINIMAX_API_BASE: ${MINIMAX_API_BASE:-}
+    MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
+    MOONSHOT_API_BASE: ${MOONSHOT_API_BASE:-}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
     GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     GOOGLE_API_KEY: ${GOOGLE_API_KEY:-${GEMINI_API_KEY:-}}
     CG__observability__otel__enabled: ${CG__observability__otel__enabled:-true}

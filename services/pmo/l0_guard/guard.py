@@ -26,7 +26,7 @@ logger = logging.getLogger("PMO.L0Guard")
 
 
 class L0Guard:
-    """L0 控制面：负责 head 的重发与回收（不涉及任何 L1 编排语义）。"""
+    """L0 control plane responsible for head retransmission and recovery (no L1 orchestration semantics)."""
 
     def __init__(
         self,
@@ -75,7 +75,7 @@ class L0Guard:
                 default_depth=default_depth,
             )
         except ProtocolViolationError as exc:
-            logger.warning("Watchdog defaulted headers: %s", exc)
+            logger.warning("Watchdog default header normalization fallback: %s", exc)
             normalized, resolved_trace_id, depth = normalize_headers(
                 nats=self.nats,
                 headers={},
@@ -148,7 +148,7 @@ class L0Guard:
                     )
                     deliverable_card_id = deliverable.card_id
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Watchdog ensure deliverable failed agent=%s: %s", head.agent_id, exc)
+            logger.warning("Watchdog failed to generate fallback deliverable, agent=%s: %s", head.agent_id, exc)
         return deliverable_card_id
 
     async def retry_stuck_dispatched(self) -> None:
@@ -160,7 +160,7 @@ class L0Guard:
         for head in heads:
             if not head.active_agent_turn_id or not head.active_channel_id:
                 logger.warning(
-                    "Watchdog skip dispatched head missing turn/channel agent=%s",
+                    "Watchdog skip resend: head missing turn or channel, agent=%s",
                     head.agent_id,
                 )
                 continue
@@ -221,7 +221,7 @@ class L0Guard:
                 agent_id=head.agent_id,
             )
             if not target:
-                logger.warning("Watchdog wakeup skipped: missing worker_target agent=%s", head.agent_id)
+                logger.warning("Watchdog skip wake-up: missing worker_target, agent=%s", head.agent_id)
                 continue
             wakeup_subject = format_subject(
                 head.project_id,
@@ -237,7 +237,7 @@ class L0Guard:
                 headers=headers,
             )
             logger.warning(
-                "Watchdog resent wakeup agent=%s turn=%s epoch=%s",
+                "Watchdog retransmitting wake-up: agent=%s turn=%s epoch=%s",
                 head.agent_id,
                 head.active_agent_turn_id,
                 head.turn_epoch,
@@ -267,7 +267,7 @@ class L0Guard:
             if not updated:
                 continue
             logger.warning(
-                "Watchdog dispatched timeout agent=%s turn=%s epoch=%s",
+                "Watchdog handling dispatch timeout: agent=%s turn=%s epoch=%s",
                 head.agent_id,
                 head.active_agent_turn_id,
                 head.turn_epoch,
@@ -329,7 +329,7 @@ class L0Guard:
                 stats={},
             )
 
-            # Best-effort: advance queued mailbox after forcing idle.
+            # Try to move forward in the queue after forcing idle.
             try:
                 await self.l0.wakeup(
                     project_id=head.project_id,
@@ -340,7 +340,7 @@ class L0Guard:
                     headers=headers,
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Watchdog wakeup(dispatch_next) failed agent=%s: %s", head.agent_id, exc)
+                logger.warning("Watchdog wake-up (dispatch_next) failed agent=%s: %s", head.agent_id, exc)
 
     async def reap_stuck_active(self) -> None:
         heads = await self.state_store.list_stuck_active(
@@ -363,14 +363,14 @@ class L0Guard:
             )
             if updated:
                 logger.warning(
-                    "Watchdog reaped stale turn agent=%s turn=%s epoch=%s prev_status=%s",
+                    "Watchdog cleaning stale turn: agent=%s turn=%s epoch=%s prev_status=%s",
                     head.agent_id,
                     head.active_agent_turn_id,
                     head.turn_epoch,
                     head.status,
                 )
 
-                # Best-effort: advance queued mailbox after forcing idle.
+                # Try to move forward in the queue after forcing idle.
                 headers, _, _ = self._normalize_watchdog_headers(
                     trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
                     default_depth=int(getattr(head, "active_recursion_depth", 0) or 0),
@@ -385,7 +385,7 @@ class L0Guard:
                         headers=headers,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("Watchdog wakeup(dispatch_next) failed agent=%s: %s", head.agent_id, exc)
+                    logger.warning("Watchdog wake-up (dispatch_next) failed agent=%s: %s", head.agent_id, exc)
 
                 headers, _, _ = self._normalize_watchdog_headers(
                     trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
@@ -408,7 +408,7 @@ class L0Guard:
                     metadata={"error": "timeout_reaped_by_watchdog"},
                 )
 
-                # 1. Record Audit
+                # 1. Record audit
                 await self.state_store.record_force_termination(
                     project_id=head.project_id,
                     agent_id=head.agent_id,
@@ -417,13 +417,13 @@ class L0Guard:
                     output_box_id=head.output_box_id,
                 )
 
-                # 1b. Best-effort deliverable (avoid consumers scanning output_box).
+                # 1b. Best-effort complete deliverable to avoid downstream scanning on output_box.
                 deliverable_card_id = await self._ensure_watchdog_deliverable(
                     head,
                     reason="timeout_reaped_by_watchdog",
                 )
                 
-                # 2. Publish Event
+                # 2. Publish event
                 headers, _, _ = self._normalize_watchdog_headers(
                     trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
                     default_depth=int(getattr(head, "active_recursion_depth", 0) or 0),
@@ -498,14 +498,14 @@ class L0Guard:
                         status="skipped",
                     )
                     logger.warning(
-                        "Watchdog skipped pending wakeup missing channel inbox=%s agent=%s age=%.1fs",
+                        "Watchdog skipping pending wake-up: missing channel, inbox=%s agent=%s age=%.1fs",
                         inbox_id,
                         agent_id,
                         age_seconds,
                     )
                     continue
                 logger.warning(
-                    "Watchdog skip pending wakeup missing channel inbox=%s agent=%s",
+                    "Watchdog skipping pending wake-up: missing channel, inbox=%s agent=%s",
                     inbox_id,
                     agent_id,
                 )
@@ -517,7 +517,7 @@ class L0Guard:
                 agent_id=agent_id,
             )
             if not target:
-                logger.warning("Watchdog pending wakeup skipped: missing worker_target agent=%s", agent_id)
+                logger.warning("Watchdog skipping pending wake-up: missing worker_target, agent=%s", agent_id)
                 continue
             subject = format_subject(
                 project_id,

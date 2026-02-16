@@ -4,5 +4,4 @@ __pycache__
 *.pyc
 .pytest_cache
 .mypy_cache
-phase1
 docs

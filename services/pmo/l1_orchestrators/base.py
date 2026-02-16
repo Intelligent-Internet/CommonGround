@@ -26,7 +26,7 @@ class BatchCreateRequest:
 
 
 class Orchestrator(Protocol):
-    """L1 编排器接口（抽象语义，不绑定具体实现/存储）。"""
+    """L1 orchestrator interface (abstract semantics, decoupled from concrete implementations or storage)."""
 
     async def create_batch(
         self,

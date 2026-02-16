@@ -381,10 +381,13 @@ def get_identity_store() -> IdentityStore:
 app = FastAPI(title="CommonGround API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    # Dev ergonomics: Ground Control may be opened via 127.0.0.1/localhost/0.0.0.0/LAN IP,
-    # and CORS failures look like "TypeError: Failed to fetch" in the browser.
-    allow_origin_regex=r"^https?://.*$",
-    allow_origins=[],
+    # Allow only the known local frontend hosts used during development.
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8010",
+        "http://localhost:3000",
+    ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

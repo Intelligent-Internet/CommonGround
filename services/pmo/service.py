@@ -1,4 +1,4 @@
-"""Phase 2c PMO service entrypoint (refactored).
+"""PMO service entrypoint (refactored).
 
 Listens for PMO-targeted tool commands (`cmd.sys.pmo.>`), validates tool
 definitions from Postgres, and dispatches to PMO internal (L1) handlers.

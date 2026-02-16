@@ -3,7 +3,7 @@
 Fastest path:
 
 ```bash
-cd CommonGround-next
+cd CommonGround
 docker compose up -d nats postgres
 docker compose -f observability/otel/docker-compose.jaeger.yml up -d
 ```
@@ -34,4 +34,4 @@ UI:
 - Jaeger: `http://localhost:16686`
 - Tempo: `docker compose -f observability/otel/docker-compose.tempo.yml up -d` then Grafana `http://localhost:3000`
 
-More details: `docs/Legacy/04_observability/otel_quickstart.md`
+More details: `docs/05_operations/observability.md`

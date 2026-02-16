@@ -39,7 +39,7 @@ async def main_async(*, project_id: str, dsn: str, ensure_schema_flag: bool) -> 
             await ensure_schema(pool)
             print("[seed] schema ensured")
 
-        await ensure_project(pool, project_id=project_id, title="MVP Test Project", owner_id="user_seed")
+        await ensure_project(pool, project_id=project_id, title="Sample Test Project", owner_id="user_seed")
         print(f"[seed] project ensured: {project_id}")
 
         bootstrapper = ProjectBootstrapper(pool=pool)

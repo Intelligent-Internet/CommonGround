@@ -1,16 +1,16 @@
 """
-Demo: minimal principal run with streaming chunks
+Demo: minimal principal streaming example.
 
 Goals:
-- Avoid external tools (no web_search / openapi / etc.)
-- Exercise the Inbox + Wakeup run flow
+- No external tools (no web_search / openapi / etc).
+- Demonstrate Inbox + Wakeup flow.
 - Print core NATS streaming chunks: cg.v1r3.{project}.{channel}.str.agent.{agent_id}.chunk
 - Wait for completion event: cg.v1r3.{project}.{channel}.evt.agent.{agent_id}.task
 
 Notes:
-- The Worker currently publishes streaming chunks ONLY for LLM delta.content (chunk_type="content").
-  If the model returns tool_calls with empty content, you may see no chunks.
-- Completion requires builtin tool `submit_result` (the profile prompt below instructs the model to call it).
+- Worker only emits streaming chunks for LLM delta.content (chunk_type="content").
+- If the model returns empty tool_calls, no chunk may be visible.
+- Completion depends on built-in tool `submit_result` (the profile prompt below requires it).
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ async def _create_profile_box(
             "name": "PrincipalStreamDebug",
             "worker_target": "worker_generic",
             "tags": ["principal"],
-            "description": "Minimal principal profile for streaming debug (no external tools).",
+            "description": "Minimal principal config for streaming debug without external tools.",
             "delegation_policy": {"target_tags": [], "target_profiles": []},
             "allowed_tools": [],
             "llm_config": {
@@ -66,10 +66,10 @@ async def _create_profile_box(
             },
             "system_prompt_template": (
                 "You are a principal agent.\n"
-                "Answer the user's question directly.\n"
-                "Do NOT call any external tools.\n"
-                "After producing the answer, call submit_result EXACTLY once to finish the run.\n"
-                "In submit_result, fill required fields with plain-text values.\n"
+                "Answer the user question directly.\n"
+                "Do not call any external tools.\n"
+                "After answering, call submit_result exactly once to end this turn.\n"
+                "In submit_result, fill required fields with plain text only.\n"
             ),
         }),
         created_at=datetime.now(UTC),
@@ -103,15 +103,15 @@ async def _create_context_box(
     fields_card_id: Optional[str] = None
     if fields_mode != "none":
         if fields_mode == "minimal":
-            required = [{"name": "output", "description": "可直接消费的主要产出（text）"}]
+            required = [{"name": "output", "description": "Primary output (text) directly consumable"}]
         else:
             required = [
-                {"name": "summary", "description": "简要总结本次任务结果（text）"},
-                {"name": "output", "description": "可直接消费的主要产出（text）"},
-                {"name": "sources", "description": "引用/来源（可选，text）"},
+                {"name": "summary", "description": "Brief summary of task result (text)"},
+                {"name": "output", "description": "Primary output (text) directly consumable"},
+                {"name": "sources", "description": "References/sources (optional, text)"},
             ]
 
-        # Ensure the submit_result tool schema matches what you want to validate.
+        # Ensure submit_result field definitions align with validation requirements.
         fields_card_id = uuid6.uuid7().hex
         fields = Card(
             card_id=fields_card_id,
@@ -170,7 +170,7 @@ async def _create_followup_context_box(
                 continue
             merged_ids.append(cid)
         if skipped_deliverables:
-            print(f"[demo] followup context filtered task.deliverable cards: {skipped_deliverables}")
+            print(f"[demo] followup context filtered out {skipped_deliverables} task.deliverable cards")
 
     merged_ids.append(continue_card_id)
 
@@ -208,7 +208,7 @@ async def _run_demo(
     nats = NATSClient(config=(cfg.get("nats", {}) if isinstance(cfg, dict) else {}))
     await nats.connect()
 
-    # Prepare boxes
+    # Prepare context and output box
     profile_box_id = await _create_profile_box(
         cardbox,
         project_id=project_id,
@@ -230,7 +230,7 @@ async def _run_demo(
     headers, _, trace_id = ensure_trace_headers({}, trace_id=str(uuid6.uuid7()))
     headers = ensure_recursion_depth(headers, default_depth=0)
 
-    # Ensure the agent exists in roster with a worker_target; otherwise dispatch fails with worker_target_missing.
+    # Ensure this agent exists in roster with worker_target to avoid worker_target_missing.
     await ensure_agent_ready(
         resource_store=resource_store,
         state_store=state,
@@ -281,10 +281,10 @@ async def _run_demo(
             return
         if not current_turn_id or data.get("agent_turn_id") != current_turn_id:
             return
-        print("\n\n[demo] task event:", json.dumps(data, ensure_ascii=False, indent=2))
+        print("\n[demo] Task event: ", json.dumps(data, ensure_ascii=False, indent=2))
         done.set()
 
-    # Core subscriptions (stream is core; task evt is also visible via core).
+    # Core subscription (stream is core; task evt is also visible via core).
     await nats.subscribe_core(stream_subject, on_chunk)
     await nats.subscribe_core(task_subject, on_task)
     async def on_turn(msg) -> None:
@@ -296,11 +296,11 @@ async def _run_demo(
             return
         phase = data.get("phase")
         if phase in ("completed", "failed"):
-            print("\n[demo] turn event:", json.dumps(data, ensure_ascii=False, indent=2))
+            print("\n[demo] Turn event: ", json.dumps(data, ensure_ascii=False, indent=2))
 
     await nats.subscribe_core(step_subject, on_turn)
 
-    print(f"[demo] stream subject: {stream_subject}")
+    print(f"[demo] Streaming subject: {stream_subject}")
     print(f"[demo] output_box_id: {output_box_id}")
 
     async def _dispatch_turn(turn_idx: int, *, context_box_id: str, turn_question: str) -> str:
@@ -321,16 +321,16 @@ async def _run_demo(
         )
         if dispatch_result.status not in ("accepted", "pending") or not dispatch_result.agent_turn_id:
             raise RuntimeError(
-                f"turn{turn_idx} dispatch failed: {dispatch_result.status} ({dispatch_result.error_code})"
+                f"Failed to dispatch turn #{turn_idx}: {dispatch_result.status} ({dispatch_result.error_code})"
             )
         current_turn_id = dispatch_result.agent_turn_id
         done.clear()
         print(
-            f"\n[demo] turn{turn_idx} dispatched agent_id={agent_id} run={current_turn_id} "
+            f"\n[demo] Turn #{turn_idx} dispatched agent_id={agent_id} run={current_turn_id} "
             f'question="{turn_question}" context_box_id={context_box_id} context_cards={context_count}'
         )
         await asyncio.wait_for(done.wait(), timeout=timeout_seconds)
-        print(f"[demo] turn{turn_idx} completed run={current_turn_id}")
+        print(f"[demo] Turn #{turn_idx} completed, run={current_turn_id}")
         return current_turn_id
 
     try:
@@ -351,7 +351,7 @@ async def _run_demo(
         )
         await _dispatch_turn(2, context_box_id=second_context_box_id, turn_question="continue")
     except asyncio.TimeoutError:
-        print(f"\n[demo] timeout waiting for evt.agent.*.task (run={current_turn_id})")
+        print(f"\n[demo] Timeout while waiting for evt.agent.*.task (run={current_turn_id})")
     finally:
         await execution_store.close()
         await resource_store.close()
@@ -361,20 +361,20 @@ async def _run_demo(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Minimal principal streaming demo (no external tools).")
+    parser = argparse.ArgumentParser(description="Minimal principal streaming demo without external tools.")
     parser.add_argument("--agent", dest="agent_id", default="principal_stream_debug_01")
     parser.add_argument("--project", dest="project_id", default="proj_mvp_001")
     parser.add_argument("--channel", dest="channel_id", default="public")
-    parser.add_argument("--question", required=True, help="User question for the principal agent.")
+    parser.add_argument("--question", required=True, help="Question for the principal agent to answer.")
     parser.add_argument("--model", default="gemini/gemini-2.5-flash")
     parser.add_argument("--provider", default="gemini", help="LiteLLM provider (custom_llm_provider).")
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--no-stream", action="store_true", help="Disable LLM streaming in llm_config.")
+    parser.add_argument("--no-stream", action="store_true", help="Disable streaming output in llm_config.")
     parser.add_argument(
         "--fields-mode",
         choices=["full", "minimal", "none"],
         default="full",
-        help="task.result_fields required fields validation mode. Use minimal/none for mock models.",
+        help="Validation mode for task.result_fields. Supported: minimal/none (mock-model-friendly).",
     )
     parser.add_argument("--timeout", type=int, default=120)
     args = parser.parse_args()

@@ -1,4 +1,4 @@
--- Phase 2b: PMO schema (L1 internal hard cut)
+-- PMO schema
 -- Run AFTER scripts/setup/init_db.sql. This file only contains PMO-specific tables.
 
 -- Ensure schemas exist (idempotent for local dev)

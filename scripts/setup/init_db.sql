@@ -1,4 +1,4 @@
--- Phase 2a MVP Database Initialization
+-- Database Initialization
 -- Run this to setup the required schema for the Generic Agent Worker
 
 CREATE SCHEMA IF NOT EXISTS resource;

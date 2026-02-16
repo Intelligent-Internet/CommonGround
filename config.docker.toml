@@ -49,28 +49,19 @@ worker_target = "ui_worker"
 [observability.otel]
 enabled = false
 service_namespace = "commonground"
-service_name = "commonground-next"
+service_name = "CommonGround"
 service_version = "0.1.0"
 otlp_endpoint = "http://otel-collector:4318/v1/traces"
 sampler_ratio = 1.0
 
-[a2a.delegate_tool]
-# Controls the PMO delegate_async handler; ensure the tool exists via
-# `uv run -m scripts.setup.seed --project <project_id>` before running in Docker.
-# Name must match the delegate worker profile created by commonground-next-a2a/bootstrap scripts.
-enabled = true
-profile_name = "A2A Delegate Worker"
-timeout_seconds = 180.0
-stream_chunks_default = true
-
 [gcs]
-bucket = "your-bucket"
+bucket = ""
 prefix = "commonground"
 credentials_path = "/var/secrets/gcp-key.json"
 
 [skills]
 mode = "remote"
-cache_root = "/var/lib/skills-cache"
+cache_root = "./skills-cache"
 local_root = "/tmp/skills-local"
 max_file_bytes = 204800
 timeout_sec_default = 60

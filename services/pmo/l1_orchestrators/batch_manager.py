@@ -901,7 +901,7 @@ class BatchManager:
         revert_after = max(reconcile_after, float(revert_after_seconds))
         limit_value = min(int(limit), self.watchdog_limit)
 
-        # Phase 1: fill turn_epoch for dispatched tasks that were actually enqueued.
+        # Reconcile dispatched tasks that were actually enqueued and are missing turn epoch.
         rows = await self.batch_store.list_stuck_dispatched_missing_epoch(
             older_than_seconds=reconcile_after,
             limit=limit_value,
@@ -936,7 +936,7 @@ class BatchManager:
                 epoch,
             )
 
-        # Phase 2: if a task remains "dispatched" but has no epoch/inbox for too long, warn.
+        # Detect dispatched tasks without epoch/inbox for too long and emit warnings.
         #
         # Do NOT auto-revert here: L0 cmds are durable (JetStream). A late-delivered cmd could still
         # enqueue/execute, and reverting would break turn_id correlation and/or cause duplicates.

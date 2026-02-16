@@ -70,7 +70,7 @@ async def seed_tools(pool: AsyncConnectionPool, project_id: str) -> None:
           options=EXCLUDED.options;
     """
     tools = [
-            # PMO tools (L1 internal hard cut)
+            # PMO tools (L1-internal handlers)
             {
                 "tool_name": "provision_agent",
                 "target_subject": PROTOCOL_PREFIX + ".{project_id}.{channel_id}.cmd.sys.pmo.internal.provision_agent",

@@ -218,8 +218,8 @@ def _parse_datetime(value: Any) -> Optional[datetime]:
 
 class CardBox(BaseModel):
     """
-    DTO: 仅用于 NATS 传输的卡片 ID 列表容器。
-    不要在此添加业务逻辑。
+    DTO: Container for card ID lists used only for NATS transport.
+    Do not add business logic here.
     """
 
     card_ids: List[str] = Field(default_factory=list)
@@ -227,18 +227,19 @@ class CardBox(BaseModel):
 
 class Card(BaseModel):
     """
-    Pydantic 表层 Card：用于消息/事件序列化，与 card_box_core.Card 一一映射。
+    Pydantic facade Card used for message/event serialization, mapped
+    one-to-one with card_box_core.Card.
 
-    语义类型 (type) 规范 v1r2 (Phase 2c):
-    - task.instruction: 任务指令 (Role: user)
-    - agent.thought: 思考与意图 (Role: assistant)
-    - tool.call: 工具调用请求 (Role: assistant)
-    - tool.result: 工具执行结果 (Role: tool)
-    - task.deliverable: 任务交付物 (Role: assistant)
-    - sys.profile: Agent 静态配置 (Role: system)
-    - sys.rendered_prompt: 渲染后的系统提示词快照 (Role: system)
-    - sys.tools: 工具定义快照 (Role: system)
-    - meta.parent_pointer: 父级任务指针 (Role: system)
+    Semantic type (type) spec v1r2:
+    - task.instruction: Task instruction (Role: user)
+    - agent.thought: Thought and intent (Role: assistant)
+    - tool.call: Tool call request (Role: assistant)
+    - tool.result: Tool execution result (Role: tool)
+    - task.deliverable: Task deliverable (Role: assistant)
+    - sys.profile: Agent static configuration (Role: system)
+    - sys.rendered_prompt: Rendered system prompt snapshot (Role: system)
+    - sys.tools: Tool definitions snapshot (Role: system)
+    - meta.parent_pointer: Parent task pointer (Role: system)
     """
 
     model_config = ConfigDict(populate_by_name=True, frozen=True, extra="forbid")

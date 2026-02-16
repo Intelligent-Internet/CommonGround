@@ -28,7 +28,7 @@ _TRACER = get_tracer("infra.nats_client")
 
 @dataclass(frozen=True)
 class NATSSubscriptionHandle:
-    """Handle returned by subscribe_* helpers for lifecycle management."""
+    """Handle returned by subscribe_* helper methods for lifecycle control."""
 
     durable_name: str
     task: asyncio.Task
@@ -40,9 +40,9 @@ class NATSSubscriptionHandle:
         """
         Wait for the underlying subscription task to finish.
 
-        By default, treat cancellation (for example, after calling stop())
-        as a normal, successful completion so that asyncio.CancelledError
-        does not leak to callers that only catch Exception.
+        By default, stop operations (e.g., calling stop()) are treated as successful
+        completion to avoid asyncio.CancelledError leaking into callers that only
+        catch Exception.
         """
         try:
             await self.task
@@ -50,9 +50,10 @@ class NATSSubscriptionHandle:
             if not cancel_ok:
                 raise
 class NATSClient:
-    """Thin wrapper around NATS/JetStream with optional TLS.
+    """Lightweight NATS/JetStream wrapper with optional TLS.
 
-    TLS,证书目录、服务器地址均由配置传入，便于本地非 TLS 测试。
+    TLS certificate directory and server addresses come from config to support local
+    non-TLS testing.
     """
 
     def __init__(
@@ -64,7 +65,7 @@ class NATSClient:
     ):
         cfg = config or {}
 
-        # servers 是 NATS endpoint 的唯一配置来源。
+        # servers is the single source of NATS endpoint configuration.
         raw_servers = (
             servers
             if isinstance(servers, list)
@@ -109,7 +110,7 @@ class NATSClient:
             except Exception:
                 return False
 
-        # cmd.* retention: 24h; evt.* retention: 7d
+        # cmd.* retention is 24 hours; evt.* retention is 7 days.
         if not await _exists(cmd_stream):
             try:
                 await self.js.add_stream(
@@ -130,7 +131,7 @@ class NATSClient:
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to create JetStream stream {cmd_stream!r}. "
-                    "If you previously used a legacy stream with overlapping subjects, delete it and retry."
+                    "If an older overlapping stream was used before, delete it first and retry."
                 ) from exc
         if not await _exists(evt_stream):
             try:
@@ -152,7 +153,7 @@ class NATSClient:
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to create JetStream stream {evt_stream!r}. "
-                    "If you previously used a legacy stream with overlapping subjects, delete it and retry."
+                    "If an older overlapping stream was used before, delete it first and retry."
                 ) from exc
 
         self._streams_ready = True
@@ -165,7 +166,9 @@ class NATSClient:
             client_key = os.path.join(self.cert_dir, "client.key")
 
             if not os.path.exists(ca_file):
-                print(f"[WARN] Certs not found at {self.cert_dir}, attempting TLS may fail; falling back to plain if missing.")
+                print(
+                    f"[WARN] Certificate directory {self.cert_dir} not found; TLS connection may fail and fallback to plain mode."
+                )
 
             ssl_ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
             try:
@@ -173,7 +176,7 @@ class NATSClient:
                 ssl_ctx.load_cert_chain(certfile=client_cert, keyfile=client_key)
                 ssl_ctx.check_hostname = False
             except FileNotFoundError:
-                print("[NATS] TLS files not found, switching to non-TLS connection for dev mode")
+                print("[NATS] TLS files not found; switching to non-TLS mode in development.")
                 ssl_ctx = None
 
         await self.nc.connect(
@@ -183,7 +186,7 @@ class NATSClient:
         self.js = self.nc.jetstream()
         await self._ensure_cg_streams()
         proto = "tls" if ssl_ctx else "plain"
-        print(f"[NATS] Connected to {self.servers} ({proto})")
+        print(f"[NATS] Connected to {self.servers} (mode={proto})")
 
     @traced(
         _TRACER,
@@ -202,7 +205,7 @@ class NATSClient:
         _span: Any = None,
     ):
         if not self.js:
-            raise Exception("NATS JetStream not connected")
+            raise Exception("NATS JetStream is not connected")
         await self._ensure_cg_streams()
 
         final_headers: Dict[str, str] = dict(headers or {})
@@ -222,7 +225,7 @@ class NATSClient:
 
         inject_context_to_headers(final_headers)
 
-        # Enforce cg-next header contract: inject defaults if missing.
+        # Fill in missing cg-next header field conventions.
         now_ms = str(int(time.time() * 1000))
         if not final_headers.get(TRACEPARENT_HEADER):
             traceparent, _ = next_traceparent(None)
@@ -230,7 +233,7 @@ class NATSClient:
         final_headers.setdefault("CG-Timestamp", now_ms)
         final_headers.setdefault("CG-Version", PROTOCOL_VERSION)
 
-        # Infer message type when caller未显式传入。
+        # Infer message type when the caller does not explicitly pass one.
         inferred_msg_type = None
         if isinstance(payload, dict):
             inferred_msg_type = payload.get("__msg_type__")
@@ -241,14 +244,15 @@ class NATSClient:
         if span is not None:
             span.set_attribute("messaging.message_type", str(final_headers.get("CG-Msg-Type")))
 
-        # Guardrail: 元数据不得混入业务 Payload
+        # Guardrail: business payload should not include metadata fields.
         if isinstance(payload, dict):
             leaked_meta = [
                 k for k in payload.keys() if isinstance(k, str) and k.lower().startswith("cg-")
             ]
             if leaked_meta:
                 print(
-                    f"[NATS] WARN payload carries header-like fields, consider moving to headers: {leaked_meta}"
+                    f"[NATS] Warning: payload contains suspected header fields {leaked_meta}. "
+                    "Use headers instead."
                 )
 
         data = json.dumps(payload, default=str).encode("utf-8")
@@ -264,11 +268,11 @@ class NATSClient:
                 if attempt >= attempts:
                     mark_span_error(span, exc)
                     print(
-                        f"[NATS] publish failed after {attempts} attempts subject={subject}: {exc}"
+                        f"[NATS] Publish failed after {attempts} retries, still failed for subject={subject}: {exc}"
                     )
                     raise
                 print(
-                    f"[NATS] publish failed attempt={attempt}/{attempts} subject={subject}: {exc} (retry in {delay}s)"
+                    f"[NATS] Publish failed attempt={attempt}/{attempts}, subject={subject}: {exc} (retry after {delay}s)"
                 )
                 if delay:
                     await asyncio.sleep(delay)
@@ -292,7 +296,7 @@ class NATSClient:
     @staticmethod
     def _warn_missing_headers(headers: Dict[str, str], subject: str) -> None:
         if not headers.get(TRACEPARENT_HEADER):
-            print(f"[NATS] WARN missing traceparent header (subject={subject})")
+            print(f"[NATS] Warning: missing traceparent header (subject={subject})")
 
     def _configure_consumer(
         self,
@@ -334,7 +338,7 @@ class NATSClient:
                 policy_name = str(deliver_policy).strip().upper()
                 if not hasattr(DeliverPolicy, policy_name):
                     allowed = ", ".join([p.name for p in DeliverPolicy])
-                    raise ValueError(f"Invalid deliver_policy={deliver_policy!r}. Allowed: {allowed}")
+                    raise ValueError(f"Invalid deliver_policy={deliver_policy!r}. Allowed values: {allowed}")
                 resolved_policy = getattr(DeliverPolicy, policy_name)
 
         backoff_list = [float(x) for x in (backoff or []) if x is not None]
@@ -373,7 +377,7 @@ class NATSClient:
         )
         if batch_size > inflight_limit:
             logger.warning(
-                "NATS pull batch_size (%s) > max_inflight (%s) durable=%s; this can increase ack_wait pressure.",
+                "NATS pull batch_size (%s) is greater than max_inflight (%s), durable=%s; this may increase ack_wait pressure.",
                 batch_size,
                 inflight_limit,
                 final_durable,
@@ -384,13 +388,13 @@ class NATSClient:
                 data = json.loads(msg.data.decode("utf-8"))
             except Exception as exc:  # noqa: BLE001
                 if auto_ack:
-                    print(f"[NATS] Error processing message: {exc}", callback)
+                    print(f"[NATS] Failed to process message: {exc}", callback)
                     try:
                         await msg.nak()
                     except Exception:
                         pass
                 else:
-                    print(f"[NATS] Decode error: {exc}")
+                    print(f"[NATS] Failed to decode message: {exc}")
                     try:
                         await msg.ack()
                     except Exception:
@@ -425,7 +429,7 @@ class NATSClient:
                         await msg.ack()
                     except Exception as exc:  # noqa: BLE001
                         mark_span_error(span, exc)
-                        print(f"[NATS] Error processing message: {exc}", callback)
+                        print(f"[NATS] Failed to process message: {exc}", callback)
                         try:
                             await msg.nak()
                         except Exception:
@@ -435,7 +439,7 @@ class NATSClient:
                         await callback(msg, msg.subject, data, headers)
                     except Exception as exc:  # noqa: BLE001
                         mark_span_error(span, exc)
-                        print(f"[NATS] Error processing message: {exc}", callback)
+                        print(f"[NATS] Failed to process message: {exc}", callback)
                         try:
                             await msg.nak()
                         except Exception:
@@ -451,7 +455,7 @@ class NATSClient:
             except TimeoutError:
                 pass
             except Exception as exc:  # noqa: BLE001
-                print(f"[NATS] Warmup fetch error: {exc}")
+                print(f"[NATS] Warmup pull failed: {exc}")
 
         async def worker_loop():
             loop_counter = 0
@@ -477,13 +481,13 @@ class NATSClient:
                             task.add_done_callback(_done)
                     except TimeoutError:
                         if log_alive and loop_counter % 200 == 0:
-                            print(f"[NATS] worker_loop alive for {final_durable}")
+                            print(f"[NATS] worker_loop running: {final_durable}")
                         continue
                     except Exception as exc:  # noqa: BLE001
-                        print(f"[NATS] Worker loop error: {exc}")
+                        print(f"[NATS] worker_loop error: {exc}")
                         await asyncio.sleep(1)
             except asyncio.CancelledError:
-                # Graceful shutdown: stop pulling more messages.
+                # Graceful shutdown: stop pulling messages.
                 pass
             finally:
                 if inflight:
@@ -510,7 +514,7 @@ class NATSClient:
         fetch_timeout_seconds: Optional[float] = None,
     ) -> NATSSubscriptionHandle:
         if not self.js:
-            raise Exception("NATS JetStream not connected")
+            raise Exception("NATS JetStream is not connected")
         await self._ensure_cg_streams()
 
         final_durable, consumer_cfg = self._configure_consumer(
@@ -525,13 +529,13 @@ class NATSClient:
         )
 
         try:
-            # Pull subscription
+            # pull subscription
             sub = await self.js.pull_subscribe(
                 subject,
                 durable=final_durable,
                 config=consumer_cfg,
             )
-            print(f"[NATS] Pull-Subscribed to {subject} (Durable: {final_durable})")
+            print(f"[NATS] Established pull subscription: {subject} (Durable: {final_durable})")
 
             return await self._run_worker_loop(
                 sub=sub,
@@ -546,7 +550,7 @@ class NATSClient:
             )
 
         except Exception as e:
-            print(f"[NATS] Subscribe failed: {e}")
+            print(f"[NATS] Subscription failed: {e}")
             raise
 
     async def subscribe_cmd_with_ack(
@@ -566,7 +570,7 @@ class NATSClient:
         fetch_timeout_seconds: Optional[float] = None,
     ) -> NATSSubscriptionHandle:
         if not self.js:
-            raise Exception("NATS JetStream not connected")
+            raise Exception("NATS JetStream is not connected")
         await self._ensure_cg_streams()
 
         final_durable, consumer_cfg = self._configure_consumer(
@@ -586,7 +590,7 @@ class NATSClient:
                 durable=final_durable,
                 config=consumer_cfg,
             )
-            print(f"[NATS] Pull-Subscribed (manual ack) to {subject} (Durable: {final_durable})")
+            print(f"[NATS] Established pull manual-ack subscription: {subject} (Durable: {final_durable})")
 
             return await self._run_worker_loop(
                 sub=sub,
@@ -599,18 +603,18 @@ class NATSClient:
             )
 
         except Exception as exc:  # noqa: BLE001
-            print(f"[NATS] Subscribe failed: {exc}")
+            print(f"[NATS] Subscription failed: {exc}")
             raise
 
 
     async def kv_bucket(self, bucket: str):
-        """Get a KeyValue bucket instance. Creates it if missing (for dev)."""
+        """Get the KeyValue bucket instance, auto-create in development when missing."""
         if not self.js:
-             raise Exception("NATS JetStream not connected")
+             raise Exception("NATS JetStream is not connected")
         try:
             return await self.js.key_value(bucket)
         except Exception:
-            # Auto-create for dev/prototype convenience
+            # Auto-create KV bucket in development.
             print(f"[NATS] Creating KV bucket: {bucket}")
             return await self.js.create_key_value(bucket=bucket, history=64, ttl=0)
 
@@ -623,51 +627,52 @@ class NATSClient:
 
     async def publish_core(self, subject: str, payload: bytes):
         """
-        Publish a message using Core NATS (fire-and-forget, non-persistent).
+        Send a message via Core NATS (single-shot, non-persistent).
 
-        This method sends a message directly via NATS core protocol, without JetStream persistence,
-        streaming, or message durability. Use this for lightweight, transient messaging.
+        This method sends directly through the NATS core protocol without JetStream
+        persistence, streaming, or reliable delivery features. It is suitable for
+        lightweight, short-lived messages.
 
         Args:
-            subject (str): The NATS subject to publish to.
-            payload (bytes): The raw message payload to send.
+            subject (str): NATS subject to publish to.
+            payload (bytes): Raw message payload.
 
         Returns:
             None
 
-        Differences from publish_event:
-            - publish_core uses core NATS (no JetStream features, no persistence, no headers).
-            - publish_event uses JetStream (supports persistence, headers, and message acks).
+        Difference from publish_event:
+            - publish_core uses Core NATS (no JetStream features, no persistence, no headers).
+            - publish_event uses JetStream (supports persistence, headers, and publish acknowledgements).
         """
         if not self.nc.is_connected:
-             raise Exception("NATS not connected")
+             raise Exception("NATS is not connected")
         await self.nc.publish(subject, payload)
 
     async def subscribe_core(self, subject: str, callback: Callable):
         """
-        Subscribe to a subject using Core NATS (non-persistent, at-most-once delivery).
+        Subscribe using Core NATS for a subject (non-persistent, at-most-once delivery).
 
-        This method creates a subscription using the core NATS protocol, without JetStream features
-        such as persistence, consumer groups, or message replay. The callback is invoked for each
-        message received.
+        This method creates a subscription using the Core NATS protocol, without JetStream
+        persistence, consumer groups, or replay capabilities; each arrived message triggers
+        the callback.
 
         Args:
-            subject (str): The NATS subject to subscribe to.
-            callback (Callable): Async callback function with signature (msg) -> Awaitable.
+            subject (str): NATS subject to subscribe to.
+            callback (Callable): Async callback with signature (msg) -> Awaitable.
 
         Returns:
-            Subscription: The NATS subscription object.
+            Subscription: NATS subscription object.
 
-        Differences from subscribe_cmd:
-            - subscribe_core uses core NATS (no JetStream, no queue groups, no persistence).
-            - subscribe_cmd uses JetStream (supports queue groups, persistence, and acks).
+        Difference from subscribe_cmd:
+            - subscribe_core uses Core NATS (no JetStream, no queue groups, no persistence).
+            - subscribe_cmd uses JetStream (supports queue groups, persistence, and acknowledgements).
         """
         if not self.nc.is_connected:
-             raise Exception("NATS not connected")
+             raise Exception("NATS is not connected")
         return await self.nc.subscribe(subject, cb=callback)
 
     async def request_core(self, subject: str, payload: bytes, *, timeout: float = 5.0):
-        """Request/Reply using Core NATS."""
+        """Perform request-response with Core NATS."""
         if not self.nc.is_connected:
-            raise Exception("NATS not connected")
+            raise Exception("NATS is not connected")
         return await self.nc.request(subject, payload, timeout=timeout)

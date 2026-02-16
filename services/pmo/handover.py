@@ -1,4 +1,4 @@
-"""Handover context packing logic for PMO service."""
+"""PMO service context handoff packaging logic."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def _build_parent_pointer_card(project_id: str, parent_agent: str) -> Card:
 
 
 class HandoverPacker:
-    """Pack cards/boxes for downstream agent based on handover rules."""
+    """Pack cards / boxes for downstream Agent based on handoff rules."""
 
     def __init__(self, cardbox: CardBoxClient, resource_store: ResourceStore) -> None:
         self.cardbox = cardbox
@@ -155,7 +155,7 @@ class HandoverPacker:
         box_id = str(box_id)
 
         if not target_profile_ref:
-            raise BadRequestError("target_profile_config 必须解析出有效的 profile_box_id")
+            raise BadRequestError("target_profile_config must resolve to a valid profile_box_id")
 
         profile_box_id = target_profile_ref
 

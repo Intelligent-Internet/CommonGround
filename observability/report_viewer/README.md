@@ -10,7 +10,7 @@ A lightweight, zero-build web UI to explore `scripts/admin/report_project_graph.
 ## Run
 
 ```bash
-cd CommonGround-next/observability/report_viewer
+cd CommonGround/observability/report_viewer
 python -m http.server 8010
 ```
 
@@ -24,4 +24,3 @@ Then:
 
 - This viewer reads the JSON entirely in the browser; nothing is uploaded.
 - Large reports can be heavy. Use `--since/--until` when generating the report if needed.
-

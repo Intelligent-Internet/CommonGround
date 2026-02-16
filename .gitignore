@@ -5,9 +5,6 @@ __pycache__/
 venv/
 env/
 
-#uv 
-uv.lock
-
 # Database
 *.duckdb
 *.duckdb.wal

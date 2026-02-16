@@ -1,4 +1,4 @@
-"""Agent Worker loop entrypoint (Phase 2c layout)."""
+"""Agent Worker loop entrypoint."""
 
 from __future__ import annotations
 

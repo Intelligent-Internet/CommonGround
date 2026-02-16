@@ -1,7 +1,7 @@
-"""Stores grouped by levels.
+"""Storage entrypoint grouped by layer.
 
-`infra.stores` remains the public import surface. Concrete stores live in
-level-scoped modules to avoid L0/L1/L2混杂。
+`infra.stores` is kept as a public import entrypoint unchanged, while concrete storage implementations
+are distributed across layered modules to avoid cross-layer mixing in L0/L1/L2.
 """
 
 from .base import BaseStore

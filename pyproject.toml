@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "commonground-next"
+name = "CommonGround"
 version = "0.1.0"
-description = "Add your description here"
+description = "Protocol-first multi-agent operating system kernel for sociotechnical coordination, combining Postgres as truth source with NATS wakeup semantics."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

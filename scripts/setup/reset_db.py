@@ -47,7 +47,7 @@ async def reset_db(grant_role: str | None = None):
     drop_sqls = [
         "DROP SCHEMA IF EXISTS sandbox CASCADE;",
         "DROP SCHEMA IF EXISTS application CASCADE;",
-        # Phase 2 schemas
+        # Project schema tables
         "DROP TABLE IF EXISTS resource.tools CASCADE;",
         "DROP TABLE IF EXISTS resource.project_agents CASCADE;",
         "DROP TABLE IF EXISTS resource.profiles CASCADE;",

@@ -1,12 +1,12 @@
 """
-Emit Marker Tool Service
+Emit Marker tool service
 
-Listens on: cg.{PROTOCOL_VERSION}.*.*.cmd.tool.emit_marker.*
+Listen to subject: cg.{PROTOCOL_VERSION}.*.*.cmd.tool.emit_marker.*
 Behavior:
-  - Reads tool.call card to extract marker payload.
-  - Writes tool.result ack card.
-  - Reports to Inbox, then publishes cmd.agent.{target}.wakeup to resume worker.
-  - Publishes evt.sys.ui.marker for UI.
+  - Read tool.call cards and extract marker payload.
+  - Write ack card to tool.result.
+  - Write Inbox first, then publish cmd.agent.{target}.wakeup to wake up the worker.
+  - Publish evt.sys.ui.marker for UI usage.
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ class EmitMarkerToolService(ServiceBase):
             protocol_version=PROTOCOL_VERSION,
         )
         queue = "tool_emit_marker"
-        logger.info("Listening on %s (queue=%s)", subject, queue)
+        logger.info("Listening: %s (queue=%s)", subject, queue)
         await self.nats.subscribe_cmd(
             subject,
             queue,
@@ -105,7 +105,7 @@ class EmitMarkerToolService(ServiceBase):
         title = args.get("title")
         markdown_content = args.get("markdown_content")
         if not marker_type or not title or not markdown_content:
-            raise BadRequestError("emit_marker requires title, markdown_content, marker_type")
+            raise BadRequestError("emit_marker requires title, markdown_content, and marker_type")
 
         event_payload = {
             "marker_type": marker_type,
@@ -129,10 +129,10 @@ class EmitMarkerToolService(ServiceBase):
                 headers=headers,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.error("Emit marker event publish failed: %s", exc, exc_info=True)
+            logger.error("emit_marker event publish failed: %s", exc, exc_info=True)
         return {
             "message": "marker_emitted",
-            "llm_instruction": "已生成采纳建议，请提示用户查看并决定是否采纳",
+            "llm_instruction": "A recommendation has been generated; ask the user to review it and decide whether to adopt it.",
         }
 
     async def _handle_cmd(self, subject: str, data: Dict[str, Any], headers: Dict[str, str]):
@@ -153,7 +153,7 @@ class EmitMarkerToolService(ServiceBase):
         if run_result.is_leader:
             logger.info("Marker emitted: tool_call_id=%s", tool_call_id)
         elif run_result.is_leader is False:
-            logger.info("Marker re-used (follower): tool_call_id=%s", tool_call_id)
+            logger.info("Marker reused (follower): tool_call_id=%s", tool_call_id)
 
 
 async def main():
@@ -166,5 +166,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        # Allow clean shutdown on Ctrl+C without logging a traceback.
+        # Exit gracefully on Ctrl+C without printing a traceback.
         pass

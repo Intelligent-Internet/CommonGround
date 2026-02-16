@@ -158,7 +158,7 @@ def init_otel(
             or _coerce_str(otel_cfg.get("service_name"))
             or _coerce_str(os.getenv("CG_SERVICE_NAME"))
             or _coerce_str(os.getenv("OTEL_SERVICE_NAME"))
-            or "commonground-next"
+            or "CommonGround"
         )
         service_namespace = (
             _coerce_str(otel_cfg.get("service_namespace"))

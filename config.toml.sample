@@ -166,9 +166,9 @@ fork_join_default_deadline_seconds = 900.0
 fork_join_max_tasks = 8
 
 [api]
-# Default: "0.0.0.0"
+# Default: "127.0.0.1"
 # Purpose: API bind host.
-listen_host = "0.0.0.0"
+listen_host = "127.0.0.1"
 
 # Default: 8099
 # Purpose: API bind port.
@@ -217,9 +217,9 @@ enabled = false
 # Purpose: OTel service.namespace resource attribute.
 service_namespace = "commonground"
 
-# Default: "commonground-next"
+# Default: "CommonGround"
 # Purpose: OTel service.name resource attribute.
-service_name = "commonground-next"
+service_name = "CommonGround"
 
 # Default: "0.1.0"
 # Purpose: OTel service.version resource attribute.
@@ -253,7 +253,7 @@ max_retries = 3
 [gcs]
 # No code default.
 # Purpose: Required to enable artifact and skills APIs that read/write GCS.
-bucket = "your-bucket"
+bucket = ""
 
 # Default behavior when omitted: ""
 # Purpose: Optional key prefix inside the bucket.
@@ -270,7 +270,7 @@ mode = "remote"
 
 # Default: "/var/lib/skills-cache"
 # Purpose: Local cache root for downloaded skill bundles.
-cache_root = "/var/lib/skills-cache"
+cache_root = "./skills-cache"
 
 # Default: "/tmp/skills-local"
 # Purpose: Local working root used by local mode.

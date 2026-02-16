@@ -1798,7 +1798,7 @@ class ReactStepProcessor:
             )
             return
 
-        # Phase C: no tool_calls and must_end_with is set -> require an end tool next turn.
+        # No tool_calls and must_end_with is set -> require an end tool next turn.
         fields_lines: List[str] = []
         if "submit_result" in must_end_with:
             for f in result_fields or []:

@@ -47,7 +47,9 @@ def _build_tls_kwargs(nats_cfg: Dict[str, Any]) -> Dict[str, Any]:
     if missing:
         missing_str = ", ".join(missing)
         raise RuntimeError(
-            f"TLS 启用但证书文件缺失: {missing_str}. 请在 config.toml 的 nats.cert_dir 中放置 ca.crt/client.crt/client.key 或显式配置 ca_file/cert_file/key_file。"
+            f"TLS is enabled but certificate files are missing: {missing_str}. "
+            "Please place ca.crt, client.crt, and client.key under config.toml nats.cert_dir, "
+            "or configure ca_file/cert_file/key_file explicitly."
         )
 
     ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
@@ -78,8 +80,8 @@ async def reset_streams(*, extra_streams: Optional[list[str]] = None) -> None:
     nc = await nats.connect(servers=nats_servers, **tls_kwargs)
     try:
         js = nc.jetstream()
-        # If a legacy stream overlaps our subjects, detect it via subject->stream lookup
-        # (common case: an old stream like "cg-stream" captures cg.v1r3.*.*.cmd.>).
+        # If there is an old stream with legacy naming overlapping current subjects, do a subject->stream reverse lookup.
+        # A common case is an old stream like "cg-stream" capturing cg.v1r3.*.*.cmd.>.
         probe_subjects = [
             f"cg.{PROTOCOL_VERSION}.probe.probe.cmd.agent.worker_generic.wakeup",
             f"cg.{PROTOCOL_VERSION}.probe.probe.evt.agent.probe.task",
@@ -94,7 +96,7 @@ async def reset_streams(*, extra_streams: Optional[list[str]] = None) -> None:
 
         for name in streams:
             deleted = await _maybe_delete_stream(js, name)
-            print(f"[reset_nats_streams] delete_stream {name}: {'OK' if deleted else 'SKIP (missing)'}")
+            print(f"[reset_nats_streams] delete_stream {name}: {'Deleted' if deleted else 'Skipped (not found)'}")
     finally:
         await nc.close()
 
