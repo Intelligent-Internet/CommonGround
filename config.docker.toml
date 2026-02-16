@@ -1,0 +1,123 @@
+[nats]
+servers = ["nats://nats:4222"]
+tls_enabled = false
+cert_dir = "./nats-js-test"
+
+[nats.pull]
+batch_size = 1
+max_inflight = 1
+fetch_timeout_seconds = 5.0
+
+[protocol]
+version = "v1r3"
+
+[worker]
+max_concurrency = 5
+wakeup_concurrency = 5
+wakeup_queue_maxsize = 0
+worker_targets = ["worker_generic"]
+worker_id_prefix = "agent"
+max_steps = 3
+max_recursion_depth = 20
+default_timeout_seconds = 30.0
+inbox_processing_timeout_seconds = 300
+
+[pmo]
+# PMO settings
+# Re-emit wakeup for stale pending inbox items (seconds)
+pending_wakeup_seconds = 5.0
+# Auto-skip stale pending inbox without channel after this threshold (0 = disable)
+# Note: keep pending_wakeup_skip_seconds >= pending_wakeup_seconds.
+# If equal, missing-channel inboxes are skipped on the first scan window.
+pending_wakeup_skip_seconds = 300.0
+
+[cardbox]
+postgres_dsn = "postgresql://postgres:postgres@postgres:5432/cardbox"
+postgres_min_size = 1
+postgres_max_size = 10
+psycopg_min_size = 1
+psycopg_max_size = 10
+tenant_id = "public"
+
+[api]
+listen_host = "0.0.0.0"
+port = 8099
+
+[ui_worker]
+worker_target = "ui_worker"
+
+[observability.otel]
+enabled = false
+service_namespace = "commonground"
+service_name = "commonground-next"
+service_version = "0.1.0"
+otlp_endpoint = "http://otel-collector:4318/v1/traces"
+sampler_ratio = 1.0
+
+[a2a.delegate_tool]
+# Controls the PMO delegate_async handler; ensure the tool exists via
+# `uv run -m scripts.setup.seed --project <project_id>` before running in Docker.
+# Name must match the delegate worker profile created by commonground-next-a2a/bootstrap scripts.
+enabled = true
+profile_name = "A2A Delegate Worker"
+timeout_seconds = 180.0
+stream_chunks_default = true
+
+[gcs]
+bucket = "your-bucket"
+prefix = "commonground"
+credentials_path = "/var/secrets/gcp-key.json"
+
+[skills]
+mode = "remote"
+cache_root = "/var/lib/skills-cache"
+local_root = "/tmp/skills-local"
+max_file_bytes = 204800
+timeout_sec_default = 60
+timeout_sec_max = 120
+stdout_max_bytes = 204800
+stderr_max_bytes = 204800
+input_max_bytes = 20971520
+output_max_bytes = 20971520
+total_input_max_bytes = 52428800
+total_output_max_bytes = 52428800
+
+[srt]
+settings_mode = "generated"
+settings_path = ""
+ignore_violations = {}
+enable_weaker_nested_sandbox = false
+
+[srt.network]
+allowed_domains = []
+denied_domains = []
+allow_unix_sockets = []
+allow_local_binding = false
+
+[srt.filesystem]
+deny_read = ["~/.ssh"]
+allow_write = [".", "/tmp"]
+deny_write = [".env"]
+
+[judge]
+model = "gemini/gemini-2.5-flash"
+temperature = 0.0
+timeout_s = 8
+
+[tools.e2b]
+template = ""
+domain = ""
+reuse_mode = "none"
+idle_ttl_sec = 1800
+hard_ttl_sec = 21600
+lock_timeout_sec = 600
+reaper_interval_sec = 60
+reaper_batch_size = 50
+timeout_sec_default = 30
+timeout_sec_max = 120
+stdout_max_bytes = 204800
+stderr_max_bytes = 204800
+input_max_bytes = 20971520
+output_max_bytes = 20971520
+total_input_max_bytes = 52428800
+total_output_max_bytes = 52428800

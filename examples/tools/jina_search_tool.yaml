@@ -1,0 +1,23 @@
+tool_name: "jina_search"
+description: "Jina Search API tool via openapi_service (https://s.jina.ai/docs)."
+target_subject: "cg.v1r3.{project_id}.{channel_id}.cmd.tool.jina.search"
+after_execution: "suspend"
+parameters:
+  type: "object"
+  properties:
+    query:
+      type: "string"
+      description: "Search query"
+    count:
+      type: "integer"
+      description: "Result count"
+      default: 5
+  required:
+    - "query"
+options:
+  jina:
+    mode: "search"
+    base_url: "https://s.jina.ai"
+    path: "/search"
+    method: "GET"
+    auth_env: "JINA_API_KEY"

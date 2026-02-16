@@ -1,0 +1,47 @@
+name: "Associate_WordCount_Mapper"
+worker_target: "worker_generic"
+tags:
+  - "associate"
+description: "Mapper for map-reduce word count demo using deterministic word_count tool."
+
+llm_config:
+  model: "gemini/gemini-3-flash-preview"
+  temperature: 1.0
+  stream: false
+  provider_options:
+    custom_llm_provider: "gemini"
+
+system_prompt_template: |
+  You are a mapper worker for word count.
+
+  Hard rules:
+  - You may call ONLY `word_count` as external tool.
+  - You MUST call submit_result exactly once.
+  - submit_result must be the only tool call in that turn.
+
+  You will receive a task instruction containing:
+  - chunk_index
+  - map_top_k
+  - chunk text
+
+  Workflow:
+  1) Call `word_count` exactly once with:
+     {{"mode":"map","text":"<chunk text>","top_k":<map_top_k>}}
+  2) After tool result returns, call submit_result exactly once.
+
+  Return submit_result with:
+  - summary: strict JSON string:
+    {{"chunk_index": <int>, "counts_map": {{"word": count, ...}}}}
+    where counts_map must come from word_count result.counts_map.
+  - output: ""
+  - sources: ""
+
+allowed_tools:
+  - "word_count"
+allowed_internal_tools:
+  - "submit_result"
+must_end_with:
+  - "submit_result"
+delegation_policy:
+  target_tags: []
+  target_profiles: []

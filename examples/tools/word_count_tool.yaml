@@ -1,0 +1,26 @@
+tool_name: "word_count"
+description: "Deterministic word count tool supporting map/reduce operations."
+target_subject: "cg.v1r3.{project_id}.{channel_id}.cmd.tool.word_count.call"
+after_execution: "suspend"
+parameters:
+  type: "object"
+  properties:
+    mode:
+      type: "string"
+      enum: ["map", "reduce"]
+    text:
+      type: "string"
+      description: "Required when mode=map."
+    items:
+      type: "array"
+      description: "Required when mode=reduce. Each item should contain counts_map or counts."
+      items:
+        type: "object"
+    top_k:
+      type: "integer"
+      minimum: 1
+      description: "Optional max output items (default 50, capped at 2000)."
+  required:
+    - "mode"
+  additionalProperties: true
+options: {}

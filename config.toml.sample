@@ -1,0 +1,453 @@
+# Common Ground configuration sample
+#
+# Load order:
+# 1) Built-in defaults (see core/config_defaults.py)
+# 2) config.toml
+# 3) Environment overrides: CG__SECTION__KEY (e.g. CG__PMO__FORK_JOIN_MAX_TASKS=64)
+
+[protocol]
+# Default: "v1r3"
+# Purpose: Subject/version prefix used in NATS topics.
+version = "v1r3"
+
+[nats]
+# Default: ["nats://localhost:4222"]
+# Purpose: NATS server URLs.
+servers = ["nats://localhost:4222"]
+
+# Default: false
+# Purpose: Enable TLS for NATS connection.
+tls_enabled = false
+
+# Default: "./nats-js-test"
+# Purpose: Certificate directory for TLS mode.
+cert_dir = "./nats-js-test"
+
+# Optional script-only overrides used by scripts/setup/reset_nats_streams.py.
+# If omitted, reset script falls back to cert_dir/{ca.crt,client.crt,client.key}.
+# ca_file = "./nats-js-test/ca.crt"
+# cert_file = "./nats-js-test/client.crt"
+# key_file = "./nats-js-test/client.key"
+
+[nats.pull]
+# Default: 1
+# Purpose: Messages fetched per pull request.
+batch_size = 1
+
+# Default: 1
+# Purpose: Max in-flight messages per pull subscription worker.
+max_inflight = 1
+
+# Default: 5.0
+# Purpose: Long-poll timeout for JS fetch.
+fetch_timeout_seconds = 5.0
+
+# Default: 0.1
+# Purpose: Warmup fetch timeout for fast startup loops.
+warmup_timeout_seconds = 0.1
+
+[cardbox]
+# Default: "postgresql://postgres:postgres@localhost:5433/cardbox"
+# Purpose: CardBox/Postgres DSN.
+postgres_dsn = "postgresql://postgres:postgres@localhost:5433/cardbox"
+
+# Default: 1
+# Purpose: CardBox adapter pool min size.
+postgres_min_size = 1
+
+# Default: 10
+# Purpose: CardBox adapter pool max size.
+postgres_max_size = 10
+
+# Default: 1
+# Purpose: Shared app pool min size for stores (state/resource/execution/etc).
+psycopg_min_size = 1
+
+# Default: 10
+# Purpose: Shared app pool max size for stores (state/resource/execution/etc).
+psycopg_max_size = 10
+
+# Default: "public"
+# Purpose: Fallback tenant/project when caller does not provide one.
+tenant_id = "public"
+
+[worker]
+# Default: 8
+# Purpose: Max steps per turn before force stop.
+max_steps = 8
+
+# Default: 30.0
+# Purpose: Default timeout for model/tool operations (seconds).
+default_timeout_seconds = 30.0
+
+# Default: 20
+# Purpose: Max recursion depth for cross-agent dispatch chains.
+max_recursion_depth = 20
+
+# Default: 1
+# Purpose: Concurrent turn-processing workers in one agent_worker process.
+max_concurrency = 1
+
+# Default: max_concurrency
+# Purpose: Concurrent wakeup scanners.
+wakeup_concurrency = 1
+
+# Default: max_concurrency * 4
+# Purpose: Queue size for claimed turn work items (0 = unbounded).
+queue_maxsize = 4
+
+# Default: 0
+# Purpose: Queue size for wakeup keys (0 = unbounded).
+wakeup_queue_maxsize = 0
+
+# Default: 20
+# Purpose: Max inbox rows claimed per wakeup scan.
+inbox_fetch_limit = 20
+
+# Default: 5.0
+# Purpose: Worker watchdog loop interval (seconds).
+watchdog_interval_seconds = 5.0
+
+# Default: 300.0
+# Purpose: Requeue "processing" inbox rows older than this threshold (seconds).
+inbox_processing_timeout_seconds = 300.0
+
+# Default: worker.default_timeout_seconds
+# Purpose: Suspend wait timeout for tool/result resume path (seconds).
+suspend_timeout_seconds = 30.0
+
+# Default: ["worker_generic"]
+# Purpose: Worker targets this process subscribes to.
+worker_targets = ["worker_generic"]
+
+[pmo]
+# Default: 1
+# Purpose: Concurrent PMO command handlers.
+max_concurrency = 1
+
+# Default: 0
+# Purpose: PMO internal queue max size (0 = unbounded).
+queue_maxsize = 0
+
+# Default: 5.0
+# Purpose: PMO watchdog interval (seconds).
+watchdog_interval_seconds = 5.0
+
+# Default: 8
+# Purpose: Batch child-turn dispatch concurrency (capped by DB pool max size).
+batch_dispatch_concurrency = 8
+
+# Default: 10.0
+# Purpose: Retry wakeup for dispatched turns older than this threshold (seconds).
+dispatched_retry_seconds = 10.0
+
+# Default: 30.0
+# Purpose: Mark dispatched turns failed when they are too old (seconds).
+dispatched_timeout_seconds = 30.0
+
+# Default: 5.0
+# Purpose: Re-emit wakeups for stale pending inbox rows (seconds).
+pending_wakeup_seconds = 5.0
+
+# Default: 300.0
+# Purpose: Skip stale pending rows with missing channel after this age (seconds; <=0 disables skip).
+pending_wakeup_skip_seconds = 300.0
+
+# Default: 300.0
+# Purpose: Reap stale running turns older than this threshold (seconds).
+active_reap_seconds = 300.0
+
+# Default: 900.0
+# Purpose: Default fork_join deadline when args.deadline_seconds is omitted (seconds; <=0 disables default deadline).
+fork_join_default_deadline_seconds = 900.0
+
+# Default: 8
+# Purpose: Hard upper bound of tasks per fork_join request.
+fork_join_max_tasks = 8
+
+[api]
+# Default: "0.0.0.0"
+# Purpose: API bind host.
+listen_host = "0.0.0.0"
+
+# Default: 8099
+# Purpose: API bind port.
+port = 8099
+
+[ui_worker]
+# Default: "ui_worker"
+# Purpose: Worker target consumed by UI worker.
+worker_target = "ui_worker"
+
+# Default: 86400
+# Purpose: UI action idempotency TTL in seconds.
+idempotency_ttl_seconds = 86400
+
+[observability.timing]
+# Default: false
+# Purpose: Master switch for timing capture.
+enabled = false
+
+# Default: false
+# Purpose: Attach timing metadata on evt.agent.*.step.
+step_event = false
+
+# Default: false
+# Purpose: Attach timing metadata on evt.agent.*.task.
+task_event = false
+
+# Default: false
+# Purpose: Attach timing metadata on stream chunk lifecycle.
+stream_metadata = false
+
+# Default: false
+# Purpose: Emit tool dispatch timing fields.
+tool_dispatch = false
+
+# Default: false
+# Purpose: Include timing fields in worker logs.
+worker_logs = false
+
+[observability.otel]
+# Default: false
+# Purpose: Enable OpenTelemetry tracing export.
+enabled = false
+
+# Default: "commonground"
+# Purpose: OTel service.namespace resource attribute.
+service_namespace = "commonground"
+
+# Default: "commonground-next"
+# Purpose: OTel service.name resource attribute.
+service_name = "commonground-next"
+
+# Default: "0.1.0"
+# Purpose: OTel service.version resource attribute.
+service_version = "0.1.0"
+
+# Default: ""
+# Purpose: OTLP/HTTP traces endpoint. Leave empty to disable exporter.
+otlp_endpoint = ""
+
+# Default: 1.0
+# Purpose: Trace sampling ratio in [0, 1].
+sampler_ratio = 1.0
+
+[judge]
+# Default: "gemini/gemini-2.5-flash"
+# Purpose: Model used by judge service / retry decision path.
+model = "gemini/gemini-2.5-flash"
+
+# Default: 0.0
+# Purpose: Judge model temperature.
+temperature = 0.0
+
+# Default: 8.0
+# Purpose: Judge RPC timeout (seconds).
+timeout_s = 8.0
+
+# Default: 3
+# Purpose: Max judge-assisted retry attempts for skills.* tool failures.
+max_retries = 3
+
+[gcs]
+# No code default.
+# Purpose: Required to enable artifact and skills APIs that read/write GCS.
+bucket = "your-bucket"
+
+# Default behavior when omitted: ""
+# Purpose: Optional key prefix inside the bucket.
+prefix = "commonground"
+
+# Default behavior when omitted: use ambient ADC credentials.
+# Purpose: Optional service-account JSON path.
+credentials_path = "/var/secrets/gcp-key.json"
+
+[skills]
+# Default: "remote"
+# Purpose: Skills execution mode: "remote" (E2B) or "local" (SRT).
+mode = "remote"
+
+# Default: "/var/lib/skills-cache"
+# Purpose: Local cache root for downloaded skill bundles.
+cache_root = "/var/lib/skills-cache"
+
+# Default: "/tmp/skills-local"
+# Purpose: Local working root used by local mode.
+local_root = "/tmp/skills-local"
+
+# Default: 204800
+# Purpose: Max size of a single loaded skill file in bytes.
+max_file_bytes = 204800
+
+# Default: 60
+# Purpose: Background reaper interval for stale async sessions/jobs.
+reaper_interval_sec = 60
+
+# Default: 60
+# Purpose: Default command timeout in seconds.
+timeout_sec_default = 60
+
+# Default: 120
+# Purpose: Maximum allowed command timeout in seconds.
+timeout_sec_max = 120
+
+# Default: 204800
+# Purpose: Max captured stdout bytes.
+stdout_max_bytes = 204800
+
+# Default: 204800
+# Purpose: Max captured stderr bytes.
+stderr_max_bytes = 204800
+
+# Default: 20971520
+# Purpose: Max input payload bytes per call.
+input_max_bytes = 20971520
+
+# Default: 20971520
+# Purpose: Max output payload bytes per call.
+output_max_bytes = 20971520
+
+# Default: 52428800
+# Purpose: Max cumulative input bytes across artifacts in one call.
+total_input_max_bytes = 52428800
+
+# Default: 52428800
+# Purpose: Max cumulative output bytes across artifacts in one call.
+total_output_max_bytes = 52428800
+
+[srt]
+# Default: "generated"
+# Purpose: SRT settings source: "generated" or "file".
+settings_mode = "generated"
+
+# Default: ""
+# Purpose: Required only when settings_mode = "file".
+settings_path = ""
+
+# Default: {}
+# Purpose: SRT ignoreViolations map.
+ignore_violations = {}
+
+# Default: false
+# Purpose: SRT nested-sandbox compatibility flag.
+enable_weaker_nested_sandbox = false
+
+[srt.network]
+# Default: []
+# Purpose: Domain allowlist.
+allowed_domains = []
+
+# Default: []
+# Purpose: Domain denylist.
+denied_domains = []
+
+# Default: []
+# Purpose: Allowed Unix sockets.
+allow_unix_sockets = []
+
+# Default: false
+# Purpose: Allow all Unix sockets.
+allow_all_unix_sockets = false
+
+# Default: false
+# Purpose: Allow local network binding.
+allow_local_binding = false
+
+[srt.filesystem]
+# Default: []
+# Purpose: Read denylist paths.
+deny_read = []
+
+# Default: []
+# Purpose: Extra write allowlist paths (work dir is auto-added).
+allow_write = []
+
+# Default: []
+# Purpose: Write denylist paths.
+deny_write = []
+
+[tools.e2b]
+# Default: ""
+# Purpose: E2B template name; empty means provider default.
+template = ""
+
+# Default: ""
+# Purpose: E2B domain override; empty uses E2B default or env.
+domain = ""
+
+# Default: "none"
+# Purpose: Sandbox reuse mode (none/off disables reuse).
+reuse_mode = "none"
+
+# Default: 1800
+# Purpose: Reused sandbox idle TTL in seconds.
+idle_ttl_sec = 1800
+
+# Default: 21600
+# Purpose: Reused sandbox hard TTL in seconds.
+hard_ttl_sec = 21600
+
+# Default: 600
+# Purpose: Registry lock expiration in seconds.
+lock_timeout_sec = 600
+
+# Default: 60
+# Purpose: Reaper loop interval in seconds.
+reaper_interval_sec = 60
+
+# Default: 50
+# Purpose: Reaper batch size per pass.
+reaper_batch_size = 50
+
+# Default: 60
+# Purpose: Default remote command timeout in seconds.
+timeout_sec_default = 60
+
+# Default: 120
+# Purpose: Maximum remote command timeout in seconds.
+timeout_sec_max = 120
+
+# Default: 204800
+# Purpose: Max captured stdout bytes.
+stdout_max_bytes = 204800
+
+# Default: 204800
+# Purpose: Max captured stderr bytes.
+stderr_max_bytes = 204800
+
+# Default: 20971520
+# Purpose: Max input payload bytes per call.
+input_max_bytes = 20971520
+
+# Default: 20971520
+# Purpose: Max output payload bytes per call.
+output_max_bytes = 20971520
+
+# Default: 52428800
+# Purpose: Max cumulative input bytes across artifacts in one call.
+total_input_max_bytes = 52428800
+
+# Default: 52428800
+# Purpose: Max cumulative output bytes across artifacts in one call.
+total_output_max_bytes = 52428800
+
+[tools.mock_search]
+# Optional section used by services/tools/mock_search.py.
+# Purpose: deterministic debugging / local tool mock behavior.
+
+# Default: false
+# Purpose: Enable verbose mock-search diagnostics in tool logs.
+debug = false
+
+# Default: true
+# Purpose: Toggle LLM-backed answer generation (false keeps deterministic fixtures only).
+use_llm = true
+
+# Default: "gemini/gemini-2.5-flash"
+# Purpose: Model name used when use_llm=true.
+llm_model = "gemini/gemini-2.5-flash"
+
+# Default: "gemini"
+# Purpose: Provider id used to resolve the LLM client when use_llm=true.
+llm_provider = "gemini"

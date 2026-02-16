@@ -1,0 +1,29 @@
+tool_name: "provision_agent"
+description: "Provision a derived agent identity (action=derive)."
+target_subject: "cg.v1r3.{project_id}.{channel_id}.cmd.sys.pmo.internal.provision_agent"
+after_execution: "suspend"
+parameters:
+  type: "object"
+  properties:
+    action:
+      type: "string"
+      enum:
+        - "derive"
+    agent_id:
+      type: "string"
+    derived_from:
+      type: "string"
+    profile_name:
+      type: "string"
+    profile_box_id:
+      type: "string"
+    metadata:
+      type: "object"
+      additionalProperties: true
+  required:
+    - "action"
+    - "agent_id"
+    - "derived_from"
+  additionalProperties: false
+options:
+  ui_allowed: true

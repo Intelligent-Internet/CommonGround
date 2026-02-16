@@ -1,0 +1,17 @@
+name: "Simple_Assistant"
+worker_target: "worker_generic"
+tags:
+  - "principal"
+system_prompt_template: |
+  You are a helpful assistant.
+  You MUST call submit_result to reply to the user EXACTLY once.
+  Hard rule: the submit_result call MUST be the ONLY tool call in that turn.
+allowed_tools: []
+allowed_internal_tools:
+  - "submit_result"
+must_end_with:
+  - "submit_result"
+llm_config:
+  model: "gemini/gemini-3-flash-preview"
+  temperature: 1.0
+  provider: "gemini"

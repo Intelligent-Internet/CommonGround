@@ -1,0 +1,56 @@
+name: "Principal_WordCount"
+worker_target: "worker_generic"
+tags:
+  - "principal"
+description: "Map-reduce word count demo principal using fork_join + word_count reduce."
+
+llm_config:
+  model: "gemini/gemini-3-flash-preview"
+  temperature: 1.0
+  stream: true
+  provider_options:
+    custom_llm_provider: "gemini"
+
+system_prompt_template: |
+  You are the principal orchestrator for a map-reduce word count task.
+
+  Hard rules:
+  - You may call ONLY `fork_join` for orchestration.
+  - For deterministic final aggregation, you may call `word_count` ONLY in reduce mode.
+  - Do NOT call `delegate_async`, `launch_principal`, `ask_expert`, `provision_agent`, or any other external tools (except `word_count` reduce).
+  - You MUST call `submit_result` exactly once to finish.
+  - In the submit_result turn, submit_result must be the only tool call.
+  - Never call `fork_join` more than once. After resume from fork_join, do not call fork_join again.
+  - Call `word_count` in reduce mode at most once (no retries).
+  - Right after reduce returns (or fails), call `submit_result` in the next turn and finish.
+  - Your fork_join call MUST include `deadline_seconds` (recommended 120).
+  - Never call `word_count` reduce with empty `items`.
+
+  Input contains CHUNKS_JSON: a list of chunk objects:
+  - {{"chunk_index": <int>, "text": <string>}}
+
+  Workflow:
+  1) Call fork_join exactly once, with one task per chunk, preserving chunk order:
+     {{"tasks": [{{"target_strategy":"new","target_ref":"Associate_WordCount_Mapper","instruction":"..."}}, ...], "deadline_seconds": 120}}
+     - target_ref MUST be exactly "Associate_WordCount_Mapper" for every task.
+     - Do not invent indexed names/aliases (forbidden examples: "Associate_WordCount_Mapper_0", "chunk_0_result").
+  2) Wait for resume.
+  3) Parse each successful task summary JSON into:
+     {{"chunk_index": <int>, "counts_map": {{"word": count, ...}}}}
+     - If there are zero successful summaries or zero counts_map entries, skip reduce and submit_result with status="failed" and a clear timeout/empty-map reason.
+  4) Call word_count in reduce mode:
+     {{"mode":"reduce","items":[...counts_map objects...],"top_k":<final_top_k>}}
+  5) Use word_count result as final output and call submit_result once.
+     - Do not start a new planning/fork_join loop.
+     - Do not call word_count a second time.
+
+allowed_tools:
+  - "fork_join"
+  - "word_count"
+allowed_internal_tools:
+  - "submit_result"
+must_end_with:
+  - "submit_result"
+delegation_policy:
+  target_tags: ["associate"]
+  target_profiles: ["Associate_WordCount_Mapper"]

@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+#uv 
+uv.lock
+
+# Database
+*.duckdb
+*.duckdb.wal
+commonground.db
+
+# Logs
+*.log
+debug.log
+worker.log
+
+# Backups
+*.bak
+local_temp_*.*
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+node_modules/
+dist/
+
+# Submodules (managed by git, but ignore contents if untracked)
+# card-box-cg/ is a submodule
+repomix-*
+config.toml
+
+# Environment files
+.env
+
+# Ground Control local demo runtime artifacts
+.gc_demo/
+
+# skills cache for local development
+skills-cache/
+secrets/
+*.png
+examples/skills
+
+# Report artifacts
+*.report.json
+
+# Local build metadata
+commonground_next.egg-info/
+.opencode/

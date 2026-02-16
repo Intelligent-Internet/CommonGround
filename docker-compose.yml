@@ -1,0 +1,157 @@
+x-app-base: &app_base
+  build: .
+  working_dir: /app
+  volumes:
+    - .:/app
+    - ./config.docker.toml:/app/config.toml:ro
+  environment:
+    PYTHONPATH: /app
+    CG_CONFIG_TOML: /app/config.toml
+    PROJECT_ID: ${PROJECT_ID:-proj_mvp_001}
+    UV_PROJECT_ENVIRONMENT: /tmp/.venv
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    GOOGLE_API_KEY: ${GOOGLE_API_KEY:-${GEMINI_API_KEY:-}}
+    CG__observability__otel__enabled: ${CG__observability__otel__enabled:-true}
+    CG__observability__otel__otlp_endpoint: ${CG__observability__otel__otlp_endpoint:-http://otel-collector:4318/v1/traces}
+    CG__observability__otel__sampler_ratio: ${CG__observability__otel__sampler_ratio:-1.0}
+    CG__observability__timing__enabled: ${CG__observability__timing__enabled:-true}
+    OTEL_PROPAGATORS: ${OTEL_PROPAGATORS:-tracecontext,baggage}
+  restart: unless-stopped
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel/otel-collector.jaeger.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      jaeger:
+        condition: service_started
+    ports:
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:13133:13133"
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf:ro
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: cardbox
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./card-box-cg/card_box_core/adapters/postgres_schema.sql:/docker-entrypoint-initdb.d/00_core.sql:ro
+      - ./scripts/setup/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./scripts/setup/init_pmo_db.sql:/docker-entrypoint-initdb.d/02_init_pmo.sql:ro
+      - ./scripts/setup/init_projects.sql:/docker-entrypoint-initdb.d/03_init_projects.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cardbox"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  db-init:
+    <<: *app_base
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >-
+      sh -lc "uv sync &&
+      uv run -m scripts.setup.seed --ensure-schema --project $${PROJECT_ID}"
+
+  api:
+    <<: *app_base
+    environment:
+      PYTHONPATH: /app
+      CG_CONFIG_TOML: /app/config.toml
+      PROJECT_ID: ${PROJECT_ID:-proj_mvp_001}
+      CG_ENABLE_GOD_API: ${CG_ENABLE_GOD_API:-1}
+    depends_on:
+      otel-collector:
+        condition: service_started
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8099:8099"
+    command: sh -lc "uv sync && uv run -m services.api"
+
+  pmo:
+    <<: *app_base
+    depends_on:
+      otel-collector:
+        condition: service_started
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    command: sh -lc "uv sync && uv run -m services.pmo.service"
+
+  agent-worker:
+    <<: *app_base
+    depends_on:
+      otel-collector:
+        condition: service_started
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    command: sh -lc "uv sync && uv run -m services.agent_worker.loop"
+
+  mock-search:
+    <<: *app_base
+    environment:
+      PYTHONPATH: /app
+      CG_CONFIG_TOML: /app/config.toml
+      PROJECT_ID: ${PROJECT_ID:-proj_mvp_001}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      MOCK_SEARCH_USE_LLM: ${MOCK_SEARCH_USE_LLM:-1}
+      MOCK_SEARCH_LLM_PROVIDER: ${MOCK_SEARCH_LLM_PROVIDER:-gemini}
+      MOCK_SEARCH_LLM_MODEL: ${MOCK_SEARCH_LLM_MODEL:-gemini/gemini-2.5-flash}
+    depends_on:
+      otel-collector:
+        condition: service_started
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    command: sh -lc "uv sync && uv run -m services.tools.mock_search"
+
+volumes:
+  nats-data:
+  pg-data:

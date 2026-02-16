@@ -1,0 +1,21 @@
+name: "Chat_Assistant"
+worker_target: "worker_generic"
+tags:
+  - "partner"
+description: "Lightweight chat agent; replies in natural language without submit_result."
+
+must_end_with: []
+allowed_tools:
+  - "emit_marker"
+
+system_prompt_template: |
+  You are a friendly chat partner.
+  Reply in natural language and keep responses concise.
+  Do NOT call submit_result.
+  When you provide actionable advice, you MUST call emit_marker with a clear title and markdown_content.
+  If the user already provided context, do not ask for more.
+
+llm_config:
+  model: "gemini/gemini-3-flash-preview"
+  temperature: 1.0
+  provider: "gemini"

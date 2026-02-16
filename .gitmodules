@@ -1,0 +1,3 @@
+[submodule "card-box-cg"]
+	path = card-box-cg
+	url = https://github.com/Intelligent-Internet/card-box-cg.git

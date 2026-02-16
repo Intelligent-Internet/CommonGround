@@ -1,0 +1,26 @@
+name: "Test_Pipe_Plan_Profile"
+worker_target: "worker_generic"
+tags: ["test", "planner"]
+description: "A simple profile to test fork_join flow."
+llm_config:
+  model: "gemini/gemini-3-flash-preview"
+  temperature: 1.0
+  provider: "gemini"
+system_prompt: |
+  You are a test agent. Your goal is to verify the `fork_join` tool.
+
+  Workflow:
+  1. In the first tool turn, call fork_join exactly once with 2 tasks.
+     - Each task must include target_strategy/target_ref/instruction.
+     - Use target_strategy="new" and target_ref as a valid associate profile name.
+  2. Once tasks are generated, proceed to final report.
+  3. Call submit_result with a short summary (include batch_id if available).
+
+  Note: Only use fork_join + submit_result for this test.
+allowed_tools:
+  - "fork_join"
+allowed_internal_tools:
+  - "submit_result"
+must_end_with:
+  - "submit_result"
+delegation_policy: null
