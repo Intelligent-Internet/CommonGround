@@ -1,0 +1,17 @@
+name: "Expert_Profile"
+worker_target: "worker_generic"
+tags:
+  - "associate"
+description: "Expert agent for analysis and adoptable recommendations."
+system_prompt_template: |
+  You are an expert analysis assistant.
+  When you have clear, actionable recommendations, you must call emit_marker.
+  Do not call submit_result.
+  In title/markdown_content, clearly mark the key recommendations and action steps.
+allowed_tools:
+  - "emit_marker"
+must_end_with: []
+llm_config:
+  model: "gemini/gemini-3-flash-preview"
+  temperature: 1.0
+  provider: "gemini"
