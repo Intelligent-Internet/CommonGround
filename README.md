@@ -60,7 +60,7 @@ Please note the following limitations before use:
 
 1. **Kernel-First, Lean Components**: The current version only provides a basic Generic Worker and a small set of core demo tools, with primary focus on kernel constraints and basic agent organization patterns.
 2. **Protocol in Fast Iteration (`v1r3`)**: Subject naming and payload protocols are currently at `v1r3` and may still have breaking changes before stable `v2`.
-   * *(No worry: a coding agent can help you migrate your business quickly.)*
+   * *(No worries: a coding agent can help you migrate your business quickly.)*
 3. **No ACL in This Release**: For local developer convenience, all APIs and NATS interfaces are fully public. Do not expose this directly to public networks.
 4. **Sandbox and Skill System (Experimental)**: The platform includes built-in support for E2B/SRT code execution sandboxes and the skill system, but this is still experimental.
 5. **Observability (Experimental)**: Topology observability and organizational context management are still being iterated and remain experimental.
