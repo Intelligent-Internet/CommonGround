@@ -7,9 +7,10 @@
 [![NATS](https://img.shields.io/badge/NATS-JetStream-27AAE1.svg)](https://nats.io/)
 [![Postgres](https://img.shields.io/badge/Postgres-CardBox-336791.svg)](https://postgresql.org/)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-7289DA.svg)](https://discord.com/invite/intelligentinternet)
+
 [中文](README_CN.md) | [English](README.md)
 
-<img width="2400" height="875" alt="image" src="https://github.com/user-attachments/assets/c74333ad-7b4e-49e6-8867-3d0e0c4790a7" />
+![Common Ground Title Image](docs/cg.png)
 
 Modern Agent frameworks often rely on rigid static heuristics, lack state tracking and system resilience, and can easily collapse under complex multi-agent delegation scenarios ("Coordination Collapse").
 
