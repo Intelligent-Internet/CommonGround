@@ -7,9 +7,10 @@
 [![NATS](https://img.shields.io/badge/NATS-JetStream-27AAE1.svg)](https://nats.io/)
 [![Postgres](https://img.shields.io/badge/Postgres-CardBox-336791.svg)](https://postgresql.org/)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-7289DA.svg)](https://discord.com/invite/intelligentinternet)
+
 [English](README.md) | [中文](README_CN.md)
 
-<img width="2400" height="875" alt="image" src="https://github.com/user-attachments/assets/c74333ad-7b4e-49e6-8867-3d0e0c4790a7" />
+![Common Ground Title Image](docs/cg.png)
 
 当今的 Agent 框架依赖死板的静态启发式规则，缺乏状态追踪与系统弹性，极易在复杂的“多智能体委托”中陷入协调崩溃（Coordination Collapse）
 
