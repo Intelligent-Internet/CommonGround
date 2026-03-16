@@ -23,7 +23,7 @@ from core.utils import safe_str, set_loop_policy
 from core.utp_protocol import ALLOWED_AFTER_EXECUTION_VALUES, Card
 from infra.agent_routing import resolve_agent_target
 from infra.service_runtime import ServiceBase
-from infra.tool_executor import ToolCallContext
+from infra.tool_executor import ToolCallEnvelope
 from services.tools.tool_runner import (
     ToolPayloadValidation,
     ToolRunner,
@@ -169,7 +169,7 @@ class WordCountToolService(ServiceBase):
                 require_after_execution=True,
                 allowed_after_execution=ALLOWED_AFTER_EXECUTION_VALUES,
             ),
-            result_author_id="sys.tool.word_count",
+            result_author_id="tool.word_count",
             logger=logger,
             service_name="WordCount",
         )
@@ -196,24 +196,22 @@ class WordCountToolService(ServiceBase):
         )
         await asyncio.Event().wait()
 
-    async def _execute_logic(self, ctx: ToolCallContext) -> Dict[str, Any]:
-        parts = ctx.parts
-        payload = ctx.payload
+    async def _execute_logic(self, envelope: ToolCallEnvelope) -> Dict[str, Any]:
+        cg_ctx = envelope.ctx
         target = await resolve_agent_target(
             resource_store=self.resource_store,
-            project_id=parts.project_id,
-            agent_id=str(payload.agent_id),
+            ctx=cg_ctx,
         )
         if not target:
             raise ProtocolViolationError(
                 "missing worker_target for agent",
                 detail={
-                    "project_id": parts.project_id,
-                    "agent_id": str(payload.agent_id),
-                    "tool_call_id": str(payload.tool_call_id),
+                    "project_id": cg_ctx.project_id,
+                    "agent_id": cg_ctx.agent_id,
+                    "tool_call_id": str(cg_ctx.tool_call_id or ""),
                 },
             )
-        args = ctx.args
+        args = envelope.args
         mode = _normalize_mode(args.get("mode"))
         top_k = _normalize_top_k(args.get("top_k"), default=50, limit=2000)
         if mode == "map":
@@ -225,8 +223,8 @@ class WordCountToolService(ServiceBase):
         return reduce_word_count(items=items, top_k=top_k)
 
     async def _handle_cmd(self, subject: str, data: Dict[str, Any], headers: Dict[str, str]) -> None:
-        async def _execute(ctx: ToolCallContext) -> Dict[str, Any]:
-            return await self._execute_logic(ctx)
+        async def _execute(envelope: ToolCallEnvelope) -> Dict[str, Any]:
+            return await self._execute_logic(envelope)
 
         run_result = await self.tool_runner.run(
             subject=subject,
@@ -238,7 +236,7 @@ class WordCountToolService(ServiceBase):
         if not run_result.handled:
             return
 
-        tool_call_id = safe_str(data.get("tool_call_id"))
+        tool_call_id = safe_str((headers or {}).get("CG-Tool-Call-Id"))
         if run_result.is_leader:
             logger.info("WordCount tool_result sent (leader) tool_call_id=%s", tool_call_id)
         elif run_result.is_leader is False:

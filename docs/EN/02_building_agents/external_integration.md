@@ -1,7 +1,7 @@
 # External Integration and I/O Boundaries (Aligned with Current Implementation)
 
 This page describes how to connect external systems to CommonGround (scripts/services/tools). The following conventions are based on the current repository implementation:
-- Default protocol version is `v1r3` (`core/config_defaults.py`).
+- Default protocol version is `v1r4` (`core/config_defaults.py`).
 - NATS and management APIs are **directly ingestible**, with no extra gateway layer.
 
 > This page mainly explains how to connect integrations, not how to define tool protocols. See `creating_tools.md` for the tool development workflow.
@@ -52,7 +52,7 @@ export PG_DSN="postgresql://postgres:postgres@postgres:5432/cardbox"
 
 See `core/config_defaults.py` for default config. Key fields include:
 
-- `protocol.version`: default `v1r3`
+- `protocol.version`: default `v1r4`
 - `nats.servers`, `nats.tls_enabled`, `nats.cert_dir`
 - `cardbox.postgres_dsn`, `cardbox.tenant_id`, `cardbox.postgres_min_size`, `cardbox.postgres_max_size`
 - `api.listen_host`, `api.port`
@@ -104,17 +104,17 @@ Key directions for external integration:
 - `cmd` / `evt`: JetStream, use `subscribe_cmd` + `publish_event`
   - `services/pmo/service.py`, `services/agent_worker/loop.py`, `services/ui_worker/loop.py`
 - `str`: Core NATS, use `subscribe_core` + `publish_core`
-  - Example subscription: `cg.v1r3.{project}.{channel}.str.agent.{agent_id}.chunk`
+  - Example subscription: `cg.v1r4.{project}.{channel}.str.agent.{agent_id}.chunk`
 
 `NATSClient` automatically creates default streams:
 
-- `cg_cmd_{v1r3}`
-- `cg_evt_{v1r3}`
+- `cg_cmd_{protocol_version}` (default: `cg_cmd_v1r4`)
+- `cg_evt_{protocol_version}` (default: `cg_evt_v1r4`)
 
 ### Subscribe / Publish Recommendations (External Boundary)
 
 - External tool services:
-  - Subscribe to: `cg.{v1r3}.{project}.{channel}.cmd.tool.{target}.*`
+  - Subscribe to: `cg.{protocol_version}.{project}.{channel}.cmd.tool.{target}.*` (default protocol: `v1r4`)
   - Reply by writing `tool.result` cards in the tool callback and flow back through the L0 report path to `state.agent_inbox`
 - External UI/event consumers:
   - Subscribe to `evt.agent.{agent_id}.task/step/state` and `str.agent.{agent_id}.chunk`

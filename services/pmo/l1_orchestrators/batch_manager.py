@@ -11,21 +11,18 @@ from typing import Any, Dict, List, Optional, Literal
 
 import uuid6
 
+from core.cg_context import CGContext
 from core.utp_protocol import (
     extract_card_content_text,
     extract_content_fields,
-    extract_tool_result_payload,
 )
-from core.headers import merge_recursion_depth
 from core.time_utils import utc_now_iso
-from core.trace import TRACEPARENT_HEADER, build_traceparent, ensure_trace_headers, trace_id_from_headers
-from core.errors import ProtocolViolationError
+from core.trace import TRACEPARENT_HEADER, build_traceparent
 from infra.cardbox_client import CardBoxClient
 from infra.nats_client import NATSClient
-from infra.l0_engine import L0Engine
+from infra.l0_engine import AddressIntent, DepthPolicy, JoinIntent, L0Engine, ReportIntent, TurnRef
 from infra.stores import BatchStore, ExecutionStore, IdentityStore, ResourceStore, StateStore
 from infra.observability.otel import (
-    CG_PARENT_TRACEPARENT_HEADER,
     current_traceparent,
     extract_context_from_headers,
     get_tracer,
@@ -35,7 +32,7 @@ from infra.observability.otel import (
 )
 
 from services.pmo.agent_lifecycle import CreateAgentSpec, ensure_agent_ready
-from infra.tool_executor import ToolResultBuilder, ToolResultContext
+from infra.tool_executor import ToolResultBuilder, ToolResultContext, fetch_and_parse_tool_result
 from infra.agent_dispatcher import AgentDispatcher, DispatchRequest
 from core.utils import safe_str, normalize_label
 from .base import BatchCreateRequest
@@ -61,70 +58,9 @@ def _derive_agent_instance_id(profile_box_id: str) -> str:
     return f"{str(profile_box_id).lower()}_{uuid6.uuid7().hex}"
 
 
-def _coerce_recursion_depth(raw: Any, *, default: int = 0) -> int:
-    try:
-        depth = int(raw)
-    except Exception:  # noqa: BLE001
-        return default
-    return depth if depth >= 0 else default
-
-
 def _hash_payload(obj: Dict[str, Any]) -> str:
     blob = json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
-
-
-def _provision_agent_span_attrs(args: Dict[str, Any]) -> Dict[str, Any]:
-    attrs: Dict[str, Any] = {
-        "cg.project_id": str(args.get("project_id") or ""),
-        "cg.channel_id": str(args.get("channel_id") or ""),
-        "cg.batch_id": str(args.get("batch_id") or ""),
-        "cg.target_agent_id": str(args.get("agent_id") or ""),
-        "cg.profile_box_id": str(args.get("profile_box_id") or ""),
-    }
-    source_agent_id = args.get("source_agent_id")
-    if source_agent_id:
-        attrs["cg.source_agent_id"] = str(source_agent_id)
-    parent_step_id = args.get("parent_step_id")
-    if parent_step_id:
-        attrs["cg.parent_step_id"] = str(parent_step_id)
-    return attrs
-
-
-def _create_batch_span_attrs(args: Dict[str, Any]) -> Dict[str, Any]:
-    req = args.get("req")
-    if req is not None:
-        attrs: Dict[str, Any] = {
-            "cg.project_id": str(getattr(req, "project_id", "") or ""),
-            "cg.channel_id": str(getattr(req, "channel_id", "") or ""),
-            "cg.task_count": int(len(getattr(req, "task_specs", None) or [])),
-        }
-        source_agent_id = getattr(req, "source_agent_id", None)
-        if source_agent_id:
-            attrs["cg.source_agent_id"] = str(source_agent_id)
-        parent_agent_turn_id = getattr(req, "parent_agent_turn_id", None)
-        if parent_agent_turn_id:
-            attrs["cg.parent_agent_turn_id"] = str(parent_agent_turn_id)
-        parent_step_id = getattr(req, "parent_step_id", None)
-        if parent_step_id:
-            attrs["cg.parent_step_id"] = str(parent_step_id)
-        return attrs
-
-    attrs: Dict[str, Any] = {
-        "cg.project_id": str(args.get("project_id") or ""),
-        "cg.channel_id": str(args.get("channel_id") or ""),
-        "cg.task_count": int(len(args.get("task_specs") or [])),
-    }
-    source_agent_id = args.get("source_agent_id")
-    if source_agent_id:
-        attrs["cg.source_agent_id"] = str(source_agent_id)
-    parent_agent_turn_id = args.get("parent_agent_turn_id")
-    if parent_agent_turn_id:
-        attrs["cg.parent_agent_turn_id"] = str(parent_agent_turn_id)
-    parent_step_id = args.get("parent_step_id")
-    if parent_step_id:
-        attrs["cg.parent_step_id"] = str(parent_step_id)
-    return attrs
 
 
 class BatchManager:
@@ -164,39 +100,50 @@ class BatchManager:
             execution_store=self.execution_store,
             resource_store=self.resource_store,
             state_store=self.state_store,
+            cardbox=self.cardbox,
         )
+
+    @staticmethod
+    def _ctx_snapshot(ctx: CGContext) -> Dict[str, Any]:
+        snapshot = ctx.to_sys_dict()
+        if ctx.headers:
+            snapshot["headers"] = dict(ctx.headers)
+        return snapshot
+
+    @staticmethod
+    def _ctx_from_snapshot(raw: Any) -> Optional[CGContext]:
+        if not isinstance(raw, dict):
+            return None
+        try:
+            return CGContext.from_sys_dict(raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Batch context snapshot restore failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _batch_source_ctx(base_ctx: CGContext) -> CGContext:
+        return base_ctx.evolve(agent_id="sys.pmo.batch_manager", agent_turn_id="", step_id=None)
 
     @traced(
         _TRACER,
         "pmo.agent.provision",
-        attributes_getter=_provision_agent_span_attrs,
         mark_error_on_exception=True,
     )
     async def _provision_batch_agent(
         self,
         *,
-        project_id: str,
-        channel_id: str,
         batch_id: str,
-        agent_id: str,
         profile_box_id: str,
         create_spec: CreateAgentSpec,
-        source_agent_id: str,
-        parent_step_id: str,
-        trace_id: Optional[str],
+        target_ctx: CGContext,
         conn: Any = None,
     ) -> Any:
         return await ensure_agent_ready(
             resource_store=self.resource_store,
             state_store=self.state_store,
             identity_store=self.identity_store,
-            project_id=project_id,
-            agent_id=agent_id,
+            target_ctx=target_ctx,
             spec=create_spec,
-            source_agent_id=source_agent_id,
-            parent_step_id=parent_step_id,
-            trace_id=trace_id,
-            channel_id=channel_id,
             conn=conn,
         )
 
@@ -204,7 +151,6 @@ class BatchManager:
         _TRACER,
         "pmo.batch.create",
         span_arg="_span",
-        attributes_getter=_create_batch_span_attrs,
     )
     async def create_batch(
         self,
@@ -213,13 +159,12 @@ class BatchManager:
         conn: Any,
         _span: Any = None,
     ) -> str:
-        project_id = req.project_id
-        channel_id = req.channel_id
-        source_agent_id = req.source_agent_id
-        parent_agent_turn_id = req.parent_agent_turn_id
-        parent_turn_epoch = req.parent_turn_epoch
-        parent_tool_call_id = req.parent_tool_call_id
-        parent_step_id = req.parent_step_id
+        parent_ctx = req.parent_ctx
+        project_id = parent_ctx.project_id
+        channel_id = parent_ctx.channel_id
+        source_agent_id = parent_ctx.agent_id
+        parent_tool_call_id = safe_str(parent_ctx.tool_call_id)
+        parent_step_id = parent_ctx.step_id or ""
         lineage_parent_step_id = req.lineage_parent_step_id
         parent_after_execution = req.parent_after_execution
         tool_suffix = req.tool_suffix
@@ -227,9 +172,7 @@ class BatchManager:
         fail_fast = req.fail_fast
         deadline_seconds = req.deadline_seconds
         structured_output = req.structured_output
-        trace_id = req.trace_id
-        parent_traceparent = req.parent_traceparent
-        recursion_depth = req.recursion_depth
+        persisted_parent_ctx = parent_ctx.with_tool_call(parent_tool_call_id)
 
         if not task_specs:
             raise ValueError("internal batch requires non-empty task_specs")
@@ -260,26 +203,14 @@ class BatchManager:
             "internal": True,
             "fail_fast": bool(fail_fast),
             "parent_after_execution": parent_after_execution,
-            "parent_step_id": parent_step_id,
             "tool_suffix": tool_suffix,
             "tool_name": tool_name,
+            "parent_ctx": self._ctx_snapshot(persisted_parent_ctx),
         }
-        if parent_traceparent:
-            batch_metadata["parent_traceparent"] = str(parent_traceparent)
         if structured_output:
             batch_metadata["structured_output"] = str(structured_output)
         if lineage_parent_step_id:
             batch_metadata["lineage_parent_step_id"] = str(lineage_parent_step_id)
-        if trace_id:
-            batch_metadata["trace_id"] = str(trace_id)
-        if recursion_depth is not None:
-            try:
-                depth_val = int(recursion_depth)
-            except Exception as exc:  # noqa: BLE001
-                raise ProtocolViolationError("invalid recursion_depth for batch") from exc
-            if depth_val < 0:
-                raise ProtocolViolationError("invalid recursion_depth for batch")
-            batch_metadata["recursion_depth"] = depth_val
 
         tasks_to_insert: List[Dict[str, Any]] = []
         seen_task_indexes: Dict[int, int] = {}
@@ -358,15 +289,15 @@ class BatchManager:
                     active_channel_id=channel_id,
                 )
                 lifecycle_result = await self._provision_batch_agent(
-                    project_id=project_id,
-                    channel_id=channel_id,
                     batch_id=batch_id,
-                    agent_id=agent_id,
                     profile_box_id=str(profile_box_id),
                     create_spec=create_spec,
-                    source_agent_id=source_agent_id,
-                    parent_step_id=parent_step_id,
-                    trace_id=trace_id,
+                    target_ctx=parent_ctx.evolve(
+                        agent_id=agent_id,
+                        parent_agent_id=source_agent_id,
+                        parent_step_id=parent_step_id,
+                        trace_id=parent_ctx.trace_id,
+                    ),
                     conn=conn,
                 )
                 if lifecycle_result.error_code:
@@ -376,7 +307,10 @@ class BatchManager:
             else:
                 if not agent_id:
                     raise ValueError("internal batch task missing agent_id when provision=false")
-                roster = await self.resource_store.fetch_roster(project_id, agent_id, conn=conn)
+                roster = await self.resource_store.fetch_roster(
+                    parent_ctx.evolve(agent_id=agent_id, channel_id=channel_id),
+                    conn=conn,
+                )
                 if not roster:
                     raise ValueError(f"internal batch agent not found: {agent_id}")
                 roster_profile_box_id = safe_str(roster.get("profile_box_id"))
@@ -400,7 +334,10 @@ class BatchManager:
             )
 
             # Persist input order explicitly so result mapping never depends on DB row order.
-            task_metadata = {"task_args": task_args, "task_index": stable_task_index}
+            task_metadata = {
+                "task_args": task_args,
+                "task_index": stable_task_index,
+            }
             if runtime_config:
                 task_metadata["runtime_config"] = runtime_config
             tasks_to_insert.append(
@@ -422,12 +359,7 @@ class BatchManager:
 
         await self.batch_store.insert_batch(
             batch_id=batch_id,
-            project_id=project_id,
-            parent_agent_id=source_agent_id,
-            parent_agent_turn_id=parent_agent_turn_id,
-            parent_tool_call_id=parent_tool_call_id,
-            parent_turn_epoch=int(parent_turn_epoch),
-            parent_channel_id=channel_id,
+            parent_ctx=persisted_parent_ctx,
             task_count=len(tasks_to_insert),
             deadline_at=deadline_at,
             metadata=batch_metadata,
@@ -446,13 +378,9 @@ class BatchManager:
         deadline_at: Optional[str] = None,
         tool_name: str = _FORK_JOIN_TOOL_NAME,
     ) -> None:
-        project_id = req.project_id
-        channel_id = req.channel_id
-        source_agent_id = req.source_agent_id
-        parent_agent_turn_id = req.parent_agent_turn_id
-        parent_step_id = req.parent_step_id
-        trace_id = req.trace_id
-        recursion_depth = req.recursion_depth
+        parent_ctx = req.parent_ctx
+        project_id = parent_ctx.project_id
+        source_agent_id = parent_ctx.agent_id
         fail_fast = bool(req.fail_fast)
 
         if deadline_at is None:
@@ -461,21 +389,22 @@ class BatchManager:
                 deadline_raw = batch_row.get("deadline_at")
                 deadline_at = str(deadline_raw) if deadline_raw is not None else None
 
-        if recursion_depth is None:
-            raise ProtocolViolationError("missing recursion_depth")
+        join_source_ctx = parent_ctx.evolve(
+            parent_step_id=parent_ctx.step_id,
+        ).with_transport(
+            trace_id=parent_ctx.trace_id,
+            recursion_depth=int(parent_ctx.recursion_depth),
+        )
+
         join_result = await self._join_with_tx(
             phase="request",
-            project_id=project_id,
-            channel_id=channel_id,
-            source_agent_id=source_agent_id,
-            source_agent_turn_id=parent_agent_turn_id,
-            source_step_id=parent_step_id,
-            target_agent_id=source_agent_id,
-            target_agent_turn_id=parent_agent_turn_id,
+            source_ctx=join_source_ctx,
+            target_ref=TurnRef(
+                project_id=parent_ctx.project_id,
+                agent_id=parent_ctx.agent_id,
+                agent_turn_id=parent_ctx.require_agent_turn_id,
+            ),
             correlation_id=batch_id,
-            recursion_depth=int(recursion_depth),
-            trace_id=trace_id,
-            parent_step_id=parent_step_id,
             metadata={
                 "batch_id": batch_id,
                 "task_count": int(task_count),
@@ -504,33 +433,52 @@ class BatchManager:
     async def _report_with_doorbell(
         self,
         *,
-        project_id: str,
-        channel_id: str,
-        target_agent_id: str,
+        source_ctx: CGContext,
+        target_ref: TurnRef,
         message_type: str,
         payload: Dict[str, Any],
         correlation_id: str,
-        recursion_depth: int,
-        trace_id: Optional[str],
-        source_agent_id: Optional[str],
-        headers: Dict[str, str],
-        parent_step_id: Optional[str] = None,
     ) -> None:
         wakeup_signals = []
         async with self.execution_store.pool.connection() as conn:
             async with conn.transaction():
-                result = await self.l0.report(
-                    project_id=project_id,
-                    channel_id=channel_id,
-                    target_agent_id=target_agent_id,
-                    message_type=message_type,
-                    payload=payload,
-                    correlation_id=correlation_id,
-                    recursion_depth=recursion_depth,
-                    trace_id=trace_id,
-                    parent_step_id=parent_step_id,
-                    source_agent_id=source_agent_id,
-                    headers=headers,
+                intent_source_ctx = self._batch_source_ctx(source_ctx)
+                result = await self.l0.report_intent(
+                    source_ctx=intent_source_ctx,
+                    intent=ReportIntent(
+                        target=target_ref,
+                        message_type=message_type,
+                        payload=payload,
+                        correlation_id=correlation_id,
+                    ),
+                    conn=conn,
+                    wakeup=True,
+                )
+                wakeup_signals = list(result.wakeup_signals or ())
+        if wakeup_signals:
+            await self.l0.publish_wakeup_signals(wakeup_signals)
+
+    async def _enqueue_address_with_doorbell(
+        self,
+        *,
+        source_ctx: CGContext,
+        target_ref: TurnRef,
+        message_type: str,
+        payload: Dict[str, Any],
+        correlation_id: Optional[str] = None,
+    ) -> None:
+        wakeup_signals = []
+        async with self.execution_store.pool.connection() as conn:
+            async with conn.transaction():
+                intent_source_ctx = self._batch_source_ctx(source_ctx)
+                result = await self.l0.enqueue_intent(
+                    source_ctx=intent_source_ctx,
+                    intent=AddressIntent(
+                        target=target_ref,
+                        message_type=message_type,
+                        payload=payload,
+                        correlation_id=correlation_id,
+                    ),
                     wakeup=True,
                     conn=conn,
                 )
@@ -542,35 +490,22 @@ class BatchManager:
         self,
         *,
         phase: Literal["request", "response"],
-        project_id: str,
-        channel_id: str,
-        source_agent_id: Optional[str],
-        source_agent_turn_id: Optional[str],
-        source_step_id: Optional[str],
-        target_agent_id: Optional[str],
-        target_agent_turn_id: Optional[str],
+        source_ctx: CGContext,
+        target_ref: TurnRef,
         correlation_id: str,
-        recursion_depth: int,
-        trace_id: Optional[str],
-        parent_step_id: Optional[str],
         metadata: Dict[str, Any],
     ) -> Any:
         async with self.execution_store.pool.connection() as conn:
             async with conn.transaction():
-                return await self.l0.join(
-                    phase=phase,
-                    project_id=project_id,
-                    channel_id=channel_id,
-                    source_agent_id=source_agent_id,
-                    source_agent_turn_id=source_agent_turn_id,
-                    source_step_id=source_step_id,
-                    target_agent_id=target_agent_id,
-                    target_agent_turn_id=target_agent_turn_id,
-                    correlation_id=correlation_id,
-                    recursion_depth=recursion_depth,
-                    trace_id=trace_id,
-                    parent_step_id=parent_step_id,
-                    metadata=metadata,
+                intent_source_ctx = self._batch_source_ctx(source_ctx)
+                return await self.l0.join_intent(
+                    source_ctx=intent_source_ctx,
+                    intent=JoinIntent(
+                        target=target_ref,
+                        phase=phase,
+                        correlation_id=correlation_id,
+                        metadata=metadata,
+                    ),
                     conn=conn,
                 )
 
@@ -592,12 +527,21 @@ class BatchManager:
             profile_box_id = row.get("profile_box_id")
             context_box_id = row.get("context_box_id")
             preset_output_box_id = safe_str(row.get("output_box_id")) if row.get("output_box_id") else ""
-            parent_channel_id = row.get("parent_channel_id") or "public"
-            parent_agent_turn_id = row.get("parent_agent_turn_id")
             task_meta = row.get("task_metadata") or {}
             task_args = task_meta.get("task_args") if isinstance(task_meta, dict) else None
             if not isinstance(task_args, dict):
                 task_args = {}
+            batch_meta = row.get("batch_metadata") or {}
+            parent_ctx = self._ctx_from_snapshot(
+                batch_meta.get("parent_ctx") if isinstance(batch_meta, dict) else None,
+            )
+            if parent_ctx is None:
+                logger.warning(
+                    "Batch dispatch skipped: missing parent_ctx snapshot task=%s batch=%s",
+                    batch_task_id,
+                    row.get("batch_id"),
+                )
+                return
             runtime_config = {}
             if isinstance(task_meta, dict) and isinstance(task_meta.get("runtime_config"), dict):
                 runtime_config = dict(task_meta["runtime_config"])
@@ -608,26 +552,27 @@ class BatchManager:
                 box_id=preset_output_box_id or None,
             )
 
-            # Stable per-attempt id used as L0 correlation_id and for batch task correlation.
-            agent_turn_id = f"turn_{uuid6.uuid7().hex}"
             claimed = await self.batch_store.claim_task_dispatched(
                 batch_task_id=batch_task_id,
                 project_id=project_id,
-                agent_turn_id=agent_turn_id,
+                agent_turn_id=None,
                 output_box_id=output_box_id,
             )
             if not claimed:
                 return
 
-            batch_meta = row.get("batch_metadata") or {}
-            parent_step_id = safe_str(batch_meta.get("parent_step_id")) if isinstance(batch_meta, dict) else None
-            parent_trace_id = safe_str(batch_meta.get("trace_id")) if isinstance(batch_meta, dict) else ""
-            parent_tp = safe_str(batch_meta.get("parent_traceparent")) if isinstance(batch_meta, dict) else ""
-
-            # Create a new trace for the child task.
+            parent_trace_id = safe_str(parent_ctx.trace_id)
+            parent_tp = safe_str(parent_ctx.headers.get(TRACEPARENT_HEADER))
+            parent_current_tp = current_traceparent() or parent_tp
             child_tp, child_trace_id = build_traceparent(None)
+            dispatch_lineage_ctx = parent_ctx.with_trace_transport(
+                traceparent=child_tp,
+                parent_traceparent=parent_current_tp or None,
+                trace_id=child_trace_id,
+                default_depth=int(parent_ctx.recursion_depth),
+            )
             child_link = link_from_traceparent(
-                child_tp,
+                safe_str(child_tp),
                 attributes={
                     "cg.link": "child",
                     "cg.batch_task_id": str(batch_task_id),
@@ -660,21 +605,6 @@ class BatchManager:
                 set_status_on_exception=True,
                 mark_error_on_exception=True,
             ) as span:
-                headers: Dict[str, str] = {}
-                # Force child trace context.
-                headers[TRACEPARENT_HEADER] = child_tp
-                headers, _, _ = ensure_trace_headers(headers, trace_id=str(child_trace_id))
-                # Keep a cross-trace pointer for the child to link back to parent spans.
-                parent_current_tp = current_traceparent() or parent_tp
-                if parent_current_tp:
-                    headers[CG_PARENT_TRACEPARENT_HEADER] = str(parent_current_tp)
-
-                parent_depth = _coerce_recursion_depth(
-                    batch_meta.get("recursion_depth") if isinstance(batch_meta, dict) else None
-                )
-                child_depth = parent_depth + 1
-                headers = merge_recursion_depth(headers, depth=child_depth)
-
                 await self.batch_store.patch_task_metadata(
                     batch_task_id=batch_task_id,
                     project_id=project_id,
@@ -683,24 +613,22 @@ class BatchManager:
                         "child_traceparent": str(child_tp),
                         "parent_trace_id": str(parent_trace_id) if parent_trace_id else None,
                         "parent_traceparent": str(parent_current_tp) if parent_current_tp else None,
+                        "dispatch_channel_id": parent_ctx.channel_id,
                     },
                 )
                 dispatch_result = await dispatcher.dispatch(
                     DispatchRequest(
-                        project_id=project_id,
-                        channel_id=parent_channel_id,
-                        agent_id=str(agent_id),
+                        source_ctx=self._batch_source_ctx(dispatch_lineage_ctx),
+                        target_agent_id=str(agent_id),
+                        target_channel_id=parent_ctx.channel_id,
+                        lineage_ctx=dispatch_lineage_ctx,
+                        correlation_id=batch_task_id,
+                        depth_policy=DepthPolicy.DESCEND,
                         profile_box_id=safe_str(profile_box_id),
                         context_box_id=safe_str(context_box_id),
                         output_box_id=output_box_id,
-                        agent_turn_id=agent_turn_id,
-                        parent_agent_turn_id=safe_str(parent_agent_turn_id),
-                        parent_tool_call_id=safe_str(row.get("parent_tool_call_id")),
-                        parent_step_id=str(parent_step_id) if parent_step_id else None,
-                        trace_id=str(child_trace_id),
                         display_name=display_name,
                         runtime_config=runtime_config,
-                        headers=headers,
                         emit_state_event=True,
                     )
                 )
@@ -734,7 +662,7 @@ class BatchManager:
                     failed_batch_id = await self.batch_store.mark_task_dispatch_failed(
                         batch_task_id=batch_task_id,
                         project_id=project_id,
-                        agent_turn_id=agent_turn_id,
+                        agent_turn_id=None,
                         error_detail=error_detail,
                         metadata_patch={
                             "dispatch_status": dispatch_status,
@@ -759,7 +687,7 @@ class BatchManager:
                     failed_batch_id = await self.batch_store.mark_task_dispatch_failed(
                         batch_task_id=batch_task_id,
                         project_id=project_id,
-                        agent_turn_id=agent_turn_id,
+                        agent_turn_id=None,
                         error_detail="dispatch_retry_exhausted",
                         metadata_patch={
                             "dispatch_status": dispatch_status,
@@ -784,7 +712,7 @@ class BatchManager:
                     await self.batch_store.revert_task_to_pending(
                         batch_task_id=batch_task_id,
                         project_id=project_id,
-                        agent_turn_id=agent_turn_id,
+                        agent_turn_id=None,
                         retry_delay_seconds=retry_delay,
                         metadata_patch={
                             "dispatch_status": dispatch_status,
@@ -803,26 +731,34 @@ class BatchManager:
                         retry_delay,
                     )
                     return
-                if not dispatch_result.agent_turn_id or dispatch_result.turn_epoch is None:
-                    logger.info(
-                        "Batch dispatch queued task=%s agent=%s turn=%s (awaiting lease)",
-                        batch_task_id,
-                        agent_id,
-                        dispatch_result.agent_turn_id,
+                resolved_turn_id = safe_str(dispatch_result.agent_turn_id)
+                if not resolved_turn_id:
+                    raise RuntimeError(
+                        f"batch dispatch accepted without agent_turn_id: task={batch_task_id}"
                     )
-                    return
-
                 await self.batch_store.set_task_turn_identity(
                     batch_task_id=batch_task_id,
                     project_id=project_id,
-                    agent_turn_id=dispatch_result.agent_turn_id,
-                    turn_epoch=int(dispatch_result.turn_epoch),
+                    agent_turn_id=resolved_turn_id,
+                    turn_epoch=(
+                        int(dispatch_result.turn_epoch)
+                        if dispatch_result.turn_epoch is not None
+                        else None
+                    ),
                 )
+                if dispatch_result.turn_epoch is None:
+                    logger.info(
+                        "Batch dispatched task=%s agent=%s turn=%s (lease pending)",
+                        batch_task_id,
+                        agent_id,
+                        resolved_turn_id,
+                    )
+                    return
                 logger.info(
                     "Batch dispatched task=%s agent=%s turn=%s epoch=%s",
                     batch_task_id,
                     agent_id,
-                    dispatch_result.agent_turn_id,
+                    resolved_turn_id,
                     dispatch_result.turn_epoch,
                 )
 
@@ -846,24 +782,36 @@ class BatchManager:
         revert_after_seconds: float = DEFAULT_REVERT_MISSING_EPOCH_AFTER_S,
         limit: int = 200,
     ) -> None:
-        """Reconcile missing turn_epoch for already-dispatched tasks.
+        """Observe lease-pending dispatched tasks and nudge downstream execution when needed."""
 
-        When L0 ACK is pending/unknown, BatchManager may have a stable agent_turn_id but no
-        turn_epoch. This method fills turn_epoch by reading the persisted inbox row
-        (correlation_id == agent_turn_id) and, if needed, reverts tasks that never got enqueued.
-        """
-
-        async def _lookup_turn_epoch_and_status(
+        async def _resolve_child_runtime(
             *,
             project_id: str,
             agent_id: str,
             agent_turn_id: str,
-        ) -> tuple[Optional[int], Optional[str]]:
+        ) -> tuple[Optional[str], Optional[int]]:
             try:
-                rows = await self.execution_store.list_inbox_by_correlation(
-                    project_id=project_id,
-                    agent_id=agent_id,
-                    correlation_id=agent_turn_id,
+                head = await self.state_store.fetch(
+                    CGContext(project_id=project_id, agent_id=agent_id),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Batch reconcile state-head lookup failed agent=%s turn=%s: %s",
+                    agent_id,
+                    agent_turn_id,
+                    exc,
+                )
+                head = None
+            if head and safe_str(getattr(head, "active_agent_turn_id", None)) == agent_turn_id:
+                try:
+                    head_epoch = int(getattr(head, "turn_epoch", None))
+                except Exception:  # noqa: BLE001
+                    head_epoch = None
+                return safe_str(getattr(head, "status", None)) or "active", head_epoch
+            try:
+                rows = await self.execution_store.list_inbox_by_agent_turn_id(
+                    ctx=CGContext(project_id=project_id, agent_id=agent_id),
+                    agent_turn_id=agent_turn_id,
                     limit=1,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -876,95 +824,35 @@ class BatchManager:
                 return None, None
             if not rows:
                 return None, None
-            status = safe_str((rows[0] or {}).get("status")) if isinstance(rows[0], dict) else None
-            payload_any = (rows[0] or {}).get("payload")
-            payload: Dict[str, Any] = {}
-            if isinstance(payload_any, dict):
-                payload = payload_any
-            elif isinstance(payload_any, str):
-                try:
-                    parsed = json.loads(payload_any)
-                    if isinstance(parsed, dict):
-                        payload = parsed
-                except Exception:  # noqa: BLE001
-                    payload = {}
-            epoch_raw = payload.get("turn_epoch")
-            if epoch_raw is None:
-                return None, status
-            try:
-                epoch = int(epoch_raw)
-            except Exception:  # noqa: BLE001
-                return None, status
-            return (epoch if epoch > 0 else None), status
+            row = rows[0] or {}
+            status = safe_str(row.get("status")) if isinstance(row, dict) else None
+            return status, None
 
         reconcile_after = max(0.0, float(reconcile_after_seconds))
         revert_after = max(reconcile_after, float(revert_after_seconds))
         limit_value = min(int(limit), self.watchdog_limit)
 
-        # Reconcile dispatched tasks that were actually enqueued and are missing turn epoch.
-        rows = await self.batch_store.list_stuck_dispatched_missing_epoch(
-            older_than_seconds=reconcile_after,
-            limit=limit_value,
-        )
-        for row in rows or []:
+        async def _observe_pending_row(
+            row: Dict[str, Any],
+            *,
+            allow_fail_downstream: bool,
+        ) -> None:
             project_id = safe_str(row.get("project_id"))
             batch_task_id = safe_str(row.get("batch_task_id"))
             agent_id = safe_str(row.get("agent_id"))
             agent_turn_id = safe_str(row.get("current_agent_turn_id"))
             if not project_id or not batch_task_id or not agent_id or not agent_turn_id:
-                continue
+                return
 
-            epoch, _status = await _lookup_turn_epoch_and_status(
+            status, resolved_epoch = await _resolve_child_runtime(
                 project_id=project_id,
                 agent_id=agent_id,
                 agent_turn_id=agent_turn_id,
             )
-            if epoch is None:
-                continue
-
-            await self.batch_store.set_task_turn_epoch(
-                batch_task_id=batch_task_id,
-                project_id=project_id,
-                agent_turn_id=agent_turn_id,
-                turn_epoch=int(epoch),
-            )
-            logger.info(
-                "Batch reconciled task epoch task=%s agent=%s turn=%s epoch=%s",
-                batch_task_id,
-                agent_id,
-                agent_turn_id,
-                epoch,
-            )
-
-        # Detect dispatched tasks without epoch/inbox for too long and emit warnings.
-        #
-        # Do NOT auto-revert here: L0 cmds are durable (JetStream). A late-delivered cmd could still
-        # enqueue/execute, and reverting would break turn_id correlation and/or cause duplicates.
-        stale = await self.batch_store.list_stuck_dispatched_missing_epoch(
-            older_than_seconds=revert_after,
-            limit=limit_value,
-        )
-        for row in stale or []:
-            project_id = safe_str(row.get("project_id"))
-            batch_task_id = safe_str(row.get("batch_task_id"))
-            agent_id = safe_str(row.get("agent_id"))
-            agent_turn_id = safe_str(row.get("current_agent_turn_id"))
-            if not project_id or not batch_task_id or not agent_id or not agent_turn_id:
-                continue
-
-            epoch, status = await _lookup_turn_epoch_and_status(
-                project_id=project_id,
-                agent_id=agent_id,
-                agent_turn_id=agent_turn_id,
-            )
-            if epoch is not None:
-                await self.batch_store.set_task_turn_epoch(
-                    batch_task_id=batch_task_id,
-                    project_id=project_id,
-                    agent_turn_id=agent_turn_id,
-                    turn_epoch=int(epoch),
-                )
-                continue
+            if resolved_epoch is not None and int(resolved_epoch) > 0:
+                return
+            if status in ("running", "processing"):
+                return
             task_meta_any = row.get("task_metadata")
             task_meta = task_meta_any if isinstance(task_meta_any, dict) else {}
             batch_id = safe_str(row.get("batch_id"))
@@ -981,12 +869,14 @@ class BatchManager:
 
             wakeup_sent = task_meta.get("dispatch_wakeup_sent_at") is not None
             if status == "queued" and not wakeup_sent:
-                wakeup_channel_id = safe_str(row.get("parent_channel_id")) or "public"
+                wakeup_channel_id = safe_str(task_meta.get("dispatch_channel_id")) or "public"
                 try:
                     wakeup_result = await self.l0.wakeup(
-                        project_id=project_id,
-                        channel_id=wakeup_channel_id,
-                        target_agent_id=agent_id,
+                        target_ctx=CGContext(
+                            project_id=project_id,
+                            channel_id=wakeup_channel_id,
+                            agent_id=agent_id,
+                        ),
                         mode="dispatch_next",
                         reason="batch_reconcile_ack_pending_window_exceeded",
                         metadata={
@@ -1022,7 +912,7 @@ class BatchManager:
                 isinstance(deadline_raw, datetime)
                 and deadline_raw <= datetime.now(UTC)
             )
-            should_fail_downstream = fail_fast_enabled or deadline_reached
+            should_fail_downstream = allow_fail_downstream and (fail_fast_enabled or deadline_reached)
 
             if should_fail_downstream:
                 metadata_patch["result_view"] = {
@@ -1048,7 +938,7 @@ class BatchManager:
                         deadline_reached,
                         status or "missing",
                     )
-                continue
+                return
 
             if metadata_patch:
                 await self.batch_store.patch_task_metadata(
@@ -1064,6 +954,20 @@ class BatchManager:
                         agent_turn_id,
                         status or "missing",
                     )
+
+        pending = await self.batch_store.list_stuck_dispatched_missing_epoch(
+            older_than_seconds=reconcile_after,
+            limit=limit_value,
+        )
+        for row in pending or []:
+            await _observe_pending_row(row, allow_fail_downstream=False)
+
+        stale = await self.batch_store.list_stuck_dispatched_missing_epoch(
+            older_than_seconds=revert_after,
+            limit=limit_value,
+        )
+        for row in stale or []:
+            await _observe_pending_row(row, allow_fail_downstream=True)
 
     async def handle_child_task_event(
         self,
@@ -1113,18 +1017,21 @@ class BatchManager:
         if tool_result_card_id:
             result_view["tool_result_card_id"] = str(tool_result_card_id)
             if structured_output == "tool_result":
-                try:
-                    cards = await self.cardbox.get_cards([str(tool_result_card_id)], project_id=project_id)
-                    tool_result = cards[0] if cards else None
-                    if tool_result:
-                        result_view["tool_result_payload"] = extract_tool_result_payload(tool_result)
-                    else:
-                        result_view["tool_result_error"] = "tool_result_not_found"
-                except Exception as exc:  # noqa: BLE001
+                read_result = await fetch_and_parse_tool_result(
+                    cardbox=self.cardbox,
+                    project_id=project_id,
+                    card_id=tool_result_card_id,
+                )
+                if read_result.error_code == "card_not_found":
+                    result_view["tool_result_error"] = "tool_result_not_found"
+                elif read_result.ok and isinstance(read_result.payload, dict):
+                    result_view["tool_result_payload"] = read_result.payload
+                else:
+                    err_detail = read_result.error_message or read_result.error_code or "unknown"
                     logger.warning(
-                        "Batch tool_result payload read failed tool_result_card_id=%s: %s",
+                        "Batch tool_result payload read failed tool_result_card_id=%s err=%s",
                         tool_result_card_id,
-                        exc,
+                        err_detail,
                     )
                     result_view["tool_result_error"] = "tool_result_read_failed"
 
@@ -1203,21 +1110,29 @@ class BatchManager:
     async def _terminate_children(self, *, batch_id: str, project_id: str) -> None:
         """Best-effort stop/cancel all non-terminal children for a batch.
 
-        - Dispatched tasks with known epoch -> send stop report.
+        - Dispatched tasks with known epoch -> send stop signal.
         - Dispatched tasks missing epoch:
           - inbox.status='queued' -> cancel (prevent future dispatch).
-          - inbox has turn_epoch -> send stop report (pending/processing/running path).
+          - inbox has turn_epoch -> send stop signal (pending/processing/running path).
         """
         batch = await self.batch_store.fetch_batch(batch_id=batch_id, project_id=project_id)
         if not batch:
             return
-        channel_id = batch.get("parent_channel_id") or "public"
         meta = batch.get("metadata") or {}
-        trace_id = meta.get("trace_id") if isinstance(meta, dict) else None
-        headers = {}
-        headers, _, _ = ensure_trace_headers(headers, trace_id=str(trace_id) if trace_id else None)
-        parent_depth = _coerce_recursion_depth(meta.get("recursion_depth") if isinstance(meta, dict) else None)
-        headers = merge_recursion_depth(headers, depth=parent_depth)
+        parent_ctx = self._ctx_from_snapshot(meta.get("parent_ctx") if isinstance(meta, dict) else None)
+        if parent_ctx is None:
+            logger.warning(
+                "Batch terminate skipped: missing parent_ctx snapshot batch=%s",
+                batch_id,
+            )
+            return
+        transport_ctx = parent_ctx.evolve(
+            agent_id="sys.pmo.batch_manager",
+        ).with_trace_transport(
+            base_headers=parent_ctx.headers,
+            trace_id=parent_ctx.trace_id,
+            default_depth=int(parent_ctx.recursion_depth),
+        )
 
         # 1) Stop children we can address directly (epoch known in batch store).
         turns = await self.batch_store.list_active_turns_for_batch(batch_id=batch_id, project_id=project_id)
@@ -1231,17 +1146,20 @@ class BatchManager:
                 "turn_epoch": r["current_turn_epoch"],
                 "reason": "batch_terminated",
             }
-            await self._report_with_doorbell(
-                project_id=project_id,
-                channel_id=channel_id,
-                target_agent_id=str(r["agent_id"]),
+            await self._enqueue_address_with_doorbell(
+                source_ctx=transport_ctx,
+                target_ref=TurnRef(
+                    project_id=project_id,
+                    agent_id=str(r["agent_id"]),
+                    agent_turn_id=agent_turn_id,
+                    expected_turn_epoch=(
+                        int(r["current_turn_epoch"])
+                        if r.get("current_turn_epoch") is not None
+                        else None
+                    ),
+                ),
                 message_type="stop",
                 payload=payload,
-                correlation_id=agent_turn_id,
-                recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
-                trace_id=trace_id_from_headers(headers),
-                source_agent_id="sys.pmo.batch_manager",
-                headers=headers,
             )
             logger.warning(
                 "Sent stop to child agent=%s turn=%s epoch=%s batch=%s",
@@ -1263,44 +1181,15 @@ class BatchManager:
             if t.get("current_turn_epoch") is not None:
                 continue
 
-            try:
-                rows = await self.execution_store.list_inbox_by_correlation(
-                    project_id=project_id,
+            cancel_result = await self.l0.cancel(
+                ctx=parent_ctx.evolve(
                     agent_id=agent_id,
-                    correlation_id=agent_turn_id,
-                    limit=1,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Batch terminate inbox lookup failed agent=%s turn=%s: %s",
-                    agent_id,
-                    agent_turn_id,
-                    exc,
-                )
-                continue
-            if not rows:
-                continue
-            inbox_row = rows[0] or {}
-            inbox_status = safe_str(inbox_row.get("status"))
-            payload_any = inbox_row.get("payload") or {}
-            payload: Dict[str, Any] = payload_any if isinstance(payload_any, dict) else {}
-            epoch_raw = payload.get("turn_epoch")
-            epoch: Optional[int] = None
-            if epoch_raw is not None:
-                try:
-                    epoch = int(epoch_raw)
-                except Exception:  # noqa: BLE001
-                    epoch = None
-
-            if inbox_status == "queued":
-                await self.l0.cancel(
-                    project_id=project_id,
-                    channel_id=channel_id,
-                    target_agent_id=agent_id,
                     agent_turn_id=agent_turn_id,
-                    reason="batch_terminated",
-                    metadata={"batch_id": batch_id},
-                )
+                ),
+                reason="batch_terminated",
+                metadata={"batch_id": batch_id},
+            )
+            if bool((cancel_result.payload or {}).get("canceled")):
                 logger.warning(
                     "Canceled queued child agent=%s turn=%s batch=%s",
                     agent_id,
@@ -1309,32 +1198,27 @@ class BatchManager:
                 )
                 continue
 
-            if epoch is not None and epoch > 0:
-                stop_payload = {
-                    "agent_id": agent_id,
-                    "agent_turn_id": agent_turn_id,
-                    "turn_epoch": int(epoch),
-                    "reason": "batch_terminated",
-                }
-                await self._report_with_doorbell(
+            stop_payload = {
+                "agent_id": agent_id,
+                "agent_turn_id": agent_turn_id,
+                "reason": "batch_terminated",
+            }
+            await self._enqueue_address_with_doorbell(
+                source_ctx=transport_ctx,
+                target_ref=TurnRef(
                     project_id=project_id,
-                    channel_id=channel_id,
-                    target_agent_id=agent_id,
-                    message_type="stop",
-                    payload=stop_payload,
-                    correlation_id=agent_turn_id,
-                    recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
-                    trace_id=trace_id_from_headers(headers),
-                    source_agent_id="sys.pmo.batch_manager",
-                    headers=headers,
-                )
-                logger.warning(
-                    "Sent stop to child (epoch from inbox) agent=%s turn=%s epoch=%s batch=%s",
-                    agent_id,
-                    agent_turn_id,
-                    epoch,
-                    batch_id,
-                )
+                    agent_id=agent_id,
+                    agent_turn_id=agent_turn_id,
+                ),
+                message_type="stop",
+                payload=stop_payload,
+            )
+            logger.warning(
+                "Sent stop to child without stored epoch agent=%s turn=%s batch=%s",
+                agent_id,
+                agent_turn_id,
+                batch_id,
+            )
 
     @staticmethod
     def _resolve_resume_tool_name(meta: Dict[str, Any]) -> str:
@@ -1423,6 +1307,13 @@ class BatchManager:
         if not batch:
             return
         meta = batch.get("metadata") or {}
+        parent_ctx = self._ctx_from_snapshot(meta.get("parent_ctx") if isinstance(meta, dict) else None)
+        if parent_ctx is None:
+            logger.warning(
+                "Batch resume skipped: missing parent_ctx snapshot batch=%s",
+                batch_id,
+            )
+            return
         tool_name = self._resolve_resume_tool_name(meta)
 
         resume_status = STATUS_SUCCESS
@@ -1436,22 +1327,8 @@ class BatchManager:
         result_obj = self._build_fork_join_result(tasks=tasks, final_status=final_status)
 
         parent_after = meta.get("parent_after_execution") or "suspend"
-        parent_step_id = meta.get("parent_step_id")
-        parent_step_id_str = str(parent_step_id) if parent_step_id is not None else None
         lineage_parent_step_id = meta.get("lineage_parent_step_id") if isinstance(meta, dict) else None
-        lineage_parent_step_id_str = (
-            str(lineage_parent_step_id) if lineage_parent_step_id is not None else parent_step_id_str
-        )
-        parent_channel_id = batch.get("parent_channel_id") or "public"
-        parent_agent_id = batch.get("parent_agent_id")
-
-        tool_call_id = batch.get("parent_tool_call_id")
-        agent_turn_id = batch.get("parent_agent_turn_id")
-        turn_epoch = batch.get("parent_turn_epoch")
-        tool_call_id_str = str(tool_call_id) if tool_call_id is not None else ""
-        agent_turn_id_str = str(agent_turn_id) if agent_turn_id is not None else ""
-
-        trace_id = meta.get("trace_id") if isinstance(meta, dict) else None
+        parent_agent_id = parent_ctx.agent_id
         error_payload = None
         if resume_status != STATUS_SUCCESS:
             error_payload = {
@@ -1459,23 +1336,17 @@ class BatchManager:
                 "message": f"batch finished with status={resume_status}",
                 "detail": {"batch_id": batch_id, "status": resume_status},
             }
+        result_cg_ctx = parent_ctx.evolve(parent_step_id=parent_ctx.step_id)
+        if lineage_parent_step_id is not None:
+            result_cg_ctx = result_cg_ctx.evolve(parent_step_id=str(lineage_parent_step_id))
+
         cmd_data = {
-            "tool_call_id": tool_call_id_str,
-            "agent_turn_id": agent_turn_id_str,
-            "turn_epoch": int(turn_epoch) if turn_epoch is not None else 0,
-            "agent_id": parent_agent_id,
             "after_execution": parent_after,
             "tool_name": tool_name,
         }
-        tool_call_meta = {
-            **({"step_id": parent_step_id_str} if parent_step_id_str else {}),
-            **({"trace_id": str(trace_id)} if trace_id else {}),
-            **({"parent_step_id": lineage_parent_step_id_str} if lineage_parent_step_id_str else {}),
-        }
-        result_context = ToolResultContext.from_cmd_data(
-            project_id=project_id,
+        result_context = ToolResultContext(
+            ctx=result_cg_ctx,
             cmd_data=cmd_data,
-            tool_call_meta=tool_call_meta,
         )
         payload, result_card = ToolResultBuilder(
             result_context,
@@ -1490,26 +1361,22 @@ class BatchManager:
         )
         await self.cardbox.save_card(result_card)
 
-        headers = self.nats.merge_headers({}, {})
-        headers, _, _ = ensure_trace_headers(
-            headers,
-            trace_id=str(meta.get("trace_id")) if isinstance(meta, dict) and meta.get("trace_id") else None,
+        transport_ctx = parent_ctx.evolve(
+            agent_id="sys.pmo.batch_manager",
+        ).with_trace_transport(
+            base_headers=parent_ctx.headers,
+            trace_id=parent_ctx.trace_id,
+            default_depth=int(parent_ctx.recursion_depth),
         )
-        parent_depth = _coerce_recursion_depth(meta.get("recursion_depth") if isinstance(meta, dict) else None)
-        headers = merge_recursion_depth(headers, depth=parent_depth)
         join_result = await self._join_with_tx(
             phase="response",
-            project_id=project_id,
-            channel_id=parent_channel_id,
-            source_agent_id="sys.pmo.batch_manager",
-            source_agent_turn_id=None,
-            source_step_id=None,
-            target_agent_id=parent_agent_id,
-            target_agent_turn_id=agent_turn_id_str,
+            source_ctx=transport_ctx,
+            target_ref=TurnRef(
+                project_id=parent_ctx.project_id,
+                agent_id=parent_ctx.agent_id,
+                agent_turn_id=parent_ctx.require_agent_turn_id,
+            ),
             correlation_id=batch_id,
-            recursion_depth=parent_depth,
-            trace_id=str(meta.get("trace_id")) if isinstance(meta, dict) else None,
-            parent_step_id=parent_step_id_str,
             metadata={
                 "batch_id": batch_id,
                 "status": final_status,
@@ -1526,17 +1393,15 @@ class BatchManager:
             )
 
         await self._report_with_doorbell(
-            project_id=project_id,
-            channel_id=parent_channel_id,
-            target_agent_id=str(parent_agent_id or ""),
+            source_ctx=transport_ctx,
+            target_ref=TurnRef(
+                project_id=parent_ctx.project_id,
+                agent_id=parent_ctx.agent_id,
+                agent_turn_id=parent_ctx.require_agent_turn_id,
+            ),
             message_type="tool_result",
             payload=payload,
-            correlation_id=tool_call_id_str,
-            recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
-            trace_id=trace_id_from_headers(headers),
-            parent_step_id=parent_step_id_str,
-            source_agent_id="sys.pmo.batch_manager",
-            headers=headers,
+            correlation_id=str(parent_ctx.tool_call_id or ""),
         )
         logger.info(
             "Resumed parent agent=%s batch=%s status=%s",

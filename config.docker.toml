@@ -9,7 +9,7 @@ max_inflight = 1
 fetch_timeout_seconds = 5.0
 
 [protocol]
-version = "v1r3"
+version = "v1r4"
 
 [worker]
 max_concurrency = 5
@@ -26,10 +26,6 @@ inbox_processing_timeout_seconds = 300
 # PMO settings
 # Re-emit wakeup for stale pending inbox items (seconds)
 pending_wakeup_seconds = 5.0
-# Auto-skip stale pending inbox without channel after this threshold (0 = disable)
-# Note: keep pending_wakeup_skip_seconds >= pending_wakeup_seconds.
-# If equal, missing-channel inboxes are skipped on the first scan window.
-pending_wakeup_skip_seconds = 300.0
 
 [cardbox]
 postgres_dsn = "postgresql://postgres:postgres@postgres:5432/cardbox"

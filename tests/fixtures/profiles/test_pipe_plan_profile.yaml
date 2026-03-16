@@ -5,6 +5,7 @@ description: "A simple profile to test fork_join flow."
 llm_config:
   model: "gemini/gemini-3-flash-preview"
   temperature: 1.0
+  reasoning_effort: "low"
   provider: "gemini"
 system_prompt: |
   You are a test agent. Your goal is to verify the `fork_join` tool.

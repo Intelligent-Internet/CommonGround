@@ -26,6 +26,7 @@ import httpx
 
 import uuid6
 
+from core.cg_context import CGContext
 from core.headers import ensure_recursion_depth
 from core.subject import format_subject
 from core.trace import ensure_trace_headers
@@ -450,11 +451,16 @@ async def main() -> None:
         headers, _, trace_id = ensure_trace_headers({}, trace_id=str(uuid6.uuid7()))
         headers = ensure_recursion_depth(headers, default_depth=0)
 
+        principal_ctx = CGContext(
+            project_id=str(args.project),
+            channel_id=str(args.channel),
+            agent_id=str(args.agent_id),
+        ).with_normalized_transport(headers, trace_id=trace_id, default_depth=0)
+
         await ensure_agent_ready(
             resource_store=resource_store,
             state_store=state_store,
-            project_id=str(args.project),
-            agent_id=str(args.agent_id),
+            target_ctx=principal_ctx,
             spec=CreateAgentSpec(
                 profile_box_id=str(principal_profile_box_id),
                 worker_target="worker_generic",
@@ -467,8 +473,6 @@ async def main() -> None:
                     "profile_name": str(args.principal_profile_name),
                 },
             ),
-            channel_id=str(args.channel),
-            trace_id=trace_id,
         )
 
         dispatcher = AgentDispatcher(
@@ -529,16 +533,19 @@ async def main() -> None:
         await nats.subscribe_core(task_subject, _on_task)
 
         print("[demo] dispatching principal turn...")
+        source_ctx = CGContext(
+            project_id=str(args.project),
+            channel_id=str(args.channel),
+            agent_id="sys.ground_control",
+        ).with_normalized_transport(headers, trace_id=trace_id, default_depth=0)
         dispatch_result = await dispatcher.dispatch(
             DispatchRequest(
-                project_id=str(args.project),
-                channel_id=str(args.channel),
-                agent_id=str(args.agent_id),
+                source_ctx=source_ctx,
+                target_agent_id=str(args.agent_id),
+                target_channel_id=str(args.channel),
                 profile_box_id=str(principal_profile_box_id),
                 context_box_id=str(context_box_id),
                 output_box_id=str(output_box_id),
-                trace_id=trace_id,
-                headers=headers,
             )
         )
         if dispatch_result.status not in ("accepted", "pending") or not dispatch_result.agent_turn_id:

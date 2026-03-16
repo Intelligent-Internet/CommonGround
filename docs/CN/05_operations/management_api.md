@@ -87,6 +87,11 @@
 | POST | `/projects/{project_id}/god/pmo/{tool_name}:call` | `PMOToolCallRequest` | `PMOToolCallResponse` | 调度 PMO internal tool |
 | POST | `/projects/{project_id}/god/stop` | `GodStopRequest` | `GodStopResponse` | 停止 agent turn |
 
+补充约束（实现已切换）：
+- `/god/pmo/{tool_name}:call` 的请求/响应契约保持不变。
+- 内部派发已改为走 L0 `command_intent`（由 L0 写 `execution_edges` 并统一发布 `cmd.sys.pmo.internal.*`），不再由 API 层直写 edge/直发命令。
+- `/god/stop` 已移除 `turn_epoch` 入参；`stop` 语义为按 `agent_turn_id` 停止目标 turn，不再做 epoch 精确匹配。
+
 ## 4. 与实现不一致点（已修订）
 
 - 旧文档只覆盖 `projects / profiles / tools`，遗漏了 Skill、Artifact、Agent/State、CardBox、God、观测相关接口。

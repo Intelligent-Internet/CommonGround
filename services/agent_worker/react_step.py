@@ -11,18 +11,17 @@ from infra.cardbox_client import CardBoxClient
 from infra.nats_client import NATSClient
 from infra.stores import ExecutionStore, ResourceStore, StateStore, SkillStore
 from infra.llm_gateway import LLMWrapper
+from core.cg_context import CGContext
 from core.llm import LLMRequest
 from core.errors import ProtocolViolationError
 from core.fields_schema import extract_fields_schema
 from core.utp_protocol import Card, TextContent
-from core.config import PROTOCOL_VERSION, MAX_STEPS, MAX_RECURSION_DEPTH, DEFAULT_TIMEOUT
-from core.status import STATUS_FAILED, TOOL_RESULT_STATUS_SET
+from core.config import MAX_STEPS, MAX_RECURSION_DEPTH
 from core.utils import safe_str
-from core.headers import require_recursion_depth
-from core.subject import format_subject
 from core.utp_protocol import extract_tool_result_payload
-from infra.worker_helpers import TurnGuard, publish_idle_wakeup
+from infra.worker_helpers import publish_idle_wakeup
 from infra.event_emitter import emit_agent_state, emit_agent_task
+from infra.stores.context_hydration import build_replay_context
 from card_box_core.engine import ContextEngine
 
 from .context_loader import ContextAssembler, ResourceLoader
@@ -97,53 +96,15 @@ def _normalize_reasoning_content(value: Any) -> Optional[str]:
     return str(value)
 
 
-def _llm_span_attrs(args: Dict[str, Any]) -> Dict[str, Any]:
-    item = args.get("item")
-    profile = args.get("profile")
-    step_id = args.get("step_id")
-    if item is None:
-        return {}
-    llm_cfg = getattr(profile, "llm_config", None)
-    return {
-        "cg.project_id": str(getattr(item, "project_id", "")),
-        "cg.agent_id": str(getattr(item, "agent_id", "")),
-        "cg.agent_turn_id": str(getattr(item, "agent_turn_id", "")),
-        "cg.step_id": str(step_id or ""),
-        "cg.llm.stream": bool(getattr(llm_cfg, "stream", False)),
-        "cg.llm.model": str(getattr(llm_cfg, "model", "") or ""),
-    }
-
-
-def _tool_span_attrs(args: Dict[str, Any]) -> Dict[str, Any]:
-    item = args.get("item")
-    tool_call = args.get("tool_call")
-    if item is None:
-        return {}
-    fn = "unknown"
-    tool_call_id = "unknown"
-    if isinstance(tool_call, dict):
-        fn = (tool_call.get("function") or {}).get("name") or "unknown"
-        tool_call_id = tool_call.get("id") or "unknown"
-    return {
-        "cg.project_id": str(getattr(item, "project_id", "")),
-        "cg.agent_id": str(getattr(item, "agent_id", "")),
-        "cg.agent_turn_id": str(getattr(item, "agent_turn_id", "")),
-        "cg.step_id": str(args.get("step_id") or ""),
-        "cg.tool.name": str(fn),
-        "cg.tool_call_id": str(tool_call_id),
-    }
-
 
 @dataclass
-class TurnContext:
+class StepRuntime:
     """Per-turn execution context (MUST NOT be stored on self; safe for concurrency)."""
 
     item: AgentTurnWorkItem
     start_ts: float
     state: Any
     new_card_ids: List[str] = field(default_factory=list)
-    depth: Optional[int] = None
-    step_id: Optional[str] = None
     profile: Any = None
     tool_suspend_timeouts: Dict[str, float] = field(default_factory=dict)
     result_fields: List[Dict[str, str]] = field(default_factory=list)
@@ -242,8 +203,8 @@ class ReactStepProcessor:
             if not waiters:
                 self._inbox_progress_waiters.pop(key, None)
 
-    async def notify_inbox_progress(self, *, project_id: str, agent_id: str) -> None:
-        key = (str(project_id), str(agent_id))
+    async def notify_inbox_progress(self, *, ctx: CGContext) -> None:
+        key = (str(ctx.project_id), str(ctx.agent_id))
         async with self._inbox_progress_waiters_lock:
             waiters = list(self._inbox_progress_waiters.get(key, ()))
         for waiter in waiters:
@@ -252,7 +213,7 @@ class ReactStepProcessor:
     async def _defer_until_inbox_drains(self, item: AgentTurnWorkItem) -> None:
         subscription = None
         wake_event = asyncio.Event()
-        key = (str(item.project_id), str(item.agent_id))
+        key = (item.ctx.project_id, item.ctx.agent_id)
         try:
             max_waits = 5
             wait_cycles = 0
@@ -263,14 +224,11 @@ class ReactStepProcessor:
 
             await self._register_inbox_progress_waiter(key, wake_event)
             try:
-                subject = format_subject(
-                    project_id=item.project_id,
-                    channel_id="*",
-                    category="evt",
-                    component="agent",
-                    target=item.agent_id,
-                    suffix="inbox_progress",
-                    protocol_version=PROTOCOL_VERSION,
+                subject = item.ctx.evolve(channel_id="*").subject(
+                    "evt",
+                    "agent",
+                    item.ctx.agent_id,
+                    "inbox_progress",
                 )
 
                 async def _on_inbox_progress(msg) -> None:
@@ -281,8 +239,8 @@ class ReactStepProcessor:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Inbox guard wait event subscription failed agent=%s turn=%s: %s",
-                    item.agent_id,
-                    item.agent_turn_id,
+                    item.ctx.agent_id,
+                    item.ctx.agent_turn_id,
                     exc,
                 )
                 subscription = None
@@ -290,8 +248,8 @@ class ReactStepProcessor:
             deadline = time.monotonic() + max(1.0, self.suspend_timeout_seconds)
             logger.info(
                 "Inbox guard wait start agent=%s turn=%s step=%s",
-                item.agent_id,
-                item.agent_turn_id,
+                item.ctx.agent_id,
+                item.ctx.agent_turn_id,
                 item.step_count,
             )
             checks = 0
@@ -299,8 +257,7 @@ class ReactStepProcessor:
                 checks += 1
                 try:
                     has_open = await self.execution_store.has_open_inbox(
-                        project_id=item.project_id,
-                        agent_id=item.agent_id,
+                        ctx=item.ctx,
                         exclude_inbox_id=exclude_inbox_id,
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -309,8 +266,8 @@ class ReactStepProcessor:
                 if not has_open:
                     logger.info(
                         "Inbox guard wait done agent=%s turn=%s checks=%s",
-                        item.agent_id,
-                        item.agent_turn_id,
+                        item.ctx.agent_id,
+                        item.ctx.agent_turn_id,
                         checks,
                     )
                     self._enqueue_next_step(item)
@@ -320,8 +277,8 @@ class ReactStepProcessor:
                     if wait_cycles >= max_waits:
                         logger.warning(
                             "Inbox guard wait exceeded agent=%s turn=%s waits=%s; failing turn.",
-                            item.agent_id,
-                            item.agent_turn_id,
+                            item.ctx.agent_id,
+                            item.ctx.agent_turn_id,
                             wait_cycles,
                         )
                         await self._fail_inbox_guard_wait(
@@ -332,8 +289,8 @@ class ReactStepProcessor:
                         return
                     logger.warning(
                         "Inbox guard wait timeout agent=%s turn=%s checks=%s; continuing wait cycle %s/%s.",
-                        item.agent_id,
-                        item.agent_turn_id,
+                        item.ctx.agent_id,
+                        item.ctx.agent_turn_id,
                         checks,
                         wait_cycles,
                         max_waits,
@@ -343,8 +300,8 @@ class ReactStepProcessor:
                 if checks == 1 or checks % 5 == 0:
                     logger.info(
                         "Inbox still open; waiting agent=%s turn=%s checks=%s",
-                        item.agent_id,
-                        item.agent_turn_id,
+                        item.ctx.agent_id,
+                        item.ctx.agent_turn_id,
                         checks,
                     )
                 remaining = max(0.05, deadline - time.monotonic())
@@ -360,8 +317,8 @@ class ReactStepProcessor:
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "Inbox guard wait crashed agent=%s turn=%s: %s",
-                item.agent_id,
-                item.agent_turn_id,
+                item.ctx.agent_id,
+                item.ctx.agent_turn_id,
                 exc,
                 exc_info=True,
             )
@@ -374,8 +331,8 @@ class ReactStepProcessor:
             except Exception as fail_exc:  # noqa: BLE001
                 logger.error(
                     "Inbox guard wait fail handler crashed agent=%s turn=%s: %s",
-                    item.agent_id,
-                    item.agent_turn_id,
+                    item.ctx.agent_id,
+                    item.ctx.agent_turn_id,
                     fail_exc,
                     exc_info=True,
                 )
@@ -387,8 +344,8 @@ class ReactStepProcessor:
                 except Exception as exc:  # noqa: BLE001
                     logger.debug(
                         "Inbox guard wait unsubscribe failed agent=%s turn=%s: %s",
-                        item.agent_id,
-                        item.agent_turn_id,
+                        item.ctx.agent_id,
+                        item.ctx.agent_turn_id,
                         exc,
                     )
 
@@ -408,165 +365,68 @@ class ReactStepProcessor:
         step_id: str,
         wait_items: List[Dict[str, str]],
     ) -> None:
-        lease_owner = (
-            f"react-suspend:{item.project_id}:{item.agent_id}:{item.agent_turn_id}:{int(state.turn_epoch)}:{step_id}"
-        )
-        claimed_rows = await self.state_store.claim_turn_resume_ledgers(
-            project_id=item.project_id,
-            agent_id=item.agent_id,
-            agent_turn_id=item.agent_turn_id,
-            turn_epoch=int(state.turn_epoch),
-            lease_owner=lease_owner,
-            lease_seconds=max(5.0, self.suspend_timeout_seconds),
-            limit=100,
-        )
-        claimed_pairs: set[tuple[str, str]] = set()
-        for row in claimed_rows:
-            payload = row.get("payload") or {}
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except Exception:
-                    payload = {}
-            if not isinstance(payload, dict):
-                payload = {}
-            tool_call_id = safe_str(row.get("tool_call_id")) or safe_str(payload.get("tool_call_id"))
-            tool_result_card_id = safe_str(row.get("tool_result_card_id")) or safe_str(
-                payload.get("tool_result_card_id")
-            )
-            if not tool_call_id or not tool_result_card_id:
-                continue
-            status = safe_str(payload.get("status"))
-            if status not in TOOL_RESULT_STATUS_SET:
-                status = STATUS_FAILED
-            after_execution = safe_str(payload.get("after_execution"))
-            if after_execution not in ("suspend", "terminate"):
-                after_execution = "suspend"
-            claimed_pairs.add((tool_call_id, tool_result_card_id))
-            await self.queue.put(
-                AgentTurnWorkItem(
-                    project_id=item.project_id,
-                    channel_id=item.channel_id,
-                    agent_turn_id=item.agent_turn_id,
-                    agent_id=item.agent_id,
-                    profile_box_id=safe_str(state.profile_box_id),
-                    context_box_id=safe_str(state.context_box_id),
-                    output_box_id=safe_str(state.output_box_id),
-                    turn_epoch=state.turn_epoch,
-                    headers=dict(item.headers),
-                    parent_step_id=item.parent_step_id,
-                    trace_id=item.trace_id,
-                    step_count=item.step_count,
-                    resume_data={
-                        "tool_call_id": tool_call_id,
-                        "status": status,
-                        "after_execution": after_execution,
-                        "tool_result_card_id": tool_result_card_id,
-                        "step_id": safe_str(payload.get("step_id")) or step_id,
-                    },
-                    is_continuation=True,
-                    inbox_id=None,
-                    guard_inbox_id=item.guard_inbox_id or item.inbox_id,
-                    enqueued_at=utc_now() if self.timing_capture else None,
-                )
-            )
-
-        tool_call_ids = [
-            safe_str(wait_item.get("tool_call_id"))
-            for wait_item in wait_items
-            if safe_str(wait_item.get("tool_call_id"))
-        ]
-        if not tool_call_ids:
+        _ = state, step_id
+        if not self.execution_store:
             return
-        try:
-            cards = await self.cardbox.get_cards_by_tool_call_ids(
-                project_id=item.project_id,
-                tool_call_ids=tool_call_ids,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Suspend reconcile: failed loading tool_result cards turn=%s: %s",
-                item.agent_turn_id,
-                exc,
-            )
-            return
-        by_call: Dict[str, Any] = {}
-        for card in cards or []:
-            if getattr(card, "type", None) != "tool.result":
-                continue
-            tool_call_id = safe_str(getattr(card, "tool_call_id", None))
-            if not tool_call_id:
-                continue
-            current = by_call.get(tool_call_id)
-            if current is None or getattr(
-                card, "created_at", datetime.max.replace(tzinfo=UTC)
-            ) < getattr(current, "created_at", datetime.max.replace(tzinfo=UTC)):
-                by_call[tool_call_id] = card
-
         for wait_item in wait_items:
             tool_call_id = safe_str(wait_item.get("tool_call_id"))
             if not tool_call_id:
                 continue
-            card = by_call.get(tool_call_id)
-            if card is None:
-                continue
-            card_id = safe_str(getattr(card, "card_id", None))
-            if not card_id:
-                continue
-            if (tool_call_id, card_id) in claimed_pairs:
-                continue
-            try:
-                payload = extract_tool_result_payload(card)
-            except Exception:
-                payload = {}
-            status = payload.get("status")
-            if status not in TOOL_RESULT_STATUS_SET:
-                status = STATUS_FAILED
-            after_execution = payload.get("after_execution")
-            if after_execution not in ("suspend", "terminate"):
-                after_execution = "suspend"
-            await self.state_store.record_turn_resume_ledger(
-                project_id=item.project_id,
-                agent_id=item.agent_id,
-                agent_turn_id=item.agent_turn_id,
-                turn_epoch=int(state.turn_epoch),
-                tool_call_id=tool_call_id,
-                tool_result_card_id=card_id,
-                payload={
-                    "tool_call_id": tool_call_id,
-                    "status": status,
-                    "after_execution": after_execution,
-                    "tool_result_card_id": card_id,
-                    "step_id": step_id,
-                },
+            rows = await self.execution_store.claim_pending_inbox_by_correlation(
+                ctx=item.ctx,
+                correlation_id=tool_call_id,
+                limit=20,
             )
-            await self.queue.put(
-                AgentTurnWorkItem(
-                    project_id=item.project_id,
-                    channel_id=item.channel_id,
-                    agent_turn_id=item.agent_turn_id,
-                    agent_id=item.agent_id,
-                    profile_box_id=safe_str(state.profile_box_id),
-                    context_box_id=safe_str(state.context_box_id),
-                    output_box_id=safe_str(state.output_box_id),
-                    turn_epoch=state.turn_epoch,
-                    headers=dict(item.headers),
-                    parent_step_id=item.parent_step_id,
-                    trace_id=item.trace_id,
-                    step_count=item.step_count,
-                    resume_data={
-                        "tool_call_id": tool_call_id,
-                        "status": status,
-                        "after_execution": after_execution,
-                        "tool_result_card_id": card_id,
-                        "step_id": step_id,
-                    },
-                    is_continuation=True,
-                    inbox_id=None,
-                    guard_inbox_id=item.guard_inbox_id or item.inbox_id,
-                    enqueued_at=utc_now() if self.timing_capture else None,
+            if not rows:
+                continue
+            for row in rows:
+                inbox_id = safe_str(row.get("inbox_id"))
+                message_type = safe_str(row.get("message_type"))
+                payload = row.get("payload") or {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                if message_type not in ("tool_result", "timeout"):
+                    await self.execution_store.update_inbox_status(
+                        inbox_id=inbox_id,
+                        project_id=item.ctx.project_id,
+                        status="error",
+                        expected_status="processing",
+                    )
+                    continue
+                try:
+                    ingress_ctx, safe_payload = build_replay_context(
+                        raw_payload=payload,
+                        db_row=row,
+                    )
+                except ProtocolViolationError as exc:
+                    logger.warning(
+                        "Suspend reconcile invalid inbox context id=%s: %s",
+                        inbox_id,
+                        exc,
+                    )
+                    await self.execution_store.update_inbox_status(
+                        inbox_id=inbox_id,
+                        project_id=item.ctx.project_id,
+                        status="error",
+                        expected_status="processing",
+                    )
+                    continue
+                await self.queue.put(
+                    AgentTurnWorkItem(
+                        ctx=ingress_ctx,
+                        profile_box_id=None,
+                        context_box_id=None,
+                        output_box_id=None,
+                        step_count=item.step_count,
+                        resume_data=safe_payload,
+                        is_continuation=True,
+                        inbox_id=inbox_id,
+                        guard_inbox_id=item.guard_inbox_id or item.inbox_id,
+                        enqueued_at=utc_now() if self.timing_capture else None,
+                        inbox_created_at=row.get("created_at"),
+                        inbox_processed_at=row.get("processed_at"),
+                    )
                 )
-            )
 
     async def _fail_inbox_guard_wait(
         self,
@@ -575,27 +435,33 @@ class ReactStepProcessor:
         reason: str,
         error_code: str = "inbox_guard_wait_exceeded",
     ) -> None:
-        state = await self.state_store.fetch(item.project_id, item.agent_id)
+        state = await self.state_store.fetch(item.ctx)
         if not state:
-            logger.warning("Inbox guard wait fail skipped: missing state agent=%s", item.agent_id)
+            logger.warning("Inbox guard wait fail skipped: missing state agent=%s", item.ctx.agent_id)
             return
-        guard = TurnGuard(agent_turn_id=item.agent_turn_id, turn_epoch=item.turn_epoch)
-        if not guard.matches(state):
+        if not item.ctx.matches_state(state):
             logger.warning(
                 "Inbox guard wait fail skipped: guard mismatch (%s).",
-                guard.mismatch_detail(state),
+                item.ctx.state_mismatch_detail(state),
             )
             return
 
         if getattr(state, "parent_step_id", None):
-            item.parent_step_id = safe_str(state.parent_step_id)
+            item.ctx = item.ctx.with_restored_state(parent_step_id=safe_str(state.parent_step_id))
         state_trace_id = getattr(state, "trace_id", None)
         if state_trace_id:
-            item.trace_id = safe_str(state_trace_id)
-        if item.output_box_id is None and state.active_agent_turn_id == item.agent_turn_id:
+            try:
+                candidate_trace_id = safe_str(state_trace_id)
+                item.ctx = item.ctx.with_trace_transport(
+                    base_headers=item.ctx.headers,
+                    trace_id=candidate_trace_id,
+                )
+            except ProtocolViolationError as exc:
+                logger.warning("Inbox guard wait fail: invalid trace_id: %s", exc)
+        if item.output_box_id is None and state.active_agent_turn_id == item.ctx.agent_turn_id:
             item.output_box_id = state.output_box_id
         item.output_box_id = await self.cardbox.ensure_box_id(
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
             box_id=item.output_box_id,
         )
 
@@ -719,14 +585,12 @@ class ReactStepProcessor:
         "agent.tool.execute",
         record_exception=True,
         set_status_on_exception=True,
-        attributes_getter=_tool_span_attrs,
     )
     async def _execute_tool_parallel(
         self,
         *,
         tool_call: Dict[str, Any],
         item: AgentTurnWorkItem,
-        state_epoch: int,
         step_id: str,
     ) -> ActionOutcome:
         fn = (tool_call.get("function") or {}).get("name") or "unknown"
@@ -736,11 +600,10 @@ class ReactStepProcessor:
             tool_call_id = f"tc_{uuid6.uuid7().hex}"
             tool_call["id"] = tool_call_id
 
-        dispatch_ctx = item.to_cg_context(step_id=step_id)
+        dispatch_ctx = item.ctx.with_new_step(step_id)
         return await self.action_handler.execute(
             tool_call=tool_call,
             ctx=dispatch_ctx,
-            turn_epoch=state_epoch,
             context_box_id=item.context_box_id,
             inbox_id=item.inbox_id,
             guard_inbox_id=item.guard_inbox_id,
@@ -751,7 +614,6 @@ class ReactStepProcessor:
         "agent.llm.chat",
         record_exception=True,
         set_status_on_exception=True,
-        attributes_getter=_llm_span_attrs,
     )
     async def _chat_llm(
         self,
@@ -762,6 +624,7 @@ class ReactStepProcessor:
         request: LLMRequest,
         on_chunk: Any,
     ) -> Dict[str, Any]:
+        _ = profile
         logger.info("Sending request to LLM...")
         if self.timing_step_event and item.timing:
             await emit_step_event_helper(
@@ -792,18 +655,18 @@ class ReactStepProcessor:
         profile_box_id = await resolve_box_id(
             cardbox=self.cardbox,
             box_id=profile_box_id,
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
         )
         context_box_id = item.context_box_id or state.context_box_id
         context_box_id = await resolve_box_id(
             cardbox=self.cardbox,
             box_id=context_box_id,
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
         )
 
         box_id = item.output_box_id or safe_str(state.output_box_id)
         item.output_box_id = await self.cardbox.ensure_box_id(
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
             box_id=box_id,
         )
 
@@ -853,19 +716,26 @@ class ReactStepProcessor:
     def _build_stream_start_metadata(self, item: AgentTurnWorkItem, profile: "ProfileData") -> Dict[str, Any]:
         return build_stream_start_metadata(item=item, profile=profile)
 
+    @staticmethod
+    def _require_step_id(ctx: StepRuntime, *, op: str) -> str:
+        cg_ctx = ctx.item.ctx
+        step_id = safe_str(cg_ctx.step_id)
+        if not step_id:
+            raise RuntimeError(f"item.ctx.step_id must be set before {op}")
+        return step_id
+
     async def _fetch_state_guarded(self, item: AgentTurnWorkItem) -> Optional[Any]:
-        state = await self.state_store.fetch(item.project_id, item.agent_id)
+        state = await self.state_store.fetch(item.ctx)
         if not state:
-            logger.warning("No state for %s, drop", item.agent_id)
+            logger.warning("No state for %s, drop", item.ctx.agent_id)
             return None
-        if item.turn_epoch is None:
-            logger.warning("Reject turn (missing epoch): cmd(turn=%s)", item.agent_turn_id)
+        if item.ctx.turn_epoch is None:
+            logger.warning("Reject turn (missing epoch): cmd(turn=%s)", item.ctx.agent_turn_id)
             return None
-        guard = TurnGuard(agent_turn_id=item.agent_turn_id, turn_epoch=item.turn_epoch)
-        if not guard.matches(state):
+        if not item.ctx.matches_state(state):
             logger.warning(
                 "Reject turn (id/epoch mismatch): %s",
-                guard.mismatch_detail(state),
+                item.ctx.state_mismatch_detail(state),
             )
             return None
 
@@ -874,8 +744,8 @@ class ReactStepProcessor:
                 logger.warning(
                     "Reject continuation (status=%s) turn=%s epoch=%s",
                     state.status,
-                    item.agent_turn_id,
-                    item.turn_epoch,
+                    item.ctx.agent_turn_id,
+                    item.ctx.turn_epoch,
                 )
                 return None
         else:
@@ -883,24 +753,15 @@ class ReactStepProcessor:
                 logger.warning(
                     "Reject first-turn (status=%s) turn=%s epoch=%s",
                     state.status,
-                    item.agent_turn_id,
-                    item.turn_epoch,
+                    item.ctx.agent_turn_id,
+                    item.ctx.turn_epoch,
                 )
                 return None
         return state
 
-    async def _guard_depth_and_steps(self, ctx: TurnContext) -> bool:
-        try:
-            depth = require_recursion_depth(ctx.item.headers)
-        except ProtocolViolationError as exc:
-            await self._guard_fail_turn(
-                ctx.item,
-                state=ctx.state,
-                reason=str(exc),
-                error_code="protocol_violation",
-                new_card_ids=ctx.new_card_ids,
-            )
-            return False
+    async def _guard_depth_and_steps(self, ctx: StepRuntime) -> bool:
+        cg_ctx = ctx.item.ctx
+        depth = int(cg_ctx.recursion_depth)
         if depth >= self.max_recursion_depth:
             await self._guard_fail_turn(
                 ctx.item,
@@ -922,104 +783,104 @@ class ReactStepProcessor:
             )
             return False
 
-        ctx.depth = depth
         return True
 
-    async def _start_step_and_enter_running(self, ctx: TurnContext) -> bool:
+    async def _start_step_and_enter_running(self, ctx: StepRuntime) -> bool:
         step_id = f"step_{uuid6.uuid7().hex}"
-        ctx.step_id = step_id
+        item = ctx.item
+        item.ctx = item.ctx.with_new_step(step_id)
+        cg_ctx = item.ctx
         if self.timing_capture:
-            ctx.item.timing = dict(ctx.item.timing or {})
-            ctx.item.timing.pop("llm", None)
-            ctx.item.timing["step_id"] = step_id
-            ctx.item.timing["step_started_at"] = to_iso(utc_now())
+            item.timing = dict(item.timing or {})
+            item.timing.pop("llm", None)
+            item.timing["step_id"] = step_id
+            item.timing["step_started_at"] = to_iso(utc_now())
 
         # Capture profile/context box IDs (state as authority when missing)
-        profile_box_id = ctx.item.profile_box_id or ctx.state.profile_box_id
+        profile_box_id = item.profile_box_id or ctx.state.profile_box_id
         profile_box_id = await resolve_box_id(
             cardbox=self.cardbox,
             box_id=profile_box_id,
-            project_id=ctx.item.project_id,
+            project_id=cg_ctx.project_id,
         )
-        context_box_id = ctx.item.context_box_id or ctx.state.context_box_id
+        context_box_id = item.context_box_id or ctx.state.context_box_id
         context_box_id = await resolve_box_id(
             cardbox=self.cardbox,
             box_id=context_box_id,
-            project_id=ctx.item.project_id,
+            project_id=cg_ctx.project_id,
         )
 
         # Ensure output box exists
-        if ctx.item.output_box_id is None and ctx.state.active_agent_turn_id == ctx.item.agent_turn_id:
-            ctx.item.output_box_id = ctx.state.output_box_id
+        if item.output_box_id is None and ctx.state.active_agent_turn_id == cg_ctx.agent_turn_id:
+            item.output_box_id = ctx.state.output_box_id
 
-        ctx.item.output_box_id = await self.cardbox.ensure_box_id(
-            project_id=ctx.item.project_id,
-            box_id=ctx.item.output_box_id,
+        item.output_box_id = await self.cardbox.ensure_box_id(
+            project_id=cg_ctx.project_id,
+            box_id=item.output_box_id,
         )
 
         await self.step_recorder.start_step(
-            item=ctx.item,
+            item=item,
             step_id=step_id,
             status="started",
             profile_box_id=profile_box_id,
             context_box_id=context_box_id,
-            output_box_id=ctx.item.output_box_id,
+            output_box_id=item.output_box_id,
         )
 
+        running_ctx = cg_ctx
         updated = await self.state_store.update(
-            project_id=ctx.item.project_id,
-            agent_id=ctx.item.agent_id,
-            expect_turn_epoch=ctx.state.turn_epoch,
-            expect_agent_turn_id=ctx.item.agent_turn_id,
+            ctx=running_ctx,
             new_status="running",
-            active_recursion_depth=int(ctx.depth or 0),
-            context_box_id=ctx.item.context_box_id,
-            output_box_id=ctx.item.output_box_id,
+            active_recursion_depth=int(cg_ctx.recursion_depth),
+            context_box_id=item.context_box_id,
+            output_box_id=item.output_box_id,
         )
         if not updated:
-            fresh_state = await self.state_store.fetch(ctx.item.project_id, ctx.item.agent_id)
+            fresh_state = await self.state_store.fetch(cg_ctx)
             if not (
                 fresh_state
                 and fresh_state.status == "running"
-                and fresh_state.active_agent_turn_id == ctx.item.agent_turn_id
-                and fresh_state.turn_epoch == ctx.item.turn_epoch
+                and fresh_state.active_agent_turn_id == cg_ctx.agent_turn_id
+                and fresh_state.turn_epoch == cg_ctx.turn_epoch
             ):
                 logger.warning("CAS failed when entering running")
                 return False
         await self._emit_state_event(
-            ctx.item,
+            item,
             status="running",
-            output_box_id=ctx.item.output_box_id,
+            output_box_id=item.output_box_id,
             metadata={"activity": "thinking"},
         )
         return True
 
-    async def _load_profile_or_fail(self, ctx: TurnContext) -> bool:
-        if not ctx.step_id:
-            raise RuntimeError("ctx.step_id must be set before loading profile")
+    async def _load_profile_or_fail(self, ctx: StepRuntime) -> bool:
+        step_id = self._require_step_id(ctx, op="loading profile")
+        cg_ctx = ctx.item.ctx
         profile = await self.resource_loader.load_profile(
-            ctx.item.project_id, ctx.item.agent_id, ctx.item.profile_box_id
+            cg_ctx, ctx.item.profile_box_id
         )
         if not profile:
             await self._fail_turn(
-                ctx.item, str(ctx.step_id), "profile_not_found", new_card_ids=ctx.new_card_ids
+                ctx.item, step_id, "profile_not_found", new_card_ids=ctx.new_card_ids
             )
             return False
         logger.info("Loaded profile box=%s cards_ok=True", ctx.item.profile_box_id)
         ctx.profile = profile
         return True
 
-    async def _load_context_card_ids(self, item: AgentTurnWorkItem) -> List[str]:
+    async def _load_context_card_ids(self, ctx: StepRuntime) -> List[str]:
+        item = ctx.item
         context_ids: List[str] = []
         if item.context_box_id:
-            ctx_box = await self.cardbox.get_box(item.context_box_id, project_id=item.project_id)
+            ctx_box = await self.cardbox.get_box(item.context_box_id, project_id=item.ctx.project_id)
             if ctx_box:
                 context_ids = list(ctx_box.card_ids or [])
                 logger.info("Loaded %d cards from context_box=%s", len(context_ids), item.context_box_id)
 
         if item.output_box_id and item.output_box_id != item.context_box_id:
             logger.info("Loading additional context from output_box=%s", item.output_box_id)
-            out_box = await self.cardbox.get_box(item.output_box_id, project_id=item.project_id)
+            out_box = await self.cardbox.get_box(item.output_box_id, project_id=item.ctx.project_id)
             if out_box and out_box.card_ids:
                 existing = set(context_ids)
                 added_count = 0
@@ -1048,20 +909,19 @@ class ReactStepProcessor:
             logger=logger,
         )
 
-    async def _prepare_llm_request(self, ctx: TurnContext, *, context_card_ids: List[str]) -> bool:
-        if not ctx.step_id:
-            raise RuntimeError("ctx.step_id must be set before preparing LLM request")
+    async def _prepare_llm_request(self, ctx: StepRuntime, *, context_card_ids: List[str]) -> bool:
+        step_id = self._require_step_id(ctx, op="preparing LLM request")
         if ctx.profile is None:
             raise RuntimeError("ctx.profile must be set before preparing LLM request")
         item = ctx.item
-        step_id = str(ctx.step_id)
+        cg_ctx = item.ctx
         profile = ctx.profile
-        tool_defs = await self.resource_store.fetch_tools_for_project_model(item.project_id)
+        tool_defs = await self.resource_store.fetch_tools_for_project_model(cg_ctx.project_id)
         tool_defs = filter_allowed_tools(
             tool_defs,
             allowed_tools=profile.allowed_tools,
-            project_id=item.project_id,
-            agent_id=item.agent_id,
+            project_id=cg_ctx.project_id,
+            agent_id=cg_ctx.agent_id,
         )
         tool_suspend_timeouts: Dict[str, float] = {}
         for tool_def in tool_defs:
@@ -1096,9 +956,9 @@ class ReactStepProcessor:
         if should_add_submit_result:
             if item.context_box_id:
                 try:
-                    ctx_box = await self.cardbox.get_box(item.context_box_id, project_id=item.project_id)
+                    ctx_box = await self.cardbox.get_box(item.context_box_id, project_id=item.ctx.project_id)
                     if ctx_box and ctx_box.card_ids:
-                        ctx_cards = await self.cardbox.get_cards(list(ctx_box.card_ids), project_id=item.project_id)
+                        ctx_cards = await self.cardbox.get_cards(list(ctx_box.card_ids), project_id=cg_ctx.project_id)
                         for c in reversed(ctx_cards):
                             if getattr(c, "type", "") == "task.result_fields":
                                 try:
@@ -1119,14 +979,14 @@ class ReactStepProcessor:
 
         # Assemble Request Box (formerly virtual_box)
         # ContextAssembler stitches Profile + Context + Tools into a single snapshot.
-        skills_text = await self._build_available_skills_text(item.project_id)
-        uploaded_files_text = await self._build_uploaded_files_text(item.project_id, context_card_ids)
+        skills_text = await self._build_available_skills_text(cg_ctx.project_id)
+        uploaded_files_text = await self._build_uploaded_files_text(cg_ctx.project_id, context_card_ids)
         system_append_parts = [part for part in (skills_text, uploaded_files_text) if part]
         system_append = "\n\n".join(system_append_parts) if system_append_parts else ""
         request_box = await self.assembler.assemble(
             cardbox=self.cardbox,
             profile=profile,
-            project_id=item.project_id,
+            project_id=cg_ctx.project_id,
             context_card_ids=context_card_ids,
             tool_specs=tool_specs,
             system_append=system_append,
@@ -1137,7 +997,7 @@ class ReactStepProcessor:
         if request_box.card_ids:
             try:
                 req_cards = await self.cardbox.get_cards(
-                    list(request_box.card_ids), project_id=item.project_id
+                    list(request_box.card_ids), project_id=cg_ctx.project_id
                 )
                 for c in req_cards:
                     if getattr(c, "type", "") != "tool.result":
@@ -1200,15 +1060,15 @@ class ReactStepProcessor:
             return api_request
 
         ctx_engine = ContextEngine(
-            trace_id=item.trace_id or item.agent_turn_id,
-            tenant_id=item.project_id,
+            trace_id=cg_ctx.trace_id or cg_ctx.agent_turn_id,
+            tenant_id=cg_ctx.project_id,
             storage_adapter=self.cardbox.adapter,
         )
         api_req, _ = await ctx_engine.to_api(request_box, modifier=_tool_result_modifier)
 
         request_box_id = await self.cardbox.save_box(
             list(request_box.card_ids),
-            project_id=item.project_id,
+            project_id=cg_ctx.project_id,
         )
         await self.step_recorder.set_step_status(
             item=item,
@@ -1238,23 +1098,17 @@ class ReactStepProcessor:
     async def _call_llm_or_fail(
         self,
         *,
-        ctx: TurnContext,
+        ctx: StepRuntime,
     ) -> bool:
-        if not ctx.step_id:
-            raise RuntimeError("ctx.step_id must be set before calling LLM")
+        step_id = self._require_step_id(ctx, op="calling LLM")
         if ctx.profile is None:
             raise RuntimeError("ctx.profile must be set before calling LLM")
         item = ctx.item
-        step_id = str(ctx.step_id)
         profile = ctx.profile
         messages = ctx.llm_messages
         tools = ctx.llm_tools
 
-        stream_subject = build_stream_subject(
-            project_id=item.project_id,
-            channel_id=item.channel_id,
-            agent_id=item.agent_id,
-        )
+        stream_subject = build_stream_subject(ctx=item.ctx)
 
         async def _publish_stream(payload) -> None:
             await publish_stream_payload(
@@ -1278,7 +1132,7 @@ class ReactStepProcessor:
             if self.timing_stream_metadata:
                 start_meta["llm_request_started_at"] = to_iso(llm_started_at)
             start_payload = build_stream_start_payload(
-                agent_turn_id=item.agent_turn_id,
+                agent_turn_id=item.ctx.agent_turn_id,
                 step_id=step_id,
                 metadata=start_meta,
             )
@@ -1292,7 +1146,7 @@ class ReactStepProcessor:
                     llm_timing["first_token_at"] = to_iso(utc_now())
                     llm_timing["first_token_ms"] = monotonic_ms(llm_start_ts, llm_first_token_ts)
             payload = build_stream_content_payload(
-                agent_turn_id=item.agent_turn_id,
+                agent_turn_id=item.ctx.agent_turn_id,
                 step_id=step_id,
                 content=text,
             )
@@ -1343,7 +1197,7 @@ class ReactStepProcessor:
                 step_metadata["llm_response_cost"] = response_cost
         if profile.llm_config.stream:
             end_payload = build_stream_end_payload(
-                agent_turn_id=item.agent_turn_id,
+                agent_turn_id=item.ctx.agent_turn_id,
                 step_id=step_id,
                 usage=resp.get("usage") if isinstance(resp, dict) else None,
                 response_cost=resp.get("response_cost") if isinstance(resp, dict) else None,
@@ -1366,14 +1220,12 @@ class ReactStepProcessor:
         return True
 
     async def _persist_thought_card(
-        self, ctx: TurnContext
+        self, ctx: StepRuntime
     ) -> List[Dict[str, Any]]:
-        if not ctx.step_id:
-            raise RuntimeError("ctx.step_id must be set before persisting thought card")
+        step_id = self._require_step_id(ctx, op="persisting thought card")
         if ctx.resp is None:
             raise RuntimeError("ctx.resp must be set before persisting thought card")
         item = ctx.item
-        step_id = str(ctx.step_id)
         resp = ctx.resp
         tool_calls = normalize_tool_calls(resp.get("tool_calls") or [])
         if tool_calls:
@@ -1403,11 +1255,11 @@ class ReactStepProcessor:
 
         thought_card = Card(
             card_id=uuid6.uuid7().hex,
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
             type="agent.thought",
             content=TextContent(text=resp.get("content", "") or ""),
             created_at=datetime.now(UTC),
-            author_id=item.agent_id,
+            author_id=item.ctx.agent_id,
             metadata=self._card_metadata(item, step_id=step_id, role="assistant", extra=extra_metadata),
             tool_calls=resp.get("tool_calls"),
         )
@@ -1417,20 +1269,18 @@ class ReactStepProcessor:
         item.output_box_id = await self.cardbox.append_to_box(
             item.output_box_id,
             [thought_card.card_id],
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
         )
         return tool_calls
 
     async def _handle_tool_calls(
-        self, ctx: TurnContext, tool_calls: List[Dict[str, Any]]
+        self, ctx: StepRuntime, tool_calls: List[Dict[str, Any]]
     ) -> None:
-        if not ctx.step_id:
-            raise RuntimeError("ctx.step_id must be set before handling tool calls")
+        step_id = self._require_step_id(ctx, op="handling tool calls")
         if ctx.thought_card_id is None:
             raise RuntimeError("ctx.thought_card_id must be set before handling tool calls")
         item = ctx.item
         state = ctx.state
-        step_id = str(ctx.step_id)
         tool_suspend_timeouts = ctx.tool_suspend_timeouts
         new_card_ids = ctx.new_card_ids
         start_ts = ctx.start_ts
@@ -1441,15 +1291,13 @@ class ReactStepProcessor:
             tool_call_id = tc.get("id") or f"tc_{uuid6.uuid7().hex}"
             error_card = await save_failed_tool_result_card(
                 cardbox=self.cardbox,
-                ctx=item.to_cg_context(step_id=step_id),
-                turn_epoch=state.turn_epoch,
-                tool_call_id=str(tool_call_id),
+                ctx=item.ctx.with_new_step(step_id).with_tool_call(str(tool_call_id)),
                 function_name="submit_result",
                 error="submit_result must be called alone (this turn may only include submit_result).",
             )
             new_card_ids.append(error_card.card_id)
             item.output_box_id = await self.cardbox.append_to_box(
-                item.output_box_id, [error_card.card_id], project_id=item.project_id
+                item.output_box_id, [error_card.card_id], project_id=item.ctx.project_id
             )
             if item.step_count + 1 < self.max_steps:
                 await self.step_recorder.complete_step(
@@ -1468,24 +1316,21 @@ class ReactStepProcessor:
         if non_submit_calls:
             current_tool = (non_submit_calls[0].get("function") or {}).get("name") or "unknown"
             marked = await self.state_store.update(
-                project_id=item.project_id,
-                agent_id=item.agent_id,
-                expect_turn_epoch=state.turn_epoch,
-                expect_agent_turn_id=item.agent_turn_id,
+                ctx=item.ctx,
                 new_status="running",
             )
             if not marked:
-                fresh_state = await self.state_store.fetch(item.project_id, item.agent_id)
+                fresh_state = await self.state_store.fetch(item.ctx)
                 if not (
                     fresh_state
-                    and fresh_state.active_agent_turn_id == item.agent_turn_id
-                    and fresh_state.turn_epoch == item.turn_epoch
+                    and fresh_state.active_agent_turn_id == item.ctx.agent_turn_id
+                    and fresh_state.turn_epoch == item.ctx.turn_epoch
                     and fresh_state.status == "running"
                 ):
                     logger.warning(
                         "CAS failed when pre-marking running turn=%s epoch=%s; stop side effects",
-                        item.agent_turn_id,
-                        item.turn_epoch,
+                        item.ctx.agent_turn_id,
+                        item.ctx.turn_epoch,
                     )
                     return
             await self._emit_state_event(
@@ -1514,7 +1359,6 @@ class ReactStepProcessor:
                     self._execute_tool_parallel(
                         tool_call=tc,
                         item=item,
-                        state_epoch=state.turn_epoch,
                         step_id=step_id,
                     )
                     for _, tc in indexed_calls
@@ -1527,8 +1371,7 @@ class ReactStepProcessor:
         outcomes = outcomes_by_index
         ordered_outcomes, error_count = await normalize_action_outcomes(
             cardbox=self.cardbox,
-            ctx=item.to_cg_context(step_id=step_id),
-            turn_epoch=state.turn_epoch,
+            ctx=item.ctx.with_new_step(step_id),
             tool_calls=tool_calls,
             outcomes=outcomes,
             logger=logger,
@@ -1565,7 +1408,7 @@ class ReactStepProcessor:
                 item.output_box_id = await self.cardbox.append_to_box(
                     item.output_box_id,
                     card_ids,
-                    project_id=item.project_id,
+                    project_id=item.ctx.project_id,
                 )
                 deliverable_ids.extend([c.card_id for c in outcome.cards if c.type == "task.deliverable"])
                 for card in outcome.cards:
@@ -1629,10 +1472,7 @@ class ReactStepProcessor:
             async with state_store_transaction(self.state_store) as tx:
                 updated = await call_with_optional_conn(
                     self.state_store.update,
-                    project_id=item.project_id,
-                    agent_id=item.agent_id,
-                    expect_turn_epoch=state.turn_epoch,
-                    expect_agent_turn_id=item.agent_turn_id,
+                    ctx=item.ctx,
                     expect_status="running",
                     new_status="suspended",
                     expecting_correlation_id=None,
@@ -1642,10 +1482,7 @@ class ReactStepProcessor:
                 )
                 if updated:
                     await self.state_store.replace_turn_waiting_tools(
-                        project_id=item.project_id,
-                        agent_id=item.agent_id,
-                        agent_turn_id=item.agent_turn_id,
-                        turn_epoch=state.turn_epoch,
+                        ctx=item.ctx,
                         wait_items=dedup_wait_items,
                         conn=tx.conn,
                     )
@@ -1664,8 +1501,8 @@ class ReactStepProcessor:
             else:
                 logger.warning(
                     "CAS failed when marking suspended turn=%s epoch=%s; stop side effects",
-                    item.agent_turn_id,
-                    item.turn_epoch,
+                    item.ctx.agent_turn_id,
+                    item.ctx.turn_epoch,
                 )
                 return
             await self.step_recorder.set_step_status(
@@ -1715,24 +1552,21 @@ class ReactStepProcessor:
             # remain running so the next ReAct step can proceed.
             if non_submit_calls:
                 reverted = await self.state_store.update(
-                    project_id=item.project_id,
-                    agent_id=item.agent_id,
-                    expect_turn_epoch=state.turn_epoch,
-                    expect_agent_turn_id=item.agent_turn_id,
+                    ctx=item.ctx,
                     new_status="running",
                 )
                 if not reverted:
-                    fresh_state = await self.state_store.fetch(item.project_id, item.agent_id)
+                    fresh_state = await self.state_store.fetch(item.ctx)
                     if not (
                         fresh_state
-                        and fresh_state.active_agent_turn_id == item.agent_turn_id
-                        and fresh_state.turn_epoch == item.turn_epoch
+                        and fresh_state.active_agent_turn_id == item.ctx.agent_turn_id
+                        and fresh_state.turn_epoch == item.ctx.turn_epoch
                         and fresh_state.status == "running"
                     ):
                         logger.warning(
                             "CAS failed when reverting to running turn=%s epoch=%s; stop side effects",
-                            item.agent_turn_id,
-                            item.turn_epoch,
+                            item.ctx.agent_turn_id,
+                            item.ctx.turn_epoch,
                         )
                         return
                 await self._emit_state_event(
@@ -1753,16 +1587,14 @@ class ReactStepProcessor:
             await self._fail_turn(item, step_id, "max_steps_reached", new_card_ids=new_card_ids)
 
     async def _handle_no_tool_calls(
-        self, ctx: TurnContext
+        self, ctx: StepRuntime
     ) -> None:
-        if not ctx.step_id:
-            raise RuntimeError("ctx.step_id must be set before handling no-tool path")
+        step_id = self._require_step_id(ctx, op="handling no-tool path")
         if ctx.profile is None:
             raise RuntimeError("ctx.profile must be set before handling no-tool path")
         if ctx.resp is None:
             raise RuntimeError("ctx.resp must be set before handling no-tool path")
         item = ctx.item
-        step_id = str(ctx.step_id)
         profile = ctx.profile
         resp = ctx.resp
         result_fields = ctx.result_fields
@@ -1775,11 +1607,11 @@ class ReactStepProcessor:
                 deliverable_text = "(no content)"
             deliverable_card = Card(
                 card_id=uuid6.uuid7().hex,
-                project_id=item.project_id,
+                project_id=item.ctx.project_id,
                 type="task.deliverable",
                 content=TextContent(text=deliverable_text),
                 created_at=datetime.now(UTC),
-                author_id=item.agent_id,
+                author_id=item.ctx.agent_id,
                 metadata=self._card_metadata(item, step_id=step_id, role="assistant"),
             )
             await self.cardbox.save_card(deliverable_card)
@@ -1787,7 +1619,7 @@ class ReactStepProcessor:
             item.output_box_id = await self.cardbox.append_to_box(
                 item.output_box_id,
                 [deliverable_card.card_id],
-                project_id=item.project_id,
+                project_id=item.ctx.project_id,
             )
             await self._complete_turn(
                 item,
@@ -1818,11 +1650,11 @@ class ReactStepProcessor:
             reminder_text += "\nRequired result fields:\n" + fields_desc
         reminder_card = Card(
             card_id=uuid6.uuid7().hex,
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
             type="sys.must_end_with_required",
             content=TextContent(text=reminder_text),
             created_at=datetime.now(UTC),
-            author_id=item.agent_id,
+            author_id=item.ctx.agent_id,
             metadata=self._card_metadata(item, step_id=step_id, role="system"),
         )
         await self.cardbox.save_card(reminder_card)
@@ -1830,7 +1662,7 @@ class ReactStepProcessor:
         item.output_box_id = await self.cardbox.append_to_box(
             item.output_box_id,
             [reminder_card.card_id],
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
         )
         await self.step_recorder.complete_step(
             item=item,
@@ -1858,16 +1690,18 @@ class ReactStepProcessor:
         start_ts = time.monotonic()
         logger.info(
             "Start processing turn=%s agent=%s turn=%s",
-            item.agent_turn_id,
-            item.agent_id,
+            item.ctx.agent_turn_id,
+            item.ctx.agent_id,
             item.step_count,
         )
 
         state = await self._fetch_state_guarded(item)
         if not state:
             return
+        aligned_turn_id = safe_str(getattr(state, "active_agent_turn_id", None)) or item.ctx.agent_turn_id
+        item.ctx = item.ctx.with_turn(aligned_turn_id, int(state.turn_epoch))
 
-        ctx = TurnContext(item=item, start_ts=start_ts, state=state)
+        ctx = StepRuntime(item=item, start_ts=start_ts, state=state)
 
         if not await self._guard_depth_and_steps(ctx):
             return
@@ -1878,7 +1712,7 @@ class ReactStepProcessor:
         if not await self._load_profile_or_fail(ctx):
             return
 
-        context_ids = await self._load_context_card_ids(item)
+        context_ids = await self._load_context_card_ids(ctx)
         ok = await self._prepare_llm_request(ctx, context_card_ids=context_ids)
         if not ok:
             return
@@ -1906,8 +1740,7 @@ class ReactStepProcessor:
     ) -> None:
         await emit_agent_state(
             nats=self.nats,
-            ctx=item.to_cg_context(),
-            turn_epoch=item.turn_epoch,
+            ctx=item.ctx,
             status=status,
             output_box_id=output_box_id or item.output_box_id,
             metadata=metadata,
@@ -1936,8 +1769,6 @@ class ReactStepProcessor:
                     step_id=step_id,
                     deliverable_card_id=deliverable_card_id,
                     conn=tx.conn,
-                    expect_turn_epoch=item.turn_epoch,
-                    expect_agent_turn_id=item.agent_turn_id,
                     new_card_ids=new_card_ids,
                     stats=stats,
                 )
@@ -1946,8 +1777,8 @@ class ReactStepProcessor:
         except _TurnCasMiss:
             logger.warning(
                 "Complete turn CAS failed (stale?) turn=%s epoch=%s; skip evt.task",
-                item.agent_turn_id,
-                item.turn_epoch,
+                item.ctx.agent_turn_id,
+                item.ctx.turn_epoch,
             )
             return
         except Exception as exc:  # noqa: BLE001
@@ -1983,8 +1814,6 @@ class ReactStepProcessor:
                     reason=error,
                     error_code=error_code,
                     conn=tx.conn,
-                    expect_turn_epoch=item.turn_epoch,
-                    expect_agent_turn_id=item.agent_turn_id,
                     deliverable_card_id=deliverable_card_id,
                     new_card_ids=new_card_ids,
                 )
@@ -1993,8 +1822,8 @@ class ReactStepProcessor:
         except _TurnCasMiss:
             logger.warning(
                 "Fail turn CAS failed (stale?) turn=%s epoch=%s; skip evt.task",
-                item.agent_turn_id,
-                item.turn_epoch,
+                item.ctx.agent_turn_id,
+                item.ctx.turn_epoch,
             )
             return
         except Exception as exc:  # noqa: BLE001

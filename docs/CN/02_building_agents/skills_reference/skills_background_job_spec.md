@@ -9,6 +9,7 @@
 - Task: one background command execution (`task_id`) managed by `skills.run_cmd_async`/`skills.run_service`.
 - Job: ordered multi-step workflow (`job_id`) managed by `skills.start_job`.
 - Watch: heartbeat/continuation helper for agent runtime; should be treated as observability, not a source of state transitions.
+- `session_id`：仅是调用者可见 alias。运行时会结合调用者身份派生内部 owner-scoped session key，因此同名 alias 不是跨 agent 共享 key。
 
 ## APIs
 

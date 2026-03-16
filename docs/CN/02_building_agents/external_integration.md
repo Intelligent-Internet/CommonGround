@@ -1,7 +1,7 @@
 # 外部集成与 I/O 边界（对齐当前实现）
 
 该页用于对接 CommonGround 外部系统（脚本/服务/工具）。以下约定以当前仓库代码为准：  
-- 协议版本默认 `v1r3` (`core/config_defaults.py`)  
+- 协议版本默认 `v1r4` (`core/config_defaults.py`)  
 - NATS/管理面均为 **可直接接入**，无额外网关层
 
 > 本页主要描述“如何接入”，不是“如何定义工具协议”，工具开发流程另见 `creating_tools.md`。
@@ -51,7 +51,7 @@ export PG_DSN="postgresql://postgres:postgres@postgres:5432/cardbox"
 
 默认配置见 `core/config_defaults.py`，关键字段：
 
-- `protocol.version`：默认 `v1r3`
+- `protocol.version`：默认 `v1r4`
 - `nats.servers`、`nats.tls_enabled`、`nats.cert_dir`
 - `cardbox.postgres_dsn`、`cardbox.tenant_id`、`cardbox.postgres_min_size`、`cardbox.postgres_max_size`
 - `api.listen_host`、`api.port`
@@ -103,17 +103,17 @@ cg.{ver}.{project_id}.{channel_id}.{category}.{component}.{target}.{suffix}
 - `cmd` / `evt`：JetStream，使用 `subscribe_cmd` + `publish_event`
   - `services/pmo/service.py`、`services/agent_worker/loop.py`、`services/ui_worker/loop.py`
 - `str`：Core NATS，使用 `subscribe_core` + `publish_core`
-  - 示例订阅：`cg.v1r3.{project}.{channel}.str.agent.{agent_id}.chunk`
+  - 示例订阅：`cg.v1r4.{project}.{channel}.str.agent.{agent_id}.chunk`
 
 当前 `NATSClient` 会自动创建默认 stream：
 
-- `cg_cmd_{v1r3}`
-- `cg_evt_{v1r3}`
+- `cg_cmd_{protocol_version}`（默认：`cg_cmd_v1r4`）
+- `cg_evt_{protocol_version}`（默认：`cg_evt_v1r4`）
 
 ### 订阅/发布建议（外部边界）
 
 - 外部 tool 服务：
-  - 订阅：`cg.{v1r3}.{project}.{channel}.cmd.tool.{target}.*`
+  - 订阅：`cg.{protocol_version}.{project}.{channel}.cmd.tool.{target}.*`（默认协议：`v1r4`）
   - 回执：通过 tool 回调写 `tool.result` card，并走 L0 report 流回到 `state.agent_inbox`
 - 外部 UI/事件消费方：
   - 订阅 `evt.agent.{agent_id}.task/step/state` 与 `str.agent.{agent_id}.chunk`

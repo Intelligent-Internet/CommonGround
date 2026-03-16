@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -32,9 +33,11 @@ from core.config import PROTOCOL_VERSION
 from core.app_config import load_app_config, config_to_dict
 from core.cg_context import CGContext
 from core.headers import ensure_recursion_depth
+from core.message_source import MessageSource
 from core.trace import ensure_trace_headers, trace_id_from_headers
 from core.utils import set_loop_policy
 from infra.cardbox_client import CardBoxClient
+from infra.l0_engine import L0Engine
 from infra.nats_client import NATSClient
 from infra.primitives import report as report_primitive
 from infra.stores import ExecutionStore, ResourceStore
@@ -49,7 +52,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Integration check for Report recursion_depth.")
     parser.add_argument("--project", default=os.environ.get("PROJECT_ID", "proj_report_depth_01"), help="Project ID")
     parser.add_argument("--channel", default="public", help="Channel ID (default: public)")
-    parser.add_argument("--agent-id", default="agent_integration", help="Agent ID")
+    parser.add_argument("--agent-id", default="sys.integration", help="Agent ID")
     parser.add_argument("--tool-name", default="integration_dummy", help="Tool name")
     parser.add_argument("--tool-target", default="integration_dummy", help="Tool subject target name")
     parser.add_argument("--tool-suffix", default="call", help="Tool subject suffix")
@@ -115,7 +118,7 @@ async def _fetch_inbox_depth(
     message_type: str,
 ) -> Optional[int]:
     sql = """
-        SELECT recursion_depth
+        SELECT context_headers
         FROM state.agent_inbox
         WHERE project_id=%s
           AND agent_id=%s
@@ -129,8 +132,21 @@ async def _fetch_inbox_depth(
         row = await res.fetchone()
         if not row:
             return None
-        depth = row.get("recursion_depth")
-        return int(depth) if depth is not None else None
+        headers = row.get("context_headers") or {}
+        if isinstance(headers, str):
+            try:
+                headers = json.loads(headers)
+            except Exception:  # noqa: BLE001
+                return None
+        if not isinstance(headers, dict):
+            return None
+        depth = headers.get("CG-Recursion-Depth")
+        if depth is None:
+            return None
+        try:
+            return int(depth)
+        except Exception:  # noqa: BLE001
+            return None
 
 
 async def _run_single_check(
@@ -162,11 +178,12 @@ async def _run_single_check(
             channel_id=channel_id,
             agent_id=agent_id,
             agent_turn_id=agent_turn_id,
+            turn_epoch=1,
             trace_id=trace_id_from_headers(headers),
+            recursion_depth=int(depth),
             headers=dict(headers or {}),
             step_id=step_id,
         ),
-        turn_epoch=1,
         context_box_id=None,
     )
 
@@ -182,29 +199,34 @@ async def _run_single_check(
     )
 
     payload = {
-        "tool_call_id": tool_call_id,
-        "agent_id": agent_id,
-        "agent_turn_id": agent_turn_id,
-        "turn_epoch": 1,
-        "step_id": step_id,
+        "status": "success",
+        "after_execution": "suspend",
         "tool_result_card_id": f"card_{uuid6.uuid7().hex}",
     }
     async with execution_store.pool.connection() as conn:
         async with conn.transaction():
             await report_primitive(
                 store=execution_store,
-                project_id=project_id,
-                channel_id=channel_id,
-                target_agent_id=agent_id,
+                ctx=CGContext(
+                    project_id=project_id,
+                    channel_id=channel_id,
+                    agent_id=agent_id,
+                    agent_turn_id=agent_turn_id,
+                    step_id=step_id,
+                    trace_id=trace_id_from_headers(headers),
+                    recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
+                    parent_agent_id="sys.integration",
+                    parent_step_id=step_id,
+                    headers=headers,
+                ),
+                source=MessageSource(
+                    agent_id="sys.integration",
+                    agent_turn_id=None,
+                    step_id=step_id,
+                ),
                 message_type=message_type,
                 payload=payload,
                 correlation_id=tool_call_id,
-                headers=headers,
-                traceparent=headers.get("traceparent"),
-                tracestate=headers.get("tracestate"),
-                trace_id=trace_id_from_headers(headers),
-                parent_step_id=step_id,
-                source_agent_id="sys.integration",
                 conn=conn,
             )
 
@@ -234,10 +256,13 @@ async def _run(args: argparse.Namespace) -> None:
     resource_store = ResourceStore(dsn)
     execution_store = ExecutionStore(dsn)
 
-    await nats.connect()
-    await cardbox.init()
-    await resource_store.open()
-    await execution_store.open()
+    try:
+        await asyncio.wait_for(nats.connect(), timeout=8.0)
+        await asyncio.wait_for(cardbox.init(), timeout=8.0)
+        await asyncio.wait_for(resource_store.open(), timeout=8.0)
+        await asyncio.wait_for(execution_store.open(), timeout=8.0)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"integration dependencies not ready for report_depth: {exc}")
 
     try:
         target_subject = (
@@ -251,11 +276,17 @@ async def _run(args: argparse.Namespace) -> None:
             target_subject=target_subject,
         )
 
+        l0_engine = L0Engine(
+            nats=nats,
+            execution_store=execution_store,
+            resource_store=resource_store,
+        )
         dispatcher = UTPDispatcher(
             cardbox,
             nats,
             resource_store,
             execution_store=execution_store,
+            l0_engine=l0_engine,
         )
 
         headers, _, _ = ensure_trace_headers({}, trace_id=str(uuid6.uuid7()))

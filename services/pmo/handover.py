@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from infra.cardbox_client import CardBoxClient
 from infra.stores import ResourceStore
+from core.cg_context import CGContext
 from core.utp_protocol import Card, FieldsSchemaContent, JsonContent, TextContent
 from core.errors import BadRequestError, NotFoundError
 from core.utils import safe_str
@@ -35,14 +36,15 @@ class HandoverPacker:
     async def pack_context(
         self,
         *,
-        project_id: str,
+        ctx: CGContext,
         tool_suffix: str,
-        source_agent_id: str,
         arguments: Dict[str, Any],
         handover: Optional[Dict[str, Any]],
         conn: Any = None,
     ) -> Tuple[str, str, List[str]]:
         """Create a context box and return (box_id, target_profile_box_id, card_ids)."""
+        project_id = ctx.project_id
+        source_agent_id = ctx.agent_id
         target_profile_ref: Optional[str] = None
         card_ids: List[str] = []
 
@@ -103,7 +105,16 @@ class HandoverPacker:
 
             inherit_cfg = (ctx_cfg.get("inherit_context") or {}) if isinstance(ctx_cfg, dict) else {}
             include_from_args = inherit_cfg.get("include_boxes_from_args") or []
+            authorized_inherit_box_ids = {
+                safe_str(box_id)
+                for box_id in (handover.get("authorized_inherit_box_ids") or [])
+                if safe_str(box_id)
+            }
             if isinstance(include_from_args, list) and include_from_args:
+                if not authorized_inherit_box_ids:
+                    raise BadRequestError(
+                        "inherit_context requires authorized_inherit_box_ids"
+                    )
                 existing = set(card_ids)
                 for arg_key in include_from_args:
                     if not isinstance(arg_key, str) or not arg_key:
@@ -124,6 +135,8 @@ class HandoverPacker:
                         )
 
                     for box_id in box_ids:
+                        if box_id not in authorized_inherit_box_ids:
+                            raise BadRequestError(f"inherit_context: unauthorized box_id: {box_id}")
                         box = await self.cardbox.get_box(box_id, project_id=project_id, conn=conn)
                         if not box:
                             raise NotFoundError(f"inherit_context: box not found: {box_id}")

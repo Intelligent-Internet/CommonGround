@@ -337,6 +337,107 @@ def traced(
     attributes_getter: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any] | None]] = None,
     **span_kwargs: Any,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def _auto_cg_attributes(arguments: Mapping[str, Any]) -> Dict[str, Any]:
+        attrs: Dict[str, Any] = {}
+        for key in (
+            "project_id",
+            "channel_id",
+            "agent_id",
+            "agent_turn_id",
+            "step_id",
+            "tool_call_id",
+            "batch_id",
+        ):
+            value = arguments.get(key)
+            if value is not None:
+                attrs[f"cg.{key}"] = value
+        subject = arguments.get("subject")
+        if subject:
+            attrs["cg.subject"] = str(subject)
+
+        parts = arguments.get("parts")
+        if parts is not None:
+            project_id = getattr(parts, "project_id", None)
+            channel_id = getattr(parts, "channel_id", None)
+            if project_id:
+                attrs["cg.project_id"] = str(project_id)
+            if channel_id:
+                attrs["cg.channel_id"] = str(channel_id)
+
+        ctx = arguments.get("ctx")
+        if ctx is None:
+            item = arguments.get("item")
+            if item is not None:
+                ctx = getattr(item, "ctx", None)
+        if ctx is None:
+            envelope = arguments.get("envelope")
+            if envelope is not None:
+                ctx = getattr(envelope, "ctx", None) or envelope
+
+        req = arguments.get("req")
+        if req is not None:
+            for key in (
+                "project_id",
+                "channel_id",
+                "source_agent_id",
+                "parent_agent_turn_id",
+                "parent_step_id",
+            ):
+                value = getattr(req, key, None)
+                if value is not None:
+                    attrs[f"cg.{key}"] = value
+            task_specs = getattr(req, "task_specs", None)
+            if task_specs is not None:
+                try:
+                    attrs["cg.task_count"] = int(len(task_specs))
+                except Exception:
+                    pass
+
+        if ctx is not None:
+            used_model_attrs = False
+            to_otel_attributes = getattr(ctx, "to_otel_attributes", None)
+            if callable(to_otel_attributes):
+                try:
+                    for k, v in dict(to_otel_attributes() or {}).items():
+                        if v is None:
+                            continue
+                        attrs[str(k)] = v
+                    used_model_attrs = True
+                except Exception:
+                    used_model_attrs = False
+
+            if not used_model_attrs:
+                to_sys_dict = getattr(ctx, "to_sys_dict", None)
+                if callable(to_sys_dict):
+                    try:
+                        for k, v in dict(to_sys_dict() or {}).items():
+                            if v is None:
+                                continue
+                            attrs[f"cg.{k}"] = v
+                        used_model_attrs = True
+                    except Exception:
+                        used_model_attrs = False
+
+            if not used_model_attrs:
+                for key in (
+                    "project_id",
+                    "channel_id",
+                    "agent_id",
+                    "agent_turn_id",
+                    "turn_epoch",
+                    "step_id",
+                    "tool_call_id",
+                    "trace_id",
+                    "recursion_depth",
+                    "parent_agent_id",
+                    "parent_agent_turn_id",
+                    "parent_step_id",
+                ):
+                    value = getattr(ctx, key, None)
+                    if value is not None:
+                        attrs[f"cg.{key}"] = value
+        return attrs
+
     def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         signature = inspect.signature(func)
         fixed_name = str(name).strip() if name is not None else ""
@@ -354,7 +455,11 @@ def traced(
                 raise ValueError("traced requires a non-empty span name")
             headers = arguments.get(headers_arg) if headers_arg else None
             context = arguments.get(context_arg) if context_arg else None
-            attributes = attributes_getter(arguments) if attributes_getter else None
+            auto_attributes = _auto_cg_attributes(arguments)
+            custom_attributes = attributes_getter(arguments) if attributes_getter else None
+            attributes: Dict[str, Any] = dict(auto_attributes)
+            if custom_attributes:
+                attributes.update(dict(custom_attributes))
             return resolved_name, headers, context, attributes
 
         if inspect.iscoroutinefunction(func):

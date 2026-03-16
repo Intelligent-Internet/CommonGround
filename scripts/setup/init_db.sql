@@ -195,29 +195,6 @@ ON state.turn_waiting_tools (project_id, agent_id, agent_turn_id, turn_epoch, wa
 CREATE INDEX IF NOT EXISTS idx_turn_waiting_tools_timeout
 ON state.turn_waiting_tools (project_id, agent_id, wait_status, updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS state.turn_resume_ledger (
-    project_id TEXT NOT NULL,
-    agent_id TEXT NOT NULL,
-    agent_turn_id TEXT NOT NULL,
-    turn_epoch BIGINT NOT NULL,
-    tool_call_id TEXT NOT NULL,
-    tool_result_card_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'applied', 'dropped')),
-    attempt_count INT NOT NULL DEFAULT 0,
-    next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    lease_owner TEXT,
-    lease_expires_at TIMESTAMPTZ,
-    last_error TEXT,
-    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (project_id, agent_id, agent_turn_id, turn_epoch, tool_call_id, tool_result_card_id)
-);
-CREATE INDEX IF NOT EXISTS idx_turn_resume_ledger_claim
-ON state.turn_resume_ledger (project_id, agent_id, agent_turn_id, turn_epoch, status, next_retry_at ASC, created_at ASC);
-CREATE INDEX IF NOT EXISTS idx_turn_resume_ledger_lease
-ON state.turn_resume_ledger (status, lease_expires_at ASC, updated_at DESC);
-
 -- 2b. Agent State Pointers (state.agent_state_pointers)
 -- Cross-turn pointers that should NOT be part of L0 CAS gating.
 -- - memory_context_box_id: agent-level default context pointer (fallback when caller omits context)
@@ -265,27 +242,49 @@ CREATE TABLE IF NOT EXISTS state.agent_inbox (
     inbox_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
     agent_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL DEFAULT 'public',
     message_type TEXT NOT NULL,
     enqueue_mode TEXT,
     correlation_id TEXT,
-    recursion_depth INT NOT NULL,
-    traceparent TEXT NOT NULL,
-    tracestate TEXT,
-    trace_id TEXT,
-    parent_step_id TEXT,
-    source_agent_id TEXT,
-    source_step_id TEXT,
+    agent_turn_id TEXT,
+    turn_epoch BIGINT NOT NULL DEFAULT 0,
+    context_headers JSONB NOT NULL DEFAULT '{}'::jsonb,
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     status TEXT NOT NULL DEFAULT 'pending',
+    retry_count INT NOT NULL DEFAULT 0,
+    next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_error TEXT,
+    defer_reason TEXT,
     processed_at TIMESTAMPTZ,
     archived_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE state.agent_inbox
+    ADD COLUMN IF NOT EXISTS channel_id TEXT NOT NULL DEFAULT 'public';
+ALTER TABLE state.agent_inbox
+    ADD COLUMN IF NOT EXISTS agent_turn_id TEXT;
+ALTER TABLE state.agent_inbox
+    ADD COLUMN IF NOT EXISTS turn_epoch BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE state.agent_inbox
+    ADD COLUMN IF NOT EXISTS context_headers JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE state.agent_inbox
+    ADD COLUMN IF NOT EXISTS retry_count INT NOT NULL DEFAULT 0;
+ALTER TABLE state.agent_inbox
+    ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE state.agent_inbox
+    ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE state.agent_inbox
+    ADD COLUMN IF NOT EXISTS defer_reason TEXT;
+ALTER TABLE state.agent_inbox
+    DROP COLUMN IF EXISTS nats_headers;
 CREATE INDEX IF NOT EXISTS idx_agent_inbox_agent_created
 ON state.agent_inbox(project_id, agent_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_inbox_pending
 ON state.agent_inbox(project_id, agent_id, created_at DESC)
 WHERE status='pending';
+CREATE INDEX IF NOT EXISTS idx_agent_inbox_due
+ON state.agent_inbox(project_id, agent_id, status, next_retry_at ASC, created_at ASC)
+WHERE status IN ('pending', 'deferred');
 CREATE INDEX IF NOT EXISTS idx_agent_inbox_queued_turn
 ON state.agent_inbox(project_id, agent_id, created_at ASC)
 WHERE status='queued' AND message_type='turn';
@@ -294,8 +293,6 @@ ON state.agent_inbox(created_at)
 WHERE status='pending';
 CREATE INDEX IF NOT EXISTS idx_agent_inbox_correlation
 ON state.agent_inbox USING hash (correlation_id);
-CREATE INDEX IF NOT EXISTS idx_agent_inbox_trace
-ON state.agent_inbox(project_id, trace_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_inbox_unique
 ON state.agent_inbox(project_id, message_type, md5(correlation_id));
 
@@ -312,7 +309,7 @@ CREATE TABLE IF NOT EXISTS state.execution_edges (
     target_agent_turn_id TEXT,
     correlation_id TEXT,
     enqueue_mode TEXT,
-    recursion_depth INT,
+    recursion_depth INT NOT NULL CHECK (recursion_depth >= 0),
     trace_id TEXT,
     parent_step_id TEXT,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,

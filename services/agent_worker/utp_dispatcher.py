@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from core.cg_context import CGContext
 from infra.cardbox_client import CardBoxClient
+from infra.l0_engine import CommandIntent, L0Engine
 from infra.nats_client import NATSClient
 from infra.stores import ExecutionStore, ResourceStore
 from core.utp_protocol import Card, ToolCallContent
@@ -22,7 +23,7 @@ from infra.observability.otel import get_tracer, mark_span_error, traced
 from .models import ActionOutcome
 from .builtin_tools import BUILTIN_AFTER_EXEC, try_execute_builtin_tool
 from .dispatcher_context import apply_tool_arg_options, parse_tool_args
-from .dispatcher_effects import create_error_outcome, record_tool_call_edge
+from .dispatcher_effects import create_error_outcome
 from .timing import monotonic_ms, to_iso, utc_now
 
 logger = logging.getLogger("UTPDispatcher")
@@ -40,43 +41,40 @@ class UTPDispatcher:
         resource_store: ResourceStore,
         *,
         execution_store: ExecutionStore | None = None,
+        l0_engine: L0Engine | None = None,
         timing_tool_dispatch: bool = False,
     ):
         self.cardbox = cardbox
         self.nats = nats
         self.resource_store = resource_store
         self.execution_store = execution_store
+        self.l0_engine = l0_engine
         self.timing_tool_dispatch = timing_tool_dispatch
 
     async def _check_inbox_guard(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         inbox_id: Optional[str],
         fn_name: str,
-        tool_call_meta: Dict[str, Any],
-        cmd_data: Dict[str, Any],
         tool_call_card: Optional[Card] = None,
     ) -> Optional[ActionOutcome]:
         if not self.execution_store:
             return None
         try:
             has_open_inbox = await self.execution_store.has_open_inbox(
-                project_id=project_id,
-                agent_id=agent_id,
+                ctx=ctx,
                 exclude_inbox_id=inbox_id,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Terminal tool inbox check failed: %s", exc)
-            result_context = ToolResultContext.from_cmd_data(
-                project_id=project_id,
-                cmd_data=cmd_data,
-                tool_call_meta=tool_call_meta,
+            result_context = ToolResultContext(
+                ctx=ctx,
+                cmd_data={"tool_name": fn_name, "after_execution": "suspend"},
             )
             _, error_card = ToolResultBuilder(
                 result_context,
-                author_id=agent_id,
+                author_id=ctx.agent_id,
                 function_name=fn_name,
                 error_source="worker",
             ).build(
@@ -93,14 +91,13 @@ class UTPDispatcher:
             return ActionOutcome(cards=cards, suspend=False, mark_complete=False)
 
         if has_open_inbox:
-            result_context = ToolResultContext.from_cmd_data(
-                project_id=project_id,
-                cmd_data=cmd_data,
-                tool_call_meta=tool_call_meta,
+            result_context = ToolResultContext(
+                ctx=ctx,
+                cmd_data={"tool_name": fn_name, "after_execution": "suspend"},
             )
             _, error_card = ToolResultBuilder(
                 result_context,
-                author_id=agent_id,
+                author_id=ctx.agent_id,
                 function_name=fn_name,
                 error_source="worker",
             ).build(
@@ -123,7 +120,6 @@ class UTPDispatcher:
         *,
         tool_call: Dict[str, Any],
         ctx: CGContext,
-        turn_epoch: int,
         context_box_id: Optional[str] = None,
         inbox_id: Optional[str] = None,
         guard_inbox_id: Optional[str] = None,
@@ -137,85 +133,41 @@ class UTPDispatcher:
         fn_name = (tool_call.get("function") or {}).get("name") or "unknown"
         tool_call_card: Optional[Card] = None
 
-        project_id = str(ctx.project_id or "")
-        channel_id = str(ctx.channel_id or "")
-        agent_id = str(ctx.agent_id or "")
-        agent_turn_id = str(ctx.agent_turn_id or "")
-        step_id = str(ctx.step_id or "")
-        headers = dict(ctx.headers or {})
-        trace_id = ctx.trace_id
-        parent_step_id = ctx.parent_step_id
-        if not project_id or not channel_id or not agent_id or not agent_turn_id or not step_id:
-            raise ValueError("UTPDispatcher.execute requires ctx with project/channel/agent/turn/step ids")
-
         span = _span
-        op_ctx = CGContext(
-            project_id=project_id,
-            channel_id=channel_id,
-            agent_id=agent_id,
-            agent_turn_id=agent_turn_id,
-            trace_id=trace_id,
-            headers=dict(headers or {}),
-            step_id=step_id,
-            parent_step_id=parent_step_id,
-        )
+        op_ctx = ctx
+        op_ctx = op_ctx.with_tool_call(str(tool_call_id))
+        _ = op_ctx.require_agent_turn_id
+        step_id = op_ctx.require_step_id
+        resolved_tool_call_id = op_ctx.require_tool_call_id
+        turn_epoch = int(op_ctx.turn_epoch)
         if span is not None:
-            span.set_attribute("cg.project_id", str(project_id))
-            span.set_attribute("cg.channel_id", str(channel_id))
-            span.set_attribute("cg.agent_id", str(agent_id))
-            span.set_attribute("cg.agent_turn_id", str(agent_turn_id))
-            span.set_attribute("cg.step_id", str(step_id))
-            span.set_attribute("cg.tool.name", str(fn_name))
-            span.set_attribute("cg.tool_call_id", str(tool_call_id))
+            span.set_attribute("cg.tool.name", fn_name)
+            span.set_attribute("cg.tool_call_id", resolved_tool_call_id)
 
             try:
                 args, parse_error = parse_tool_args(tool_call)
                 if parse_error:
                     tool_call_card = await self._save_tool_call_card(
-                        project_id=project_id,
-                        agent_id=agent_id,
-                        agent_turn_id=agent_turn_id,
-                        step_id=step_id,
-                        tool_call_id=tool_call_id,
+                        ctx=op_ctx,
                         fn_name=fn_name,
                         args=args,
                         target_subject=None,
-                        trace_id=trace_id,
-                        parent_step_id=parent_step_id,
                     )
                     return await create_error_outcome(
                         cardbox=self.cardbox,
                         ctx=op_ctx,
-                        tool_call_id=tool_call_id,
                         fn_name=fn_name,
                         exc=BadRequestError(parse_error),
-                        tool_call_meta=getattr(tool_call_card, "metadata", {}) or {},
                         tool_call_card=tool_call_card,
                     )
 
                 builtin_after_exec = BUILTIN_AFTER_EXEC.get(fn_name)
                 if builtin_after_exec == "terminate" and self.execution_store:
                     exclude_inbox_id = guard_inbox_id or inbox_id
-                    tool_call_meta = {
-                        "step_id": step_id,
-                        **({"trace_id": trace_id} if trace_id else {}),
-                        **({"parent_step_id": parent_step_id} if parent_step_id else {}),
-                    }
-                    cmd_data = {
-                        "tool_call_id": tool_call_id,
-                        "agent_turn_id": agent_turn_id,
-                        "turn_epoch": turn_epoch,
-                        "agent_id": agent_id,
-                        "after_execution": "suspend",
-                        "tool_name": fn_name,
-                    }
                     guard_outcome = await self._check_inbox_guard(
-                        project_id=project_id,
-                        agent_id=agent_id,
+                        ctx=op_ctx,
                         inbox_id=exclude_inbox_id,
                         fn_name=fn_name,
-                        tool_call_meta=tool_call_meta,
-                        cmd_data=cmd_data,
                         tool_call_card=None,
                     )
                     if guard_outcome is not None:
@@ -226,33 +178,24 @@ class UTPDispatcher:
                     args=args,
                     cardbox=self.cardbox,
                     ctx=op_ctx,
-                    tool_call_id=tool_call_id,
                     context_box_id=context_box_id,
                 )
                 if outcome is not None:
                     return outcome
 
-                tool_def = await self.resource_store.fetch_tool_definition_model(project_id, fn_name)
+                tool_def = await self.resource_store.fetch_tool_definition_model(op_ctx.project_id, fn_name)
                 if not tool_def:
                     tool_call_card = await self._save_tool_call_card(
-                        project_id=project_id,
-                        agent_id=agent_id,
-                        agent_turn_id=agent_turn_id,
-                        step_id=step_id,
-                        tool_call_id=tool_call_id,
+                        ctx=op_ctx,
                         fn_name=fn_name,
                         args=args,
                         target_subject=None,
-                        trace_id=trace_id,
-                        parent_step_id=parent_step_id,
                     )
                     return await create_error_outcome(
                         cardbox=self.cardbox,
                         ctx=op_ctx,
-                        tool_call_id=tool_call_id,
                         fn_name=fn_name,
                         exc=NotFoundError(f"Tool definition not found: {fn_name}"),
-                        tool_call_meta=getattr(tool_call_card, "metadata", {}) or {},
                         tool_call_card=tool_call_card,
                     )
 
@@ -260,55 +203,31 @@ class UTPDispatcher:
                 after_exec = tool_def.after_execution
                 if not target_subject_tpl or not after_exec:
                     tool_call_card = await self._save_tool_call_card(
-                        project_id=project_id,
-                        agent_id=agent_id,
-                        agent_turn_id=agent_turn_id,
-                        step_id=step_id,
-                        tool_call_id=tool_call_id,
+                        ctx=op_ctx,
                         fn_name=fn_name,
                         args=args,
                         target_subject=target_subject_tpl,
-                        trace_id=trace_id,
-                        parent_step_id=parent_step_id,
                     )
                     return await create_error_outcome(
                         cardbox=self.cardbox,
                         ctx=op_ctx,
-                        tool_call_id=tool_call_id,
                         fn_name=fn_name,
                         exc=InternalError(f"Invalid tool definition (missing subject/lifecycle): {fn_name}"),
-                        tool_call_meta=getattr(tool_call_card, "metadata", {}) or {},
                         tool_call_card=tool_call_card,
                     )
                 span.set_attribute("cg.after_execution", str(after_exec))
 
-                target_subject = target_subject_tpl.replace("{project_id}", project_id).replace(
-                    "{channel_id}", channel_id
-                )
+                target_subject = op_ctx.render_subject_template(target_subject_tpl)
                 arg_context = {
-                    "project_id": project_id,
-                    "channel_id": channel_id,
-                    "agent_id": agent_id,
-                    "agent_turn_id": agent_turn_id,
-                    "step_id": step_id,
-                    "tool_call_id": tool_call_id,
-                    "parent_step_id": parent_step_id,
-                    "trace_id": trace_id,
-                    "turn_epoch": turn_epoch,
+                    **op_ctx.to_sys_dict(),
                     "context_box_id": context_box_id,
                 }
                 dispatch_requested_at = to_iso(utc_now()) if self.timing_tool_dispatch else None
                 tool_call_card = await self._save_tool_call_card(
-                    project_id=project_id,
-                    agent_id=agent_id,
-                    agent_turn_id=agent_turn_id,
-                    step_id=step_id,
-                    tool_call_id=tool_call_id,
+                    ctx=op_ctx,
                     fn_name=fn_name,
                     args=args,
                     target_subject=target_subject,
-                    trace_id=trace_id,
-                    parent_step_id=parent_step_id,
                     tool_def=tool_def,
                     arg_context=arg_context,
                     dispatch_requested_at=dispatch_requested_at,
@@ -316,66 +235,60 @@ class UTPDispatcher:
 
                 if after_exec == "terminate" and self.execution_store:
                     exclude_inbox_id = guard_inbox_id or inbox_id
-                    tool_call_meta = getattr(tool_call_card, "metadata", {}) or {
-                        "step_id": step_id,
-                        "trace_id": trace_id,
-                        "parent_step_id": parent_step_id,
-                    }
-                    cmd_data = {
-                        "tool_call_id": tool_call_id,
-                        "agent_turn_id": agent_turn_id,
-                        "turn_epoch": turn_epoch,
-                        "agent_id": agent_id,
-                        "after_execution": "suspend",
-                        "tool_name": fn_name,
-                    }
                     guard_outcome = await self._check_inbox_guard(
-                        project_id=project_id,
-                        agent_id=agent_id,
+                        ctx=op_ctx,
                         inbox_id=exclude_inbox_id,
                         fn_name=fn_name,
-                        tool_call_meta=tool_call_meta,
-                        cmd_data=cmd_data,
                         tool_call_card=tool_call_card,
                     )
                     if guard_outcome is not None:
                         return guard_outcome
 
-                await record_tool_call_edge(
-                    execution_store=self.execution_store,
-                    ctx=op_ctx,
-                    tool_call_id=str(tool_call_id),
-                    tool_name=str(fn_name),
-                    logger=logger,
-                )
+                dispatch_ctx = op_ctx.with_bumped_epoch(turn_epoch)
 
                 payload = {
-                    "project_id": project_id,
-                    "channel": channel_id,
-                    "agent_id": agent_id,
-                    "agent_turn_id": agent_turn_id,
-                    "turn_epoch": turn_epoch,
-                    "step_id": step_id,
-                    "tool_call_id": tool_call_id,
                     "tool_name": fn_name,
                     "after_execution": after_exec,
-                    "context_box_id": context_box_id,
                     "tool_call_card_id": tool_call_card.card_id,
                 }
-                if dispatch_requested_at:
-                    payload["dispatch_requested_at"] = dispatch_requested_at
 
                 dispatch_start_ts = time.perf_counter()
                 logger.info("📤 UTP Dispatch: %s -> %s (after=%s)", fn_name, target_subject, after_exec)
-                await asyncio.wait_for(
-                    self.nats.publish_event(target_subject, payload, headers=headers),
-                    timeout=self.DEFAULT_TIMEOUT,
-                )
+                if not self.execution_store or not self.l0_engine:
+                    raise InternalError("L0 command_intent is required for cmd dispatch")
+                command_signals = []
+                async with self.execution_store.pool.connection() as conn:
+                    async with conn.transaction():
+                        result = await self.l0_engine.command_intent(
+                            source_ctx=dispatch_ctx,
+                            intent=CommandIntent(
+                                subject=target_subject,
+                                payload=payload,
+                                correlation_id=str(resolved_tool_call_id),
+                                primitive="tool_call",
+                                metadata={
+                                    "tool_call_id": str(resolved_tool_call_id),
+                                    "tool_name": str(fn_name),
+                                    "step_id": str(dispatch_ctx.step_id or ""),
+                                },
+                            ),
+                            conn=conn,
+                        )
+                        if result.status != "accepted":
+                            raise InternalError(
+                                f"L0 command_intent rejected status={result.status} code={result.error_code}"
+                            )
+                        command_signals = list(result.command_signals or ())
+                if command_signals:
+                    await asyncio.wait_for(
+                        self.l0_engine.publish_command_signals(command_signals),
+                        timeout=self.DEFAULT_TIMEOUT,
+                    )
                 if self.timing_tool_dispatch:
                     dispatch_duration_ms = monotonic_ms(dispatch_start_ts)
                     logger.info(
                         "📤 UTP Dispatch sent: tool_call_id=%s duration_ms=%s",
-                        tool_call_id,
+                        resolved_tool_call_id,
                         dispatch_duration_ms,
                     )
                 return ActionOutcome(cards=[tool_call_card], suspend=True, mark_complete=False)
@@ -386,14 +299,8 @@ class UTPDispatcher:
                 return await create_error_outcome(
                     cardbox=self.cardbox,
                     ctx=op_ctx,
-                    tool_call_id=tool_call_id,
                     fn_name=fn_name,
                     exc=ToolTimeoutError(f"Execution timed out ({self.DEFAULT_TIMEOUT}s)"),
-                    tool_call_meta=getattr(tool_call_card, "metadata", {}) or {
-                        "step_id": step_id,
-                        "trace_id": trace_id,
-                        "parent_step_id": parent_step_id,
-                    },
                     tool_call_card=tool_call_card,
                 )
             except Exception as e:
@@ -402,40 +309,27 @@ class UTPDispatcher:
                 return await create_error_outcome(
                     cardbox=self.cardbox,
                     ctx=op_ctx,
-                    tool_call_id=tool_call_id,
                     fn_name=fn_name,
                     exc=InternalError(f"Execution error: {str(e)}"),
-                    tool_call_meta=getattr(tool_call_card, "metadata", {}) or {
-                        "step_id": step_id,
-                        "trace_id": trace_id,
-                        "parent_step_id": parent_step_id,
-                    },
                     tool_call_card=tool_call_card,
                 )
     async def _save_tool_call_card(
         self,
         *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        step_id: str,
-        tool_call_id: str,
+        ctx: CGContext,
         fn_name: str,
         args: Dict[str, Any],
         target_subject: Optional[str],
-        trace_id: Optional[str],
-        parent_step_id: Optional[str],
         tool_def: Optional[Any] = None,
         arg_context: Optional[Dict[str, Any]] = None,
         dispatch_requested_at: Optional[str] = None,
     ) -> Card:
         merged_args = args
+        tool_call_id = ctx.require_tool_call_id
         metadata = {
-            "agent_turn_id": agent_turn_id,
-            "step_id": step_id,
+            "agent_turn_id": ctx.agent_turn_id,
             "tool_call_id": tool_call_id,
-            **({"trace_id": trace_id} if trace_id else {}),
-            **({"parent_step_id": parent_step_id} if parent_step_id else {}),
+            **ctx.to_lineage_meta(),
         }
         if dispatch_requested_at:
             metadata["dispatch_requested_at"] = dispatch_requested_at
@@ -456,7 +350,7 @@ class UTPDispatcher:
                 metadata["tool_args_envs"] = envs_meta
         card = Card(
             card_id=uuid6.uuid7().hex,
-            project_id=project_id,
+            project_id=ctx.project_id,
             type="tool.call",
             content=ToolCallContent(
                 tool_name=fn_name,
@@ -465,7 +359,7 @@ class UTPDispatcher:
                 target_subject=target_subject,
             ),
             created_at=datetime.now(UTC),
-            author_id=agent_id,
+            author_id=ctx.agent_id,
             metadata=metadata,
             tool_call_id=tool_call_id,
         )

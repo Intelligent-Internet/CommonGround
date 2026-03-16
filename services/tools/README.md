@@ -34,8 +34,8 @@ uv run -m services.tools.sandbox_reaper
 如需覆盖 **有效** `after_execution`，在 `tool.result.content.result.__cg_control.after_execution` 写入 `suspend|terminate`（保留命名空间）。
 
 框架抽象说明：
-- `ToolCallContext` 与 `ToolResultBuilder` 统一放在 `infra/tool_executor/`。
-- `services/tools/tool_helpers.py` 提供 L2 便捷封装：`build_tool_result_package`、`extract_tool_call_args`、`extract_tool_call_metadata`。
+- `ToolCallEnvelope` 与 `ToolResultBuilder` 统一放在 `infra/tool_executor/`。
+- `services/tools/tool_helpers.py` 提供失败回报与 metadata 恢复辅助：`build_validation_failure_package`、`extract_tool_call_args`、`extract_tool_call_metadata`。
 - 上述便捷封装内部仍委托 `infra/tool_executor`，保证行为与内核实现一致。
 - `ToolRunner` 在执行前会自动 hydration `tool.call`，业务工具直接使用 `ctx.args`。
 - 业务层只返回业务结果或抛异常；`tool.result` 成功/失败封装由框架统一处理。

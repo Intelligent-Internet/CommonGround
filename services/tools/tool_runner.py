@@ -4,24 +4,25 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Tuple, Union
 
-import uuid6
 from pydantic import ValidationError
 
+from core.cg_context import CGContext
 from core.errors import BadRequestError, ProtocolViolationError
-from core.headers import require_recursion_depth
 from core.subject import SubjectParts, parse_subject
-from core.trace import ensure_trace_headers, trace_id_from_headers
+from core.utils import safe_str
 from core.utp_protocol import ToolCommandPayload
+from infra.messaging.ingress import build_nats_ingress_context
 from infra.idempotency import IdempotentExecutor, NatsKvIdempotencyStore, build_idempotency_key
 from infra.l0_engine import L0Engine
 from infra.l0.tool_reports import publish_tool_result_report
 from infra.tool_executor import (
-    ToolCallContext,
+    ToolCallEnvelope,
     ToolCallHydrationError,
     ToolResultBuilder,
     ToolResultContext,
     hydrate_tool_call_context,
 )
+from services.tools.tool_helpers import build_validation_failure_package
 
 
 @dataclass(frozen=True)
@@ -45,10 +46,9 @@ class ToolPayloadValidation:
 
 @dataclass(frozen=True)
 class ToolPreflightContext:
-    subject: str
     parts: SubjectParts
+    ctx: CGContext
     data: Dict[str, Any]
-    headers: Dict[str, str]
 
 @dataclass(frozen=True)
 class ToolExecutionOutput:
@@ -59,7 +59,6 @@ class ToolExecutionOutput:
 @dataclass(frozen=True)
 class ToolRunnerResult:
     handled: bool
-    context: Optional[ToolResultContext | ToolPreflightContext] = None
     is_leader: Optional[bool] = None
     payload: Optional[Dict[str, Any]] = None
 
@@ -71,7 +70,7 @@ class ToolIdempotency:
 
 
 ToolExecutionOutputLike = Union[ToolExecutionOutput, Tuple[Dict[str, Any], Any], Any]
-ToolExecuteFn = Callable[[ToolCallContext], Awaitable[ToolExecutionOutputLike]]
+ToolExecuteFn = Callable[[ToolCallEnvelope], Awaitable[ToolExecutionOutputLike]]
 ToolValidationErrorHandler = Callable[[ToolPreflightContext, Exception], Awaitable[bool]]
 ToolPublishResultFn = Callable[[SubjectParts, Dict[str, str], Dict[str, Any], str], Awaitable[None]]
 
@@ -145,7 +144,8 @@ class ToolRunner:
         self.category = str(category)
         self.component = str(component)
         self.idempotency_namespace = str(idempotency_namespace)
-        self.result_author_id = str(result_author_id or f"tool.{self.target}")
+        # L0 source validation binds the reported actor to the tool.result author.
+        self.result_author_id = str(result_author_id or self.source_agent_id)
         self.default_function_name = str(default_function_name or self.target)
         self.publish_result = publish_result
         self.require_tool_call_type = bool(require_tool_call_type)
@@ -158,13 +158,12 @@ class ToolRunner:
         data: Dict[str, Any],
         headers: Mapping[str, str] | None,
         execute: ToolExecuteFn,
-        parts: Optional[SubjectParts] = None,
         tool_name_fallback: Optional[str] = None,
         idempotency_domain: Optional[str] = None,
         source_agent_id: Optional[str] = None,
         on_validation_error: Optional[ToolValidationErrorHandler] = None,
     ) -> ToolRunnerResult:
-        resolved_parts = parts or parse_subject(subject)
+        resolved_parts = parse_subject(subject)
         if (
             resolved_parts is None
             or resolved_parts.category != self.category
@@ -173,29 +172,42 @@ class ToolRunner:
         ):
             return ToolRunnerResult(handled=False)
 
-        merged_headers = self.nats.merge_headers(dict(headers or {}))
         try:
-            merged_headers, _, _ = ensure_trace_headers(merged_headers)
-        except ProtocolViolationError as exc:
-            self.logger.error("%s invalid trace headers: %s", self.service_name, exc)
-            return ToolRunnerResult(
-                handled=True,
-                context=ToolPreflightContext(
-                    subject=subject,
-                    parts=resolved_parts,
-                    data=data,
-                    headers=merged_headers,
-                ),
+            ingress_ctx, _ = build_nats_ingress_context(
+                headers=headers,
+                raw_payload=data,
+                subject_parts=resolved_parts,
             )
+        except ProtocolViolationError as exc:
+            self.logger.error("%s protocol violation: %s", self.service_name, exc)
+            try:
+                ingress_ctx, _ = build_nats_ingress_context(
+                    headers=headers,
+                    raw_payload={},
+                    subject_parts=resolved_parts,
+                )
+            except ProtocolViolationError:
+                return ToolRunnerResult(handled=True)
+            handled = await self._publish_validation_failure(
+                ToolPreflightContext(
+                    parts=resolved_parts,
+                    ctx=ingress_ctx,
+                    data=dict(data or {}),
+                ),
+                exc,
+            )
+            if handled:
+                return ToolRunnerResult(handled=True)
+            return ToolRunnerResult(handled=True)
 
         preflight = ToolPreflightContext(
-            subject=subject,
             parts=resolved_parts,
-            data=data,
-            headers=merged_headers,
+            ctx=ingress_ctx,
+            data=dict(data or {}),
         )
         try:
-            payload = self.payload_validation.validate(data)
+            payload = self.payload_validation.validate(dict(data or {}))
+            resolved_tool_call_id = ingress_ctx.require_tool_call_id
         except (ValidationError, BadRequestError, ProtocolViolationError) as exc:
             handled = False
             if on_validation_error is not None:
@@ -212,7 +224,7 @@ class ToolRunner:
             if not handled:
                 handled = await self._publish_validation_failure(preflight, exc)
             if handled:
-                return ToolRunnerResult(handled=True, context=preflight)
+                return ToolRunnerResult(handled=True)
             self._log_payload_error(exc)
             raise exc
 
@@ -221,18 +233,13 @@ class ToolRunner:
             self.idempotency_namespace,
             resolved_parts.project_id,
             key_domain,
-            str(payload.tool_call_id),
+            str(resolved_tool_call_id),
         )
 
         base_context = ToolResultContext.from_cmd_data(
-            project_id=resolved_parts.project_id,
-            cmd_data=data,
-            tool_call_meta={},
-            subject=subject,
-            parts=resolved_parts,
-            headers=merged_headers,
+            ctx=ingress_ctx,
+            cmd_data=dict(data or {}),
             payload=payload,
-            raw_data=data,
         )
 
         async def _leader_execute() -> Dict[str, Any]:
@@ -240,10 +247,8 @@ class ToolRunner:
             try:
                 tool_context = await hydrate_tool_call_context(
                     cardbox=self.cardbox,
-                    subject=subject,
-                    parts=resolved_parts,
-                    data=data,
-                    headers=merged_headers,
+                    cg_ctx=ingress_ctx,
+                    data=dict(data or {}),
                     payload=payload,
                     require_tool_call_type=self.require_tool_call_type,
                     validate_tool_call_id_match=self.validate_tool_call_id_match,
@@ -255,15 +260,12 @@ class ToolRunner:
                     context=tool_context,
                 )
             except ToolCallHydrationError as hydration_exc:
-                failure_context = ToolResultContext.from_cmd_data(
-                    project_id=resolved_parts.project_id,
-                    cmd_data=data,
-                    tool_call_meta=hydration_exc.tool_call_meta,
-                    subject=subject,
-                    parts=resolved_parts,
-                    headers=merged_headers,
+                tool_meta = dict(hydration_exc.tool_call_meta or {})
+                failure_ctx = ingress_ctx.with_lineage_meta(tool_meta)
+                failure_context = ToolResultContext(
+                    ctx=failure_ctx,
+                    cmd_data=dict(data or {}),
                     payload=payload,
-                    raw_data=data,
                 )
                 active_context = failure_context
                 normalized_output = self._build_failed_output(
@@ -283,32 +285,28 @@ class ToolRunner:
         try:
             outcome = await self.idempotent_executor.execute(key, _leader_execute)
             effective_source = str(source_agent_id or self.source_agent_id)
-            await self.ensure_request_edge_for_report(
-                parts=resolved_parts,
-                headers=merged_headers,
-                payload=outcome.payload,
-            )
+            source_ctx = ingress_ctx.evolve(agent_id=effective_source, agent_turn_id="", step_id=None)
+            report_ctx = ingress_ctx.with_tool_call(str(resolved_tool_call_id))
             await self._publish_result(
                 parts=resolved_parts,
-                headers=merged_headers,
                 payload=outcome.payload,
-                source_agent_id=effective_source,
+                target_ctx=report_ctx,
+                source_ctx=source_ctx,
             )
             if outcome.is_leader:
                 self.logger.info(
                     "%s tool_result sent (leader) tool_call_id=%s",
                     self.service_name,
-                    payload.tool_call_id,
+                    resolved_tool_call_id,
                 )
             else:
                 self.logger.info(
                     "%s tool_result re-sent (follower) tool_call_id=%s",
                     self.service_name,
-                    payload.tool_call_id,
+                    resolved_tool_call_id,
                 )
             return ToolRunnerResult(
                 handled=True,
-                context=base_context,
                 is_leader=outcome.is_leader,
                 payload=outcome.payload,
             )
@@ -334,49 +332,28 @@ class ToolRunner:
         self.logger.error("%s invalid tool payload: %s", self.service_name, exc)
 
     async def _publish_validation_failure(self, preflight: ToolPreflightContext, exc: Exception) -> bool:
-        cmd_data = self._build_validation_cmd_data(preflight.data)
-        if cmd_data is None:
-            return False
-        normalized_exc: Exception = exc
-        if isinstance(exc, ValidationError):
-            missing = ToolCommandPayload.missing_fields_from_error(exc)
-            normalized_exc = BadRequestError(f"missing required fields {missing or ['unknown']}")
-        result_context = ToolResultContext.from_cmd_data(
-            project_id=preflight.parts.project_id,
-            cmd_data=cmd_data,
-            tool_call_meta={},
-            subject=preflight.subject,
-            parts=preflight.parts,
-            headers=preflight.headers,
-            raw_data=preflight.data,
-        )
-        builder = ToolResultBuilder(
-            result_context,
+        package = await build_validation_failure_package(
+            cardbox=self.cardbox,
+            ingress_ctx=preflight.ctx,
+            data=preflight.data,
+            exc=exc,
+            default_tool_name=self.default_function_name,
             author_id=self.result_author_id,
-            function_name=cmd_data.get("tool_name") or self.default_function_name,
-            error_source="tool",
         )
-        payload, result_card = builder.fail(
-            normalized_exc,
-            function_name=cmd_data.get("tool_name") or self.default_function_name,
-            after_execution=cmd_data.get("after_execution"),
-        )
+        if package is None:
+            return False
+        validation_ctx, payload, result_card = package
         await self.cardbox.save_card(result_card)
-        await self.ensure_request_edge_for_report(
-            parts=preflight.parts,
-            headers=preflight.headers,
-            payload=payload,
-        )
         await self._publish_result(
             parts=preflight.parts,
-            headers=preflight.headers,
             payload=payload,
-            source_agent_id=self.source_agent_id,
+            target_ctx=validation_ctx,
+            source_ctx=validation_ctx.evolve(agent_id=self.source_agent_id, agent_turn_id="", step_id=None),
         )
         self.logger.info(
             "%s tool_result sent (validation_failed) tool_call_id=%s",
             self.service_name,
-            str(cmd_data.get("tool_call_id") or ""),
+            str(validation_ctx.tool_call_id or ""),
         )
         return True
 
@@ -399,141 +376,30 @@ class ToolRunner:
         )
         return ToolExecutionOutput(payload=payload, result_card=result_card)
 
-    @staticmethod
-    def _build_validation_cmd_data(data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-        tool_call_id = ToolRunner._safe_str(data.get("tool_call_id"))
-        agent_turn_id = ToolRunner._safe_str(data.get("agent_turn_id"))
-        agent_id = ToolRunner._safe_str(data.get("agent_id"))
-        if not tool_call_id or not agent_turn_id or not agent_id:
-            return None
-        try:
-            turn_epoch = int(data.get("turn_epoch"))
-        except Exception:
-            return None
-        after_execution = ToolRunner._safe_str(data.get("after_execution")) or "suspend"
-        tool_name = ToolRunner._safe_str(data.get("tool_name"))
-        cmd_data: Dict[str, Any] = {
-            "tool_call_id": tool_call_id,
-            "agent_turn_id": agent_turn_id,
-            "turn_epoch": turn_epoch,
-            "agent_id": agent_id,
-            "after_execution": after_execution,
-            "tool_name": tool_name,
-        }
-        tool_call_card_id = ToolRunner._safe_str(data.get("tool_call_card_id"))
-        if tool_call_card_id:
-            cmd_data["tool_call_card_id"] = tool_call_card_id
-        return cmd_data
-
-    @staticmethod
-    def _safe_str(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text if text else None
-
     async def _publish_result(
         self,
         *,
         parts: SubjectParts,
-        headers: Dict[str, str],
         payload: Dict[str, Any],
-        source_agent_id: str,
+        target_ctx: CGContext,
+        source_ctx: CGContext,
     ) -> None:
+        source_agent_id = str(source_ctx.agent_id or self.source_agent_id)
+        headers = target_ctx.to_nats_headers()
         if self.publish_result is not None:
             await self.publish_result(parts, headers, payload, source_agent_id)
             return
         await publish_tool_result_report(
             nats=self.nats,
             execution_store=self.execution_store,
+            cardbox=self.cardbox,
             resource_store=self.resource_store,
             state_store=self.state_store,
             l0_engine=self.l0_engine,
-            project_id=parts.project_id,
-            channel_id=parts.channel_id,
+            source_ctx=source_ctx,
+            target_ctx=target_ctx,
             payload=payload,
-            headers=headers,
-            source_agent_id=source_agent_id,
         )
-
-    async def ensure_request_edge_for_report(
-        self,
-        *,
-        parts: SubjectParts,
-        headers: Mapping[str, str],
-        payload: Dict[str, Any],
-    ) -> None:
-        correlation_id = self._safe_str(payload.get("tool_call_id"))
-        if not correlation_id:
-            return
-        if not hasattr(self.execution_store, "get_request_recursion_depth"):
-            return
-        if not hasattr(self.execution_store, "insert_execution_edge"):
-            return
-        try:
-            existing_depth = await self.execution_store.get_request_recursion_depth(
-                project_id=parts.project_id,
-                correlation_id=correlation_id,
-            )
-            if existing_depth is not None:
-                return
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning(
-                "%s request-edge depth lookup failed tool_call_id=%s: %s",
-                self.service_name,
-                correlation_id,
-                exc,
-            )
-            return
-
-        try:
-            depth = int(require_recursion_depth(headers))
-        except Exception:
-            depth = 0
-
-        agent_id = self._safe_str(payload.get("agent_id"))
-        agent_turn_id = self._safe_str(payload.get("agent_turn_id"))
-        step_id = self._safe_str(payload.get("step_id"))
-        trace_id = self._safe_str(payload.get("trace_id")) or trace_id_from_headers(headers)
-        edge_id = f"edge_{uuid6.uuid7().hex}"
-
-        try:
-            await self.execution_store.insert_execution_edge(
-                edge_id=edge_id,
-                project_id=parts.project_id,
-                channel_id=parts.channel_id,
-                primitive="tool_call",
-                edge_phase="request",
-                source_agent_id=agent_id,
-                source_agent_turn_id=agent_turn_id,
-                source_step_id=step_id,
-                target_agent_id=agent_id,
-                target_agent_turn_id=agent_turn_id,
-                correlation_id=correlation_id,
-                enqueue_mode=None,
-                recursion_depth=int(depth),
-                trace_id=trace_id,
-                parent_step_id=step_id,
-                metadata={
-                    "tool_call_id": correlation_id,
-                    "source": "tool_runner_backfill",
-                    "service": self.service_name,
-                    "recursion_depth": int(depth),
-                },
-            )
-            self.logger.warning(
-                "%s backfilled missing request edge tool_call_id=%s depth=%s",
-                self.service_name,
-                correlation_id,
-                int(depth),
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning(
-                "%s request-edge backfill failed tool_call_id=%s: %s",
-                self.service_name,
-                correlation_id,
-                exc,
-            )
 
     def _normalize_execution_output(
         self,

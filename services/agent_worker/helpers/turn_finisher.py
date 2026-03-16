@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from core.cg_context import CGContext
 from core.status import STATUS_FAILED, STATUS_SUCCESS
 from core.utp_protocol import Card, JsonContent
 
@@ -18,6 +19,7 @@ import uuid6
 @dataclass(frozen=True, slots=True)
 class TurnFinishEffects:
     item: AgentTurnWorkItem
+    committed_ctx: CGContext
     step_id: str
     status: str
     deliverable_card_id: Optional[str]
@@ -60,8 +62,6 @@ class TurnFinisher:
         item: AgentTurnWorkItem,
         step_id: str,
         reason: str,
-        expect_turn_epoch: int,
-        expect_agent_turn_id: str,
         error_code: Optional[str] = None,
         conn: Any = None,
         bump_epoch: bool = False,
@@ -77,13 +77,13 @@ class TurnFinisher:
             try:
                 item.output_box_id = await call_with_optional_conn(
                     self.cardbox.ensure_box_id,
-                    project_id=item.project_id,
+                    project_id=item.ctx.project_id,
                     box_id=item.output_box_id,
                     conn=conn,
                 )
                 error_card = Card(
                     card_id=uuid6.uuid7().hex,
-                    project_id=item.project_id,
+                    project_id=item.ctx.project_id,
                     type="agent.error",
                     content=JsonContent(data={"error": reason, "status": "failed"}),
                     created_at=datetime.now(UTC),
@@ -95,7 +95,7 @@ class TurnFinisher:
                     self.cardbox.append_to_box,
                     str(item.output_box_id),
                     [error_card.card_id],
-                    project_id=item.project_id,
+                    project_id=item.ctx.project_id,
                     conn=conn,
                 )
                 collected_card_ids.append(error_card.card_id)
@@ -117,20 +117,19 @@ class TurnFinisher:
         if deliverable_card_id and deliverable_card_id not in collected_card_ids:
             collected_card_ids.append(deliverable_card_id)
 
-        updated = await call_with_optional_conn(
-            self.state_store.finish_turn_idle,
-            project_id=item.project_id,
-            agent_id=item.agent_id,
-            expect_turn_epoch=expect_turn_epoch,
-            expect_agent_turn_id=expect_agent_turn_id,
+        transition = await call_with_optional_conn(
+            self.state_store.finish_turn_idle_transition,
+            ctx=item.ctx,
             last_output_box_id=item.output_box_id,
             bump_epoch=bool(bump_epoch),
             conn=conn,
         )
-        if not updated:
+        if transition is None:
             return None
+        item.ctx = transition.committed_ctx
         return TurnFinishEffects(
             item=item,
+            committed_ctx=transition.committed_ctx,
             step_id=step_id,
             status=STATUS_FAILED,
             deliverable_card_id=deliverable_card_id,
@@ -144,8 +143,6 @@ class TurnFinisher:
         self,
         item: AgentTurnWorkItem,
         step_id: str,
-        expect_turn_epoch: int,
-        expect_agent_turn_id: str,
         deliverable_card_id: Optional[str] = None,
         conn: Any = None,
         bump_epoch: bool = False,
@@ -170,20 +167,19 @@ class TurnFinisher:
         if deliverable_card_id and deliverable_card_id not in collected_card_ids:
             collected_card_ids.append(deliverable_card_id)
 
-        updated = await call_with_optional_conn(
-            self.state_store.finish_turn_idle,
-            project_id=item.project_id,
-            agent_id=item.agent_id,
-            expect_turn_epoch=expect_turn_epoch,
-            expect_agent_turn_id=expect_agent_turn_id,
+        transition = await call_with_optional_conn(
+            self.state_store.finish_turn_idle_transition,
+            ctx=item.ctx,
             last_output_box_id=item.output_box_id,
             bump_epoch=bool(bump_epoch),
             conn=conn,
         )
-        if not updated:
+        if transition is None:
             return None
+        item.ctx = transition.committed_ctx
         return TurnFinishEffects(
             item=item,
+            committed_ctx=transition.committed_ctx,
             step_id=step_id,
             status=STATUS_SUCCESS,
             deliverable_card_id=deliverable_card_id,
@@ -193,12 +189,12 @@ class TurnFinisher:
 
     async def publish_finish_effects(self, effects: TurnFinishEffects) -> None:
         item = effects.item
-        ctx = item.to_cg_context()
+        item.ctx = effects.committed_ctx
+        ctx = effects.committed_ctx
         state_metadata = {"error": effects.error} if effects.error else None
         await self.emit_state_fn(
             nats=self.nats,
             ctx=ctx,
-            turn_epoch=item.turn_epoch,
             status="idle",
             output_box_id=item.output_box_id,
             metadata=state_metadata,
@@ -235,10 +231,7 @@ class TurnFinisher:
             nats=self.nats,
             resource_store=self.resource_store,
             state_store=self.state_store,
-            project_id=item.project_id,
-            channel_id=item.channel_id,
-            agent_id=item.agent_id,
-            headers=item.headers,
+            ctx=item.ctx,
             retry_count=3,
             retry_delay=1.0,
             logger=self.logger,

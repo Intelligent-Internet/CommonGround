@@ -20,12 +20,11 @@ from core.app_config import load_app_config, config_to_dict
 from core.errors import (
     BadRequestError,
 )
-from core.subject import format_subject, subject_pattern
+from core.subject import subject_pattern
 from core.time_utils import to_iso, utc_now
-from core.trace import trace_id_from_headers
 from core.utils import set_loop_policy
 from infra.service_runtime import ServiceBase
-from infra.tool_executor import ToolCallContext
+from infra.tool_executor import ToolCallEnvelope
 from services.tools.tool_runner import (
     ToolPayloadValidation,
     ToolRunner,
@@ -59,7 +58,7 @@ class EmitMarkerToolService(ServiceBase):
                 forbid_keys={"args"},
                 require_tool_call_card_id=True,
             ),
-            result_author_id="tool_emit_marker",
+            result_author_id="tool.emit_marker",
             logger=logger,
             service_name="EmitMarker",
         )
@@ -90,17 +89,15 @@ class EmitMarkerToolService(ServiceBase):
 
     async def _execute_logic(
         self,
-        ctx: ToolCallContext,
+        envelope: ToolCallEnvelope,
     ) -> Dict[str, Any]:
-        parts = ctx.parts
-        headers = ctx.headers
-        payload = ctx.payload
-        tool_call_id = payload.tool_call_id
-        tool_call_card_id = ctx.tool_call_card_id
-        agent_id = payload.agent_id
+        cg_ctx = envelope.ctx
+        headers = envelope.headers
+        tool_call_id = cg_ctx.tool_call_id or ""
+        tool_call_card_id = envelope.tool_call_card_id
+        agent_id = cg_ctx.agent_id
 
-        tool_call_meta = ctx.tool_call_meta
-        args = ctx.args
+        args = envelope.args
         marker_type = args.get("marker_type")
         title = args.get("title")
         markdown_content = args.get("markdown_content")
@@ -111,17 +108,10 @@ class EmitMarkerToolService(ServiceBase):
             "marker_type": marker_type,
             "tool_call_card_id": str(tool_call_card_id),
             "source_agent_id": str(agent_id),
-            "trace_id": tool_call_meta.get("trace_id") or trace_id_from_headers(headers),
+            "trace_id": cg_ctx.trace_id,
             "ts": to_iso(utc_now()),
         }
-        event_subject = format_subject(
-            parts.project_id,
-            parts.channel_id,
-            "evt",
-            "sys",
-            "ui",
-            "marker",
-        )
+        event_subject = cg_ctx.subject("evt", "sys", "ui", "marker")
         try:
             await self.nats.publish_event(
                 event_subject,
@@ -136,8 +126,8 @@ class EmitMarkerToolService(ServiceBase):
         }
 
     async def _handle_cmd(self, subject: str, data: Dict[str, Any], headers: Dict[str, str]):
-        async def _execute(ctx: ToolCallContext) -> Dict[str, Any]:
-            return await self._execute_logic(ctx)
+        async def _execute(envelope: ToolCallEnvelope) -> Dict[str, Any]:
+            return await self._execute_logic(envelope)
 
         run_result = await self.tool_runner.run(
             subject=subject,
@@ -149,7 +139,7 @@ class EmitMarkerToolService(ServiceBase):
         if not run_result.handled:
             return
 
-        tool_call_id = str(data.get("tool_call_id") or "")
+        tool_call_id = str((headers or {}).get("CG-Tool-Call-Id") or "")
         if run_result.is_leader:
             logger.info("Marker emitted: tool_call_id=%s", tool_call_id)
         elif run_result.is_leader is False:

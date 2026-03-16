@@ -89,6 +89,11 @@ cg.{ver}.{project_id}.{channel_id}.{category}.{component}.{target}.{suffix}
 
 ## 5. 关键 Subject 家族与载荷
 
+总规则（命令面收口）：
+- 边界内 `cmd.*` 的发布统一由 L0 执行（`enqueue/report/join/command_intent/wakeup`）；业务层不应直接 `publish_event` 到 `cmd.*`。
+- `cmd.agent.*.wakeup` 仅通过 L0 wakeup 接口发出（不走 `command_intent`）。
+- 本轮采用“温和瘦身”：`cmd.tool.* / cmd.sys.pmo.internal.*` 允许保留 `tool_call_id/tool_call_card_id/tool_name/after_execution` 等路由必需字段。
+
 ### 5.1 `cmd.agent.{target}.wakeup`
 - 方向：PMO/ExecutionService → Worker
 - 必填：`agent_id`
@@ -116,6 +121,7 @@ cg.{ver}.{project_id}.{channel_id}.{category}.{component}.{target}.{suffix}
 - 必填：`tool_call_id` / `agent_turn_id` / `turn_epoch` / `agent_id`
 - 常见可选：`tool_name` / `after_execution` / `tool_call_card_id` / `context_box_id` / `dispatch_requested_at`
 - 约束：工具入口中 `ToolCommandPayload` 默认禁止 `args` 直传；通常应携带 `tool_call_card_id` 并让卡片表达具体参数。
+- 发送路径：Worker/ToolCaller/API 均应走 L0 `command_intent` 产 signal，再事务后发布。
 
 ### 5.5 `cmd.sys.pmo.internal.*`
 - 方向：Worker → PMO
@@ -154,8 +160,9 @@ cg.{ver}.{project_id}.{channel_id}.{category}.{component}.{target}.{suffix}
 - 方向：UI Worker → UI
 - 必填：`action_id` / `agent_id` / `status`
 - 可选：`message_id` / `tool_result_card_id` / `error_code` / `error`
-- 语义：确认接收/待确认（pending）/拒绝/忙碌/完成
-  - `status` 通常为 `accepted|busy|rejected`；兼容实现也可能回传其他字符串状态。
+- 语义：入口确认 / 拒绝 / 忙碌 / 最终完成
+  - 入口阶段通常返回 `accepted|busy|rejected`
+  - 工具执行完成后通常返回 `done`；失败场景返回 `rejected`
 
 ## 6. 消费者约定与消费模式 (L0 必遵)
 

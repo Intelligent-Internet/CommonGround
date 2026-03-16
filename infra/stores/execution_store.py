@@ -1,50 +1,12 @@
 import json
 from datetime import datetime, timedelta, UTC
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from psycopg_pool import AsyncConnectionPool
 
+from core.cg_context import CGContext
+from core.message_source import MessageSource
 from .base import BaseStore
-
-@dataclass(frozen=True, slots=True)
-class InboxInsert:
-    inbox_id: str
-    project_id: str
-    agent_id: str
-    message_type: str
-    enqueue_mode: Optional[str]
-    correlation_id: Optional[str]
-    recursion_depth: int
-    traceparent: str
-    tracestate: Optional[str]
-    trace_id: Optional[str]
-    parent_step_id: Optional[str]
-    source_agent_id: Optional[str]
-    source_step_id: Optional[str]
-    payload: Dict[str, Any]
-    status: str = "pending"
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutionEdgeInsert:
-    edge_id: str
-    project_id: str
-    channel_id: Optional[str]
-    primitive: str
-    edge_phase: str
-    source_agent_id: Optional[str]
-    source_agent_turn_id: Optional[str]
-    source_step_id: Optional[str]
-    target_agent_id: Optional[str]
-    target_agent_turn_id: Optional[str]
-    correlation_id: Optional[str]
-    enqueue_mode: Optional[str]
-    recursion_depth: Optional[int]
-    trace_id: Optional[str]
-    parent_step_id: Optional[str]
-    metadata: Dict[str, Any]
-
 
 class ExecutionStore(BaseStore):
     """Execution inbox + audit edge store (v1r2)."""
@@ -73,6 +35,42 @@ class ExecutionStore(BaseStore):
                 "Missing required schema: state.execution_edges. "
                 "Run scripts/setup/init_db.sql or apply the v1r2 inbox migration."
             )
+        inbox_column_rows = await self.fetch_all(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='state' AND table_name='agent_inbox'
+            """
+        )
+        inbox_columns = {str((r or {}).get("column_name") or "") for r in inbox_column_rows}
+        required_inbox_columns = {
+            "inbox_id",
+            "project_id",
+            "agent_id",
+            "channel_id",
+            "message_type",
+            "enqueue_mode",
+            "correlation_id",
+            "agent_turn_id",
+            "turn_epoch",
+            "context_headers",
+            "payload",
+            "status",
+            "retry_count",
+            "next_retry_at",
+            "last_error",
+            "defer_reason",
+            "created_at",
+            "processed_at",
+            "archived_at",
+        }
+        missing_inbox_columns = sorted(col for col in required_inbox_columns if col not in inbox_columns)
+        if missing_inbox_columns:
+            raise RuntimeError(
+                "Missing required columns in state.agent_inbox: "
+                f"{', '.join(missing_inbox_columns)}. "
+                "Run scripts/setup/init_db.sql (or apply equivalent migration)."
+            )
 
     async def close(self, *, timeout: float | None = None) -> None:
         await super().close(timeout=timeout)
@@ -80,53 +78,54 @@ class ExecutionStore(BaseStore):
     async def insert_inbox(
         self,
         *,
+        ctx: CGContext,
+        source: MessageSource,
         inbox_id: str,
-        project_id: str,
-        agent_id: str,
         message_type: str,
         enqueue_mode: Optional[str],
         correlation_id: Optional[str],
-        recursion_depth: int,
-        traceparent: str,
-        tracestate: Optional[str],
-        trace_id: Optional[str],
-        parent_step_id: Optional[str],
-        source_agent_id: Optional[str],
-        source_step_id: Optional[str],
         payload: Dict[str, Any],
         status: str = "pending",
-    ) -> None:
-        record = InboxInsert(
-            inbox_id=inbox_id,
-            project_id=project_id,
-            agent_id=agent_id,
-            message_type=message_type,
-            enqueue_mode=enqueue_mode,
-            correlation_id=correlation_id,
-            recursion_depth=recursion_depth,
-            traceparent=traceparent,
-            tracestate=tracestate,
-            trace_id=trace_id,
-            parent_step_id=parent_step_id,
-            source_agent_id=source_agent_id,
-            source_step_id=source_step_id,
-            payload=payload,
-            status=status,
-        )
+    ) -> bool:
+        _ = source
         async with self.pool.connection() as conn:
-            await self._insert_inbox_with_conn(conn, record)
+            return await self.insert_inbox_with_conn(
+                conn,
+                ctx=ctx,
+                inbox_id=inbox_id,
+                message_type=message_type,
+                enqueue_mode=enqueue_mode,
+                correlation_id=correlation_id,
+                payload=payload,
+                status=status,
+            )
 
-    async def _insert_inbox_with_conn(self, conn: Any, record: InboxInsert) -> bool:
+    async def insert_inbox_with_conn(
+        self,
+        conn: Any,
+        *,
+        ctx: CGContext,
+        inbox_id: str,
+        message_type: str,
+        enqueue_mode: Optional[str],
+        correlation_id: Optional[str],
+        payload: Dict[str, Any],
+        status: str = "pending",
+    ) -> bool:
+        headers_json = json.dumps(ctx.to_nats_headers(include_topology=True))
+        next_retry_at = datetime.now(UTC)
         sql = """
             INSERT INTO state.agent_inbox (
-                inbox_id, project_id, agent_id, message_type, enqueue_mode,
-                correlation_id, recursion_depth, traceparent, tracestate, trace_id,
-                parent_step_id, source_agent_id, source_step_id, payload, status, created_at
+                inbox_id, project_id, agent_id, channel_id, message_type, enqueue_mode,
+                correlation_id, agent_turn_id, turn_epoch, context_headers,
+                payload, status, retry_count,
+                next_retry_at, last_error, defer_reason, created_at
             )
             VALUES (
-                %s,%s,%s,%s,%s,
-                %s,%s,%s,%s,%s,
-                %s,%s,%s,%s::jsonb,%s,NOW()
+                %s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s::jsonb,
+                %s::jsonb,%s,%s,
+                %s,%s,%s,NOW()
             )
             ON CONFLICT DO NOTHING
             RETURNING inbox_id
@@ -134,21 +133,22 @@ class ExecutionStore(BaseStore):
         row = await self.fetch_one(
             sql,
             (
-                record.inbox_id,
-                record.project_id,
-                record.agent_id,
-                record.message_type,
-                record.enqueue_mode,
-                record.correlation_id,
-                int(record.recursion_depth),
-                record.traceparent,
-                record.tracestate,
-                record.trace_id,
-                record.parent_step_id,
-                record.source_agent_id,
-                record.source_step_id,
-                json.dumps(record.payload or {}),
-                record.status,
+                inbox_id,
+                ctx.project_id,
+                ctx.agent_id,
+                ctx.channel_id,
+                message_type,
+                enqueue_mode,
+                correlation_id,
+                ctx.agent_turn_id or None,
+                int(ctx.turn_epoch),
+                headers_json,
+                json.dumps(payload or {}),
+                status,
+                0,
+                next_retry_at,
+                None,
+                None,
             ),
             conn=conn,
         )
@@ -157,86 +157,43 @@ class ExecutionStore(BaseStore):
     async def insert_execution_edge(
         self,
         *,
+        ctx: CGContext,
+        source: MessageSource,
         edge_id: str,
-        project_id: str,
-        channel_id: Optional[str],
         primitive: str,
         edge_phase: str,
-        source_agent_id: Optional[str],
-        source_agent_turn_id: Optional[str],
-        source_step_id: Optional[str],
-        target_agent_id: Optional[str],
-        target_agent_turn_id: Optional[str],
-        correlation_id: Optional[str],
-        enqueue_mode: Optional[str],
-        recursion_depth: Optional[int],
-        trace_id: Optional[str],
-        parent_step_id: Optional[str],
+        correlation_id: Optional[str] = None,
+        enqueue_mode: Optional[str] = None,
         metadata: Dict[str, Any],
-    ) -> None:
-        record = ExecutionEdgeInsert(
-            edge_id=edge_id,
-            project_id=project_id,
-            channel_id=channel_id,
-            primitive=primitive,
-            edge_phase=edge_phase,
-            source_agent_id=source_agent_id,
-            source_agent_turn_id=source_agent_turn_id,
-            source_step_id=source_step_id,
-            target_agent_id=target_agent_id,
-            target_agent_turn_id=target_agent_turn_id,
-            correlation_id=correlation_id,
-            enqueue_mode=enqueue_mode,
-            recursion_depth=recursion_depth,
-            trace_id=trace_id,
-            parent_step_id=parent_step_id,
-            metadata=metadata,
-        )
+    ) -> bool:
         async with self.pool.connection() as conn:
-            await self._insert_execution_edge_with_conn(conn, record)
+            return await self.insert_execution_edge_with_conn(
+                conn,
+                ctx=ctx,
+                source=source,
+                edge_id=edge_id,
+                primitive=primitive,
+                edge_phase=edge_phase,
+                correlation_id=correlation_id,
+                enqueue_mode=enqueue_mode,
+                metadata=metadata,
+            )
 
     async def insert_execution_edge_with_conn(
         self,
         conn: Any,
         *,
+        ctx: CGContext,
+        source: MessageSource,
         edge_id: str,
-        project_id: str,
-        channel_id: Optional[str],
         primitive: str,
         edge_phase: str,
-        source_agent_id: Optional[str],
-        source_agent_turn_id: Optional[str],
-        source_step_id: Optional[str],
-        target_agent_id: Optional[str],
-        target_agent_turn_id: Optional[str],
-        correlation_id: Optional[str],
-        enqueue_mode: Optional[str],
-        recursion_depth: Optional[int],
-        trace_id: Optional[str],
-        parent_step_id: Optional[str],
+        correlation_id: Optional[str] = None,
+        enqueue_mode: Optional[str] = None,
         metadata: Dict[str, Any],
-    ) -> None:
-        record = ExecutionEdgeInsert(
-            edge_id=edge_id,
-            project_id=project_id,
-            channel_id=channel_id,
-            primitive=primitive,
-            edge_phase=edge_phase,
-            source_agent_id=source_agent_id,
-            source_agent_turn_id=source_agent_turn_id,
-            source_step_id=source_step_id,
-            target_agent_id=target_agent_id,
-            target_agent_turn_id=target_agent_turn_id,
-            correlation_id=correlation_id,
-            enqueue_mode=enqueue_mode,
-            recursion_depth=recursion_depth,
-            trace_id=trace_id,
-            parent_step_id=parent_step_id,
-            metadata=metadata,
-        )
-        await self._insert_execution_edge_with_conn(conn, record)
-
-    async def _insert_execution_edge_with_conn(self, conn: Any, record: ExecutionEdgeInsert) -> None:
+    ) -> bool:
+        merged_metadata = dict(metadata or {})
+        merged_metadata.setdefault("cg_ctx", ctx.to_sys_dict())
         sql = """
             INSERT INTO state.execution_edges (
                 edge_id, project_id, channel_id, primitive, edge_phase,
@@ -252,74 +209,160 @@ class ExecutionStore(BaseStore):
             )
             ON CONFLICT (project_id, md5(correlation_id), primitive, edge_phase) DO NOTHING
         """
-        await conn.execute(
+        res = await conn.execute(
             sql,
             (
-                record.edge_id,
-                record.project_id,
-                record.channel_id,
-                record.primitive,
-                record.edge_phase,
-                record.source_agent_id,
-                record.source_agent_turn_id,
-                record.source_step_id,
-                record.target_agent_id,
-                record.target_agent_turn_id,
-                record.correlation_id,
-                record.enqueue_mode,
-                int(record.recursion_depth) if record.recursion_depth is not None else None,
-                record.trace_id,
-                record.parent_step_id,
-                json.dumps(record.metadata or {}),
+                edge_id,
+                ctx.project_id,
+                ctx.channel_id or None,
+                primitive,
+                edge_phase,
+                source.agent_id,
+                source.agent_turn_id,
+                source.step_id,
+                ctx.agent_id or None,
+                ctx.agent_turn_id or None,
+                correlation_id,
+                enqueue_mode,
+                int(ctx.recursion_depth) if ctx.recursion_depth is not None else None,
+                ctx.trace_id,
+                ctx.parent_step_id,
+                json.dumps(merged_metadata or {}),
             ),
         )
+        return bool(getattr(res, "rowcount", 0))
 
     async def enqueue_transactional(
         self,
         *,
-        inbox: InboxInsert,
-        edge: ExecutionEdgeInsert,
-    ) -> None:
+        ctx: CGContext,
+        source: MessageSource,
+        inbox_id: str,
+        message_type: str,
+        enqueue_mode: Optional[str],
+        correlation_id: Optional[str],
+        payload: Dict[str, Any],
+        edge_id: str,
+        primitive: str,
+        edge_phase: str,
+        metadata: Dict[str, Any],
+        inbox_status: str = "pending",
+    ) -> bool:
         async with self.pool.connection() as conn:
             async with conn.transaction():
-                await self._insert_inbox_with_conn(conn, inbox)
-                await self._insert_execution_edge_with_conn(conn, edge)
+                return await self.enqueue_with_conn(
+                    conn,
+                    ctx=ctx,
+                    source=source,
+                    inbox_id=inbox_id,
+                    message_type=message_type,
+                    enqueue_mode=enqueue_mode,
+                    correlation_id=correlation_id,
+                    payload=payload,
+                    edge_id=edge_id,
+                    primitive=primitive,
+                    edge_phase=edge_phase,
+                    metadata=metadata,
+                    inbox_status=inbox_status,
+                )
 
     async def enqueue_with_conn(
         self,
         conn: Any,
         *,
-        inbox: InboxInsert,
-        edge: ExecutionEdgeInsert,
-    ) -> None:
-        await self._insert_inbox_with_conn(conn, inbox)
-        await self._insert_execution_edge_with_conn(conn, edge)
+        ctx: CGContext,
+        source: MessageSource,
+        inbox_id: str,
+        message_type: str,
+        enqueue_mode: Optional[str],
+        correlation_id: Optional[str],
+        payload: Dict[str, Any],
+        edge_id: str,
+        primitive: str,
+        edge_phase: str,
+        metadata: Dict[str, Any],
+        inbox_status: str = "pending",
+    ) -> bool:
+        inserted = await self.insert_inbox_with_conn(
+            conn,
+            ctx=ctx,
+            inbox_id=inbox_id,
+            message_type=message_type,
+            enqueue_mode=enqueue_mode,
+            correlation_id=correlation_id,
+            payload=payload,
+            status=inbox_status,
+        )
+        if not inserted:
+            return False
+        await self.insert_execution_edge_with_conn(
+            conn,
+            ctx=ctx,
+            source=source,
+            edge_id=edge_id,
+            primitive=primitive,
+            edge_phase=edge_phase,
+            correlation_id=correlation_id,
+            enqueue_mode=enqueue_mode,
+            metadata=metadata,
+        )
+        return True
 
     async def list_pending_inbox(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
         sql = """
-            SELECT inbox_id, project_id, agent_id, message_type, enqueue_mode,
-                   correlation_id, recursion_depth, traceparent, tracestate, trace_id,
-                   parent_step_id, source_agent_id, source_step_id, payload, status,
+            SELECT inbox_id, project_id, agent_id, channel_id, message_type, enqueue_mode,
+                   correlation_id, agent_turn_id, turn_epoch, context_headers,
+                   payload, status, retry_count, next_retry_at, last_error, defer_reason,
                    created_at, processed_at, archived_at
             FROM state.agent_inbox
-            WHERE project_id=%s AND agent_id=%s AND status='pending'
-            ORDER BY created_at ASC
+            WHERE project_id=%s
+              AND agent_id=%s
+              AND status IN ('pending', 'deferred')
+              AND next_retry_at <= NOW()
+            ORDER BY next_retry_at ASC, created_at ASC
             LIMIT %s
         """
-        rows = await self.fetch_all(sql, (project_id, agent_id, int(limit)))
+        rows = await self.fetch_all(sql, (ctx.project_id, ctx.agent_id, int(limit)))
+        return [dict(row) for row in rows]
+
+    async def list_due_deferred_inbox_targets(
+        self,
+        *,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        sql = """
+            WITH due AS (
+                SELECT project_id,
+                       agent_id,
+                       channel_id,
+                       next_retry_at,
+                       created_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY project_id, agent_id
+                           ORDER BY next_retry_at ASC, created_at ASC
+                       ) AS rn
+                FROM state.agent_inbox
+                WHERE status='deferred'
+                  AND next_retry_at <= NOW()
+            )
+            SELECT project_id, agent_id, channel_id, next_retry_at, created_at
+            FROM due
+            WHERE rn=1
+            ORDER BY next_retry_at ASC, created_at ASC
+            LIMIT %s
+        """
+        rows = await self.fetch_all(sql, (int(limit),))
         return [dict(row) for row in rows]
 
     async def has_open_inbox(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         exclude_inbox_id: Optional[str] = None,
     ) -> bool:
         sql = """
@@ -327,15 +370,15 @@ class ExecutionStore(BaseStore):
             FROM state.agent_inbox
             WHERE project_id=%s
               AND agent_id=%s
-              AND status IN ('pending', 'processing')
+              AND status IN ('pending', 'deferred', 'processing')
               AND (COALESCE(%s::text, '') = '' OR inbox_id <> %s::text)
             LIMIT 1
         """
         row = await self.fetch_one(
             sql,
             (
-                project_id,
-                agent_id,
+                ctx.project_id,
+                ctx.agent_id,
                 exclude_inbox_id,
                 exclude_inbox_id,
             ),
@@ -345,50 +388,72 @@ class ExecutionStore(BaseStore):
     async def claim_pending_inbox(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
         sql = """
             WITH candidates AS (
                 SELECT inbox_id
                 FROM state.agent_inbox
-                WHERE project_id=%s AND agent_id=%s AND status='pending'
-                ORDER BY created_at ASC
+                WHERE project_id=%s
+                  AND agent_id=%s
+                  AND status IN ('pending', 'deferred')
+                  AND next_retry_at <= NOW()
+                ORDER BY next_retry_at ASC, created_at ASC
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE state.agent_inbox
             SET status='processing',
                 processed_at=COALESCE(processed_at, NOW())
-            WHERE inbox_id IN (SELECT inbox_id FROM candidates)
-            RETURNING inbox_id, project_id, agent_id, message_type, enqueue_mode,
-                      correlation_id, recursion_depth, traceparent, tracestate, trace_id,
-                      parent_step_id, source_agent_id, source_step_id, payload, status,
+            WHERE project_id=%s
+              AND inbox_id IN (SELECT inbox_id FROM candidates)
+            RETURNING inbox_id, project_id, agent_id, channel_id, message_type, enqueue_mode,
+                      correlation_id, agent_turn_id, turn_epoch, context_headers,
+                      payload, status, retry_count, next_retry_at, last_error, defer_reason,
                       created_at, processed_at, archived_at
         """
-        rows = await self.fetch_all(sql, (project_id, agent_id, int(limit)))
+        rows = await self.fetch_all(sql, (ctx.project_id, ctx.agent_id, int(limit), ctx.project_id))
         return [dict(row) for row in rows]
 
     async def list_inbox_by_correlation(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         correlation_id: str,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
         sql = """
-            SELECT inbox_id, project_id, agent_id, message_type, enqueue_mode,
-                   correlation_id, recursion_depth, traceparent, tracestate, trace_id,
-                   parent_step_id, source_agent_id, source_step_id, payload, status,
+            SELECT inbox_id, project_id, agent_id, channel_id, message_type, enqueue_mode,
+                   correlation_id, agent_turn_id, turn_epoch, context_headers,
+                   payload, status, retry_count, next_retry_at, last_error, defer_reason,
                    created_at, processed_at, archived_at
             FROM state.agent_inbox
             WHERE project_id=%s AND agent_id=%s AND correlation_id=%s
             ORDER BY created_at DESC
             LIMIT %s
         """
-        rows = await self.fetch_all(sql, (project_id, agent_id, correlation_id, int(limit)))
+        rows = await self.fetch_all(sql, (ctx.project_id, ctx.agent_id, correlation_id, int(limit)))
+        return [dict(row) for row in rows]
+
+    async def list_inbox_by_agent_turn_id(
+        self,
+        *,
+        ctx: CGContext,
+        agent_turn_id: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        sql = """
+            SELECT inbox_id, project_id, agent_id, channel_id, message_type, enqueue_mode,
+                   correlation_id, agent_turn_id, turn_epoch, context_headers,
+                   payload, status, retry_count, next_retry_at, last_error, defer_reason,
+                   created_at, processed_at, archived_at
+            FROM state.agent_inbox
+            WHERE project_id=%s AND agent_id=%s AND agent_turn_id=%s
+            ORDER BY created_at DESC
+            LIMIT %s
+        """
+        rows = await self.fetch_all(sql, (ctx.project_id, ctx.agent_id, agent_turn_id, int(limit)))
         return [dict(row) for row in rows]
 
     async def get_request_recursion_depth(
@@ -430,29 +495,26 @@ class ExecutionStore(BaseStore):
     async def get_active_recursion_depth(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
     ) -> Optional[int]:
         async with self.pool.connection() as conn:
             return await self.get_active_recursion_depth_with_conn(
                 conn,
-                project_id=project_id,
-                agent_id=agent_id,
+                ctx=ctx,
             )
 
     async def get_active_recursion_depth_with_conn(
         self,
         conn: Any,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
     ) -> Optional[int]:
         sql = """
             SELECT active_recursion_depth
             FROM state.agent_state_head
             WHERE project_id=%s AND agent_id=%s
         """
-        row = await self.fetch_one(sql, (project_id, agent_id), conn=conn)
+        row = await self.fetch_one(sql, (ctx.project_id, ctx.agent_id), conn=conn)
         if not row:
             return None
         depth = row.get("active_recursion_depth")
@@ -461,29 +523,31 @@ class ExecutionStore(BaseStore):
     async def list_pending_inbox_by_correlation(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         correlation_id: str,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
         sql = """
-            SELECT inbox_id, project_id, agent_id, message_type, enqueue_mode,
-                   correlation_id, recursion_depth, traceparent, tracestate, trace_id,
-                   parent_step_id, source_agent_id, source_step_id, payload, status,
+            SELECT inbox_id, project_id, agent_id, channel_id, message_type, enqueue_mode,
+                   correlation_id, agent_turn_id, turn_epoch, context_headers,
+                   payload, status, retry_count, next_retry_at, last_error, defer_reason,
                    created_at, processed_at, archived_at
             FROM state.agent_inbox
-            WHERE project_id=%s AND agent_id=%s AND correlation_id=%s AND status='pending'
-            ORDER BY created_at ASC
+            WHERE project_id=%s
+              AND agent_id=%s
+              AND correlation_id=%s
+              AND status IN ('pending', 'deferred')
+              AND next_retry_at <= NOW()
+            ORDER BY next_retry_at ASC, created_at ASC
             LIMIT %s
         """
-        rows = await self.fetch_all(sql, (project_id, agent_id, correlation_id, int(limit)))
+        rows = await self.fetch_all(sql, (ctx.project_id, ctx.agent_id, correlation_id, int(limit)))
         return [dict(row) for row in rows]
 
     async def claim_pending_inbox_by_correlation(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         correlation_id: str,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
@@ -491,21 +555,29 @@ class ExecutionStore(BaseStore):
             WITH candidates AS (
                 SELECT inbox_id
                 FROM state.agent_inbox
-                WHERE project_id=%s AND agent_id=%s AND correlation_id=%s AND status='pending'
-                ORDER BY created_at ASC
+                WHERE project_id=%s
+                  AND agent_id=%s
+                  AND correlation_id=%s
+                  AND status IN ('pending', 'deferred')
+                  AND next_retry_at <= NOW()
+                ORDER BY next_retry_at ASC, created_at ASC
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE state.agent_inbox
             SET status='processing',
                 processed_at=COALESCE(processed_at, NOW())
-            WHERE inbox_id IN (SELECT inbox_id FROM candidates)
-            RETURNING inbox_id, project_id, agent_id, message_type, enqueue_mode,
-                      correlation_id, recursion_depth, traceparent, tracestate, trace_id,
-                      parent_step_id, source_agent_id, source_step_id, payload, status,
+            WHERE project_id=%s
+              AND inbox_id IN (SELECT inbox_id FROM candidates)
+            RETURNING inbox_id, project_id, agent_id, channel_id, message_type, enqueue_mode,
+                      correlation_id, agent_turn_id, turn_epoch, context_headers,
+                      payload, status, retry_count, next_retry_at, last_error, defer_reason,
                       created_at, processed_at, archived_at
         """
-        rows = await self.fetch_all(sql, (project_id, agent_id, correlation_id, int(limit)))
+        rows = await self.fetch_all(
+            sql,
+            (ctx.project_id, ctx.agent_id, correlation_id, int(limit), ctx.project_id),
+        )
         return [dict(row) for row in rows]
 
     async def update_inbox_status(
@@ -523,6 +595,9 @@ class ExecutionStore(BaseStore):
             clauses.append("archived_at=NULL")
         if status == "processing":
             clauses.append("processed_at=COALESCE(processed_at, NOW())")
+        if status == "deferred":
+            clauses.append("processed_at=NULL")
+            clauses.append("archived_at=NULL")
         if status in ("consumed", "error", "skipped"):
             clauses.append("archived_at=COALESCE(archived_at, NOW())")
         sql = f"""
@@ -531,6 +606,43 @@ class ExecutionStore(BaseStore):
             WHERE project_id=%s AND inbox_id=%s
         """
         params.extend([project_id, inbox_id])
+        if expected_status is not None:
+            sql += " AND status=%s"
+            params.append(expected_status)
+        async with self.pool.connection() as conn:
+            res = await conn.execute(sql, tuple(params))
+            return res.rowcount == 1
+
+    async def defer_inbox_with_backoff(
+        self,
+        *,
+        inbox_id: str,
+        project_id: str,
+        delay_seconds: float,
+        reason: Optional[str] = None,
+        last_error: Optional[str] = None,
+        expected_status: Optional[str] = "processing",
+    ) -> bool:
+        next_retry = datetime.now(UTC) + timedelta(seconds=max(0.0, float(delay_seconds)))
+        sql = """
+            UPDATE state.agent_inbox
+            SET status='deferred',
+                retry_count=COALESCE(retry_count, 0) + 1,
+                next_retry_at=%s,
+                defer_reason=%s,
+                last_error=%s,
+                processed_at=NULL,
+                archived_at=NULL
+            WHERE project_id=%s
+              AND inbox_id=%s
+        """
+        params: List[Any] = [
+            next_retry,
+            reason,
+            last_error,
+            project_id,
+            inbox_id,
+        ]
         if expected_status is not None:
             sql += " AND status=%s"
             params.append(expected_status)
@@ -578,8 +690,8 @@ class ExecutionStore(BaseStore):
             return []
         cutoff = datetime.now(UTC) - timedelta(seconds=float(older_than_seconds))
         sql = """
-            SELECT inbox_id, project_id, agent_id, message_type, payload,
-                   recursion_depth, traceparent, tracestate, trace_id, created_at
+            SELECT inbox_id, project_id, agent_id, channel_id, message_type, payload,
+                   agent_turn_id, turn_epoch, context_headers, created_at
             FROM state.agent_inbox
             WHERE status='pending'
               AND created_at < %s

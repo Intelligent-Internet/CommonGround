@@ -40,7 +40,7 @@ from core.utp_protocol import ALLOWED_AFTER_EXECUTION_VALUES, extract_after_exec
 from infra.agent_routing import resolve_agent_target
 from infra.observability.otel import get_tracer, mark_span_error, traced
 from infra.service_runtime import ServiceBase
-from infra.tool_executor import ToolCallContext
+from infra.tool_executor import ToolCallEnvelope
 from services.tools.tool_runner import ToolPayloadValidation, ToolRunner, build_tool_idempotency
 
 set_loop_policy()
@@ -57,10 +57,6 @@ _JINA_SEARCH_BASE_URL = "https://s.jina.ai"
 _JINA_READER_BASE_URL = "https://r.jina.ai"
 _ALLOWED_JINA_HOSTS = {"s.jina.ai", "r.jina.ai"}
 _DEFAULT_JINA_AUTH_ENV = "JINA_API_KEY"
-
-
-def _subject_span_attrs(args: Dict[str, Any]) -> Dict[str, Any]:
-    return {"cg.subject": str(args.get("subject"))}
 
 
 def _safe_host(base_url: str) -> str:
@@ -101,7 +97,7 @@ class OpenAPIToolService(ServiceBase):
                 require_after_execution=True,
                 allowed_after_execution=ALLOWED_AFTER_EXECUTION_VALUES,
             ),
-            result_author_id=f"tool.openapi.{self.target_service}",
+            result_author_id="tool.openapi",
             logger=logger,
             service_name=f"OpenAPI[{self.target_service}]",
             require_tool_call_type=True,
@@ -145,38 +141,33 @@ class OpenAPIToolService(ServiceBase):
         logger.info("Service stopped.")
 
     @traced(_TRACER, "tool.execute_logic", span_arg="_span")
-    async def _execute_logic(self, ctx: ToolCallContext, _span: Any = None) -> Dict[str, Any]:
-        parts = ctx.parts
-        payload = ctx.payload
-        args = ctx.args
+    async def _execute_logic(self, envelope: ToolCallEnvelope, _span: Any = None) -> Dict[str, Any]:
+        cg_ctx = envelope.ctx
+        payload = envelope.payload
+        args = envelope.args
         span = _span
-        if span is not None:
-            span.set_attribute("cg.project_id", str(parts.project_id))
-
         tool_name = payload.tool_name or self.target_service
-        agent_turn_id = payload.agent_turn_id
-        tool_call_id = payload.tool_call_id
-        after_execution = payload.after_execution
+        tool_call_id = cg_ctx.tool_call_id or ""
+        after_execution = envelope.base_after_execution
 
-        logger.info("Received CMD: %s (turn=%s, call=%s)", tool_name, agent_turn_id, tool_call_id)
+        logger.info("Received CMD: %s (turn=%s, call=%s)", tool_name, cg_ctx.agent_turn_id, tool_call_id)
 
         target = await resolve_agent_target(
             resource_store=self.resource_store,
-            project_id=parts.project_id,
-            agent_id=str(payload.agent_id),
+            ctx=cg_ctx,
         )
         if not target:
             raise ProtocolViolationError(
                 "missing worker_target for agent",
                 detail={
-                    "project_id": parts.project_id,
-                    "agent_id": str(payload.agent_id),
-                    "tool_call_id": str(tool_call_id),
+                    "project_id": cg_ctx.project_id,
+                    "agent_id": cg_ctx.agent_id,
+                    "tool_call_id": tool_call_id,
                 },
             )
 
         tool_def = await self.resource_store.fetch_tool_definition(
-            project_id=parts.project_id,
+            project_id=cg_ctx.project_id,
             tool_name=str(tool_name),
         )
         if not tool_def:
@@ -190,7 +181,7 @@ class OpenAPIToolService(ServiceBase):
                     after_execution,
                     db_after_execution,
                 )
-            ctx.override_after_execution(str(db_after_execution))
+            envelope.override_after_execution(str(db_after_execution))
 
         tool_options = tool_def.get("options", {}) if isinstance(tool_def.get("options"), dict) else {}
         jina_config = tool_options.get("jina") if isinstance(tool_options.get("jina"), dict) else {}
@@ -241,9 +232,9 @@ class OpenAPIToolService(ServiceBase):
                 "AUDIT openapi __cg_control override tool=%s tool_call_id=%s caller=%s override=%s base=%s",
                 tool_name,
                 tool_call_id,
-                payload.agent_id,
+                cg_ctx.agent_id,
                 override_after_execution,
-                ctx.base_after_execution,
+                envelope.base_after_execution,
             )
 
         if isinstance(result, dict):
@@ -259,7 +250,6 @@ class OpenAPIToolService(ServiceBase):
         include_links=True,
         mark_error_on_exception=True,
         span_arg="_span",
-        attributes_getter=_subject_span_attrs,
     )
     async def _handle_cmd(
         self,
@@ -274,25 +264,16 @@ class OpenAPIToolService(ServiceBase):
             if not parts or parts.target != self.target_service:
                 return
 
-            async def _execute(ctx: ToolCallContext) -> Dict[str, Any]:
-                payload = ctx.payload
-                if span is not None:
-                    span.set_attribute("cg.project_id", str(ctx.parts.project_id))
-                    span.set_attribute("cg.channel_id", str(ctx.parts.channel_id))
-                    span.set_attribute("cg.tool_name", str(payload.tool_name or ""))
-                    span.set_attribute("cg.tool_call_id", str(payload.tool_call_id or ""))
-                    span.set_attribute("cg.agent_id", str(payload.agent_id or ""))
-                    span.set_attribute("cg.agent_turn_id", str(payload.agent_turn_id or ""))
-                    span.set_attribute("cg.after_execution", str(payload.after_execution or ""))
-                logger.info("Leader acquired lock tool_call_id=%s", payload.tool_call_id)
-                return await self._execute_logic(ctx)
+            async def _execute(envelope: ToolCallEnvelope) -> Dict[str, Any]:
+                _ = span
+                logger.info("Leader acquired lock tool_call_id=%s", envelope.ctx.tool_call_id)
+                return await self._execute_logic(envelope)
 
             await self.tool_runner.run(
                 subject=subject,
                 data=data,
                 headers=headers,
                 execute=_execute,
-                parts=parts,
                 tool_name_fallback=self.target_service,
                 source_agent_id="tool.openapi",
             )

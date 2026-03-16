@@ -7,6 +7,7 @@ description: "End-to-end principal: fork_join -> final report via submit_result.
 llm_config:
   model: "gemini/gemini-3-flash-preview"
   temperature: 1.0
+  reasoning_effort: "low"
   stream: true
   provider_options:
     custom_llm_provider: "gemini"

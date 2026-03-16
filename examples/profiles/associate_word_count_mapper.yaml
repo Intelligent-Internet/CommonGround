@@ -7,6 +7,7 @@ description: "Mapper for map-reduce word count demo using deterministic word_cou
 llm_config:
   model: "gemini/gemini-3-flash-preview"
   temperature: 1.0
+  reasoning_effort: "low"
   stream: false
   provider_options:
     custom_llm_provider: "gemini"

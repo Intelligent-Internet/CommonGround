@@ -5,7 +5,7 @@
 ## 1. 关键心智模型（P0）
 
 - **中心化存储 ≠ 默认可见**：Cards/Boxes 在项目内统一落库（CardBox/PG），但单个 turn 的 LLM 只会看到 `context_box_id` 和该 turn 的 `output_box_id`（Worker 会把 `output_box_id` 与 `context_box_id` 结果合并后供 LLM 使用）。PMO 不会自动把项目历史“全量水合”进上下文。
-- **`box_id` 不是安全边界（当前实现）**：系统层面仍未把 box 访问控制作为完整能力来强制；有读取权限的组件可通过 `box_id` 访问内容。
+- **`box_id` 不是完整安全边界**：系统层面仍未提供完整的 box-capability ACL；但 PMO 现在也不再把“box 存在”当成可继承的充分条件。内建流程只允许继承 source turn 已可见的 box，以及显式授权过的额外 box（例如 clone 来源 output）。
 - **跨 Agent 共享必须显式发生**：共享上下文通过“显式传递 box_id 并重新打包 context box”实现，不存在全局隐式拼接。
 
 ## 2. 当前实现组件与边界
@@ -44,7 +44,8 @@
 
 - 读取 `handover["context_packing_config"]["inherit_context"]["include_boxes_from_args"]` 指定的参数名列表。
 - 每个参数值可为单个 `box_id`（`str`/`int`）或列表。
-- 每个 box 会读取其 `card_ids`，按顺序追加到新 context，并使用 set 去重（保留首次顺序）。
+- 每个被继承的 box 还必须出现在 `handover["authorized_inherit_box_ids"]` 中，否则 packer 会直接拒绝。
+- 对于通过授权的 box，才会读取其 `card_ids`，按顺序追加到新 context，并使用 set 去重（保留首次顺序）。
 - box 不存在会 `NotFoundError`；参数类型异常会 `BadRequestError`。
 
 4) `include_parent`
@@ -64,7 +65,8 @@
   - 继承来源：
     - `context_box_id`（可选）；
     - 若 `target_strategy == "clone"`，还会继承克隆源当前 `output_box_id`；
-  - 使用 `validate_box_ids_exist` 校验所有来源 box 合法。
+  - `target_strategy == "reuse"` 的默认语义是“复用目标 agent 身份”；若目标已有 `output_box_id` 则沿用，否则在派发时新建，不把“已有 output 历史”作为首发前置条件。
+  - 使用 `validate_box_ids_exist` 校验所有来源 box 的存在性和最小授权范围；clone 来源 output 也必须显式授权。
   - 调用 `pack_context_with_instruction` 统一打包 context。
 - `fork_join`
   - 每个 task 可携带 `context_box_id`；
@@ -88,7 +90,7 @@
 
 ## 6. 可扩展性与注意事项
 
-- **扩展点在于 handler 与 handover 规则**：新增/修改 internal handler 可在自有流程中定义 custom handover，再调用 `pack_context` 组装。
+- **扩展点在于 handler 与 handover 规则**：新增/修改 internal handler 时，应在自有流程中定义 custom handover，并显式给出允许继承的 box 列表后再调用 `pack_context`。
 - 当前 `launch_principal` 并未手写 handover，其 context 通过 `delegate_async` 路径复用上述统一行为。
 - 输出侧仍由 Dispatcher/Worker 决定；PMO 侧不在此处写 `output_box_id`。
 
@@ -106,4 +108,3 @@
 - `docs/CN/01_getting_started/architecture_intro.md`（Box 可见性）
 - `docs/CN/04_protocol_l0/state_machine.md`（Dual-Box 约束）
 - `docs/CN/03_kernel_l1/agent_worker.md`（Worker 水合边界）
-

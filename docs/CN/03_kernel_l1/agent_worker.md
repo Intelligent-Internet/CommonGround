@@ -40,8 +40,8 @@
 3) Worker 进入处理时会将 `agent_turn` 置 `running`（状态变更与 CAS 保护），并按顺序水合：`state.agent_state_head` → `resource.*` → `profile_box_id/context_box_id/output_box_id`。
 4) **Greedy Batch**：从 `claim_pending_inbox` 拉取同一 Worker 对应 agent 的可执行 inbox，按时间顺序顺序处理。
 5) 若存在工具调用：写 `tool.call` 卡并发布 `cmd.tool.*` / `cmd.sys.pmo.internal.*`，记录步内 `tool_call_id`，并标记 `activity=executing_tool`（LLM step metadata）。
-6) 每个工具等待在 state 中写入 `turn_waiting_tools`，并设置 `resume_deadline`；`suspend_timeout` 由 worker 相关配置与工具侧 timeout 约束控制。当前实现未将 `expecting_correlation_id` 作为匹配条件持久化使用（常见路径为 `None`），而是通过 `tool_waiting + resume_ledger` 做恢复判定。
-7) `status=suspended` 时，wake/resume 不再依赖单一 correlation 过滤；watchdog 与 resume 路径会在可消费条件满足时重放 resume 记录并回写 inbox，随后继续运行。
+6) 每个工具等待在 state 中写入 `turn_waiting_tools`，并设置 `resume_deadline`；`suspend_timeout` 由 worker 相关配置与工具侧 timeout 约束控制。当前实现未将 `expecting_correlation_id` 作为匹配条件持久化使用（常见路径为 `None`），恢复判定统一基于 `turn_waiting_tools + state.agent_inbox(correlation=tool_call_id)`。
+7) `status=suspended` 时，wake/resume 不再依赖单一 correlation 过滤；watchdog 与 resume 路径会先对 `turn_waiting_tools(waiting/received)` 做 reconcile，再领取匹配的到期 inbox 项（`pending/deferred`）继续运行。
 8) 工具返回后、或无 tool call 的普通 LLM 回合，按 `next_step(is_continuation=True)` 逻辑在同一 `agent_turn_id/turn_epoch` 内继续下一个 step（同一 turn 的内部续航；`resume` 可能产生 epoch 重排）。
 9) 终态：写 `task.deliverable`，发布 `evt.agent.*.task`，清空 `active_agent_turn_id`，`status` 回到 `idle`。
 
@@ -82,9 +82,9 @@
 
 ## 8. 幂等与异常处理
 - 任何 `UPDATE state` 必须带 `turn_epoch + active_agent_turn_id`，0 行即停止副作用。
-- tool_result/tool callback 的去重与收敛由 `turn_waiting_tools` / `resume_ledger` 共同约束，关键键包括 agent、turn、epoch 与 tool_call 维度，避免重复投递导致的重复执行。
+- tool_result/tool callback 的去重与收敛由 `turn_waiting_tools` + `state.agent_inbox(correlation_id=tool_call_id)` 共同约束；waiting row 的 apply 采用单赢家语义，后续重复到达会收敛为幂等消费而非重复 append。
 - `status` 或 `turn` 不一致/卡片已过期时，resume 会重排为 drop/待重试并记录可观测信号，而不是盲目重复提交。
-- `Worker watchdog` 会重扫 `resume_ledger` 与等待表：在 resume 超时和重放条件下注入 `tool.result` timeout 报告，并驱动 wakeup 进入同一转交流程。
+- `Worker watchdog` 会重扫等待表并从 `state.agent_inbox` 领取到期项：在 resume 超时和重放条件下注入 `tool.result` timeout 报告，并驱动 wakeup 进入同一转交流程。
 - `error/parse` 失败会走失败兜底：例如 `task.result_fields` / tools schema 不合法或解析异常时，记录告警并继续可用降级路径，不等同于硬性协议拒绝（除非无法继续构建模型请求）。
 - Worker 崩溃由 PMO 回收；`watchdog` 与 `resume` 负责超时和回放，不应跨 agent 修改他人 state。
 

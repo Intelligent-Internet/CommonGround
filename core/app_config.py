@@ -19,7 +19,6 @@ from core.config_defaults import (
     DEFAULT_PMO_DISPATCHED_TIMEOUT_SECONDS,
     DEFAULT_PMO_MAX_CONCURRENCY,
     DEFAULT_PMO_PENDING_WAKEUP_SECONDS,
-    DEFAULT_PMO_PENDING_WAKEUP_SKIP_SECONDS,
     DEFAULT_PMO_FORK_JOIN_DEFAULT_DEADLINE_SECONDS,
     DEFAULT_PMO_QUEUE_MAXSIZE,
     DEFAULT_PMO_WATCHDOG_INTERVAL_SECONDS,
@@ -32,6 +31,7 @@ from core.config_defaults import (
     DEFAULT_WORKER_INBOX_FETCH_LIMIT,
     DEFAULT_WORKER_INBOX_PROCESSING_TIMEOUT_SECONDS,
     DEFAULT_WORKER_MAX_CONCURRENCY,
+    DEFAULT_WORKER_MAX_RESUME_DEFER_RETRIES,
     DEFAULT_WORKER_MAX_RECURSION_DEPTH,
     DEFAULT_WORKER_MAX_STEPS,
     DEFAULT_WORKER_TARGETS,
@@ -89,6 +89,7 @@ class WorkerConfig(BaseModel):
     inbox_fetch_limit: int = DEFAULT_WORKER_INBOX_FETCH_LIMIT
     watchdog_interval_seconds: float = DEFAULT_WORKER_WATCHDOG_INTERVAL_SECONDS
     inbox_processing_timeout_seconds: float = DEFAULT_WORKER_INBOX_PROCESSING_TIMEOUT_SECONDS
+    max_resume_defer_retries: int = DEFAULT_WORKER_MAX_RESUME_DEFER_RETRIES
     worker_targets: list[str] = Field(default_factory=lambda: list(DEFAULT_WORKER_TARGETS))
 
 
@@ -101,7 +102,6 @@ class PmoConfig(BaseModel):
     dispatched_timeout_seconds: float = DEFAULT_PMO_DISPATCHED_TIMEOUT_SECONDS
     active_reap_seconds: float = DEFAULT_PMO_ACTIVE_REAP_SECONDS
     pending_wakeup_seconds: float = DEFAULT_PMO_PENDING_WAKEUP_SECONDS
-    pending_wakeup_skip_seconds: float = DEFAULT_PMO_PENDING_WAKEUP_SKIP_SECONDS
     fork_join_default_deadline_seconds: float = DEFAULT_PMO_FORK_JOIN_DEFAULT_DEADLINE_SECONDS
 
 

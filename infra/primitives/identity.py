@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List
 
+from core.cg_context import CGContext
 from core.errors import ProtocolViolationError
 from core.utils import safe_str
 from core.trace import normalize_trace_id, parse_traceparent
@@ -35,23 +36,19 @@ async def provision_identity(
     *,
     identity_store: IdentityStore,
     resource_store: ResourceStore,
-    project_id: str,
-    channel_id: Optional[str],
+    target_ctx: CGContext,
     action: str,
-    target_agent_id: str,
     profile_box_id: str,
     worker_target: str,
     tags: List[str],
     display_name: Optional[str],
     owner_agent_id: Optional[str],
     metadata: Dict[str, Any],
-    source_agent_id: Optional[str] = None,
-    parent_step_id: Optional[str] = None,
-    trace_id: Optional[str] = None,
     traceparent: Optional[str] = None,
 ) -> ProvisionIdentityResult:
-    if not project_id:
+    if not target_ctx.project_id:
         raise ProtocolViolationError("missing project_id")
+    target_agent_id = target_ctx.agent_id
     if not target_agent_id:
         raise ProtocolViolationError("missing target_agent_id")
     if not action:
@@ -61,17 +58,17 @@ async def provision_identity(
     if not worker_target:
         raise ProtocolViolationError("missing worker_target")
 
-    trace_id = _resolve_trace_id(trace_id, traceparent)
+    trace_id = _resolve_trace_id(target_ctx.trace_id, traceparent)
+    write_ctx = target_ctx.with_restored_state(trace_id=trace_id)
 
     roster_meta = dict(metadata or {})
-    profile_row = await resource_store.fetch_profile(project_id, profile_box_id)
+    profile_row = await resource_store.fetch_profile(target_ctx.project_id, profile_box_id)
     profile_name_value = safe_str((profile_row or {}).get("name"))
     if profile_name_value:
         roster_meta["profile_name"] = profile_name_value
 
     await resource_store.upsert_project_agent(
-        project_id=project_id,
-        agent_id=target_agent_id,
+        ctx=target_ctx,
         profile_box_id=profile_box_id,
         worker_target=worker_target,
         tags=tags,
@@ -81,13 +78,8 @@ async def provision_identity(
     )
 
     edge_id = await identity_store.insert_identity_edge(
-        project_id=project_id,
-        channel_id=channel_id,
+        ctx=write_ctx,
         action=action,
-        source_agent_id=source_agent_id,
-        target_agent_id=target_agent_id,
-        trace_id=trace_id,
-        parent_step_id=parent_step_id,
         metadata={
             "profile_box_id": profile_box_id,
             "worker_target": worker_target,

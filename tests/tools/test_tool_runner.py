@@ -4,12 +4,15 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import pytest
-from pydantic import ValidationError
 
-from infra.tool_executor import ToolCallContext
+from core.config import PROTOCOL_VERSION
+from core.errors import BadRequestError
+from infra.tool_executor import ToolCallEnvelope
 from infra.idempotency import IdempotencyOutcome
 from services.tools.tool_runner import ToolPayloadValidation, ToolRunner
 from core.utp_protocol import ToolCallContent
+
+_TEST_SUBJECT = f"cg.{PROTOCOL_VERSION}.proj_1.public.cmd.tool.demo.execute"
 
 
 @dataclass
@@ -76,6 +79,8 @@ class _DummyExecutionStore:
     async def insert_execution_edge(self, **kwargs: Any) -> None:
         self.inserted_edges.append(dict(kwargs))
         depth = kwargs.get("recursion_depth")
+        if depth is None and kwargs.get("ctx") is not None:
+            depth = getattr(kwargs.get("ctx"), "recursion_depth", None)
         if depth is not None:
             self.request_depth = int(depth)
 
@@ -108,13 +113,18 @@ class _IdempTimeout:
 
 def _valid_data() -> Dict[str, Any]:
     return {
-        "tool_call_id": "call_1",
-        "agent_turn_id": "turn_1",
-        "turn_epoch": 1,
-        "agent_id": "agent_1",
         "tool_name": "demo",
         "tool_call_card_id": "tc_1",
         "after_execution": "suspend",
+    }
+
+
+def _ctx_headers() -> Dict[str, str]:
+    return {
+        "CG-Agent-Id": "agent_1",
+        "CG-Turn-Id": "turn_1",
+        "CG-Turn-Epoch": "1",
+        "CG-Tool-Call-Id": "call_1",
     }
 
 
@@ -137,13 +147,13 @@ async def test_tool_runner_validation_failure_publishes_failed_result() -> None:
     data = _valid_data()
     data.pop("after_execution")
 
-    async def _execute(_: ToolCallContext):
+    async def _execute(_: ToolCallEnvelope):
         raise AssertionError("execute should not run on validation failure")
 
     result = await runner.run(
-        subject="cg.v1r3.proj_1.public.cmd.tool.demo.execute",
+        subject=_TEST_SUBJECT,
         data=data,
-        headers={},
+        headers=_ctx_headers(),
         execute=_execute,
     )
 
@@ -152,7 +162,8 @@ async def test_tool_runner_validation_failure_publishes_failed_result() -> None:
     assert len(publish_capture.calls) == 1
     published = publish_capture.calls[0]["payload"]
     assert published["status"] == "failed"
-    assert published["tool_call_id"] == "call_1"
+    assert published["tool_result_card_id"]
+    assert "tool_call_id" not in published
 
 
 @pytest.mark.asyncio
@@ -172,24 +183,68 @@ async def test_tool_runner_validation_failure_without_min_fields_raises() -> Non
     )
 
     bad_data = {
-        "agent_turn_id": "turn_1",
-        "turn_epoch": 1,
-        "agent_id": "agent_1",
+        "tool_name": "demo",
     }
 
-    async def _execute(_: ToolCallContext):
+    async def _execute(_: ToolCallEnvelope):
         raise AssertionError("execute should not run on validation failure")
 
-    with pytest.raises(ValidationError):
+    headers_without_call_id = dict(_ctx_headers())
+    headers_without_call_id.pop("CG-Tool-Call-Id", None)
+
+    with pytest.raises(BadRequestError):
         await runner.run(
-            subject="cg.v1r3.proj_1.public.cmd.tool.demo.execute",
+            subject=_TEST_SUBJECT,
             data=bad_data,
-            headers={},
+            headers=headers_without_call_id,
             execute=_execute,
         )
 
     assert cardbox.saved_cards == []
     assert publish_capture.calls == []
+
+
+@pytest.mark.asyncio
+async def test_tool_runner_protocol_violation_recovers_tool_call_id_from_card_not_payload() -> None:
+    publish_capture = _CapturePublisher()
+    cardbox = _DummyCardBox(saved_cards=[], cards={})
+    runner = ToolRunner(
+        target="demo",
+        source_agent_id="tool.demo",
+        nats=_DummyNats(),
+        cardbox=cardbox,
+        execution_store=_DummyExecutionStore(),
+        idempotent_executor=_IdempLeader(),
+        payload_validation=ToolPayloadValidation(require_after_execution=True),
+        result_author_id="tool.demo",
+        publish_result=publish_capture,
+    )
+
+    async def _execute(_: ToolCallEnvelope):
+        raise AssertionError("execute should not run on protocol violation")
+
+    headers_without_call_id = dict(_ctx_headers())
+    headers_without_call_id.pop("CG-Tool-Call-Id", None)
+
+    result = await runner.run(
+        subject=_TEST_SUBJECT,
+        data={
+            "tool_name": "demo",
+            "tool_call_card_id": "tc_1",
+            "tool_call_id": "call_from_payload",
+            "after_execution": "suspend",
+        },
+        headers=headers_without_call_id,
+        execute=_execute,
+    )
+
+    assert result.handled is True
+    assert len(cardbox.saved_cards) == 1
+    assert len(publish_capture.calls) == 1
+    published_call = publish_capture.calls[0]
+    assert cardbox.saved_cards[0].metadata["tool_call_id"] == "call_1"
+    assert published_call["payload"]["status"] == "failed"
+    assert "tool_call_id" not in published_call["payload"]
 
 
 @pytest.mark.asyncio
@@ -206,14 +261,14 @@ async def test_tool_runner_execute_timeout_is_raised() -> None:
         publish_result=_CapturePublisher(),
     )
 
-    async def _execute(_: ToolCallContext):
+    async def _execute(_: ToolCallEnvelope):
         return {"ok": True}, {"card": "ignored"}
 
     with pytest.raises(TimeoutError):
         await runner.run(
-            subject="cg.v1r3.proj_1.public.cmd.tool.demo.execute",
+            subject=_TEST_SUBJECT,
             data=_valid_data(),
-            headers={},
+            headers=_ctx_headers(),
             execute=_execute,
         )
 
@@ -235,24 +290,19 @@ async def test_tool_runner_success_saves_card_and_publishes() -> None:
     )
 
     expected_payload = {
-        "tool_call_id": "call_1",
-        "agent_turn_id": "turn_1",
-        "turn_epoch": 1,
         "after_execution": "suspend",
         "status": "success",
         "tool_result_card_id": "card_1",
-        "agent_id": "agent_1",
-        "step_id": "step_1",
     }
     expected_card = {"card_id": "card_1"}
 
-    async def _execute(_: ToolCallContext):
+    async def _execute(_: ToolCallEnvelope):
         return expected_payload, expected_card
 
     result = await runner.run(
-        subject="cg.v1r3.proj_1.public.cmd.tool.demo.execute",
+        subject=_TEST_SUBJECT,
         data=_valid_data(),
-        headers={},
+        headers=_ctx_headers(),
         execute=_execute,
     )
 
@@ -265,7 +315,7 @@ async def test_tool_runner_success_saves_card_and_publishes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_runner_backfills_missing_request_edge_before_publish() -> None:
+async def test_tool_runner_does_not_backfill_request_edge_before_publish() -> None:
     publish_capture = _CapturePublisher()
     cardbox = _DummyCardBox(saved_cards=[], cards={})
     execution_store = _DummyExecutionStore(request_depth=None)
@@ -282,30 +332,20 @@ async def test_tool_runner_backfills_missing_request_edge_before_publish() -> No
     )
 
     payload = {
-        "tool_call_id": "call_1",
-        "agent_turn_id": "turn_1",
-        "turn_epoch": 1,
         "after_execution": "suspend",
         "status": "success",
         "tool_result_card_id": "card_1",
-        "agent_id": "agent_1",
-        "step_id": "step_1",
     }
 
-    async def _execute(_: ToolCallContext):
+    async def _execute(_: ToolCallEnvelope):
         return payload, {"card_id": "card_1"}
 
     result = await runner.run(
-        subject="cg.v1r3.proj_1.public.cmd.tool.demo.execute",
+        subject=_TEST_SUBJECT,
         data=_valid_data(),
-        headers={"CG-Recursion-Depth": "3"},
+        headers={**_ctx_headers(), "CG-Recursion-Depth": "3"},
         execute=_execute,
     )
 
     assert result.handled is True
-    assert len(execution_store.inserted_edges) == 1
-    edge = execution_store.inserted_edges[0]
-    assert edge["primitive"] == "tool_call"
-    assert edge["edge_phase"] == "request"
-    assert edge["correlation_id"] == "call_1"
-    assert edge["recursion_depth"] == 3
+    assert execution_store.inserted_edges == []

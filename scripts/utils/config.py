@@ -4,18 +4,17 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-import toml
-
+from core.app_config import config_to_dict, load_app_config
 from core.utils import REPO_ROOT
 
 DEFAULT_CARDBOX_DSN = "postgresql://postgres:postgres@localhost:5433/cardbox"
 
 
 def load_toml_config(path: Optional[Path] = None) -> Dict[str, Any]:
-    cfg_path = path or (REPO_ROOT / "config.toml")
+    cfg_path = path or Path(os.environ.get("CG_CONFIG_TOML") or (REPO_ROOT / "config.toml"))
     if not cfg_path.exists():
         return {}
-    return toml.load(cfg_path)
+    return config_to_dict(load_app_config(path=cfg_path))
 
 
 def api_base_url(cfg: Dict[str, Any]) -> str:

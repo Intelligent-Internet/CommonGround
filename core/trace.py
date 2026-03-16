@@ -27,7 +27,7 @@ def normalize_trace_id(trace_id: str) -> str:
 
 def _generate_span_id() -> str:
     while True:
-        span_id = uuid6.uuid7().hex[:16].lower()
+        span_id = uuid6.uuid7().hex[-16:].lower()
         if span_id != "0" * 16:
             return span_id
 

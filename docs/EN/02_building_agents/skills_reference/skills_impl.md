@@ -123,8 +123,9 @@ sequenceDiagram
 
 ### Sandbox Reuse and Reclamation
 - By default, each call creates a new sandbox (`tools.e2b.reuse_mode=none`).
-- When reuse is enabled, sandboxes are reused by `project_id + agent_id` and dependencies/files are retained.
+- When reuse is enabled, the runtime derives an internal owner-scoped session key from `project_id + agent_id + session_id(alias)` and reuses by that key; the same alias used by different agents does not collide.
 - Expired sandboxes are cleaned regularly by the reaper service.
+- The public `session_id` in tool arguments/results remains a caller-visible alias. It is not the raw sandbox identity.
 - **Self-hosted E2B compatibility:** `Sandbox.connect` is used first. If `/connect` is missing (404), fallback logic is applied:
   - call `get_info`, and if `state=paused` then invoke `/sandboxes/{id}/resume`
   - call `get_info` again, then build the client directly with `envdAccessToken + domain`
@@ -190,6 +191,7 @@ CREATE UNIQUE INDEX idx_agent_inbox_unique
 - `skills.run_cmd` is synchronous and returns stdout, stderr, exit code, and artifacts after command completion.
 - `skills.load` ensures skill contents are injected into the sandbox for the current session (local and remote behavior differ).
 - `skills.run_service` requires `session_id` for long-lived services; only available when `skills.mode=local`.
+- `session_id` should be treated as a stable alias chosen by the caller, not as a globally reusable sandbox id.
 
 - Example use of `skills.run_cmd` (short task):
   - skill files are injected into `skill/`

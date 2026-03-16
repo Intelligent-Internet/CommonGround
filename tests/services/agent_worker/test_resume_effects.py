@@ -12,12 +12,18 @@ from services.agent_worker.resume_effects import (
 
 
 class _DummyStateStore:
-    def __init__(self):
+    def __init__(self, *, claim_result: bool = True):
         self.update_calls = []
+        self.applied_calls = []
+        self.claim_result = bool(claim_result)
 
     async def update(self, **kwargs):
         self.update_calls.append(kwargs)
         return True
+
+    async def mark_turn_waiting_tool_applied(self, **kwargs):
+        self.applied_calls.append(kwargs)
+        return self.claim_result
 
 
 class _DummyCardBox:
@@ -54,21 +60,64 @@ class _DummyCardBox:
 async def test_ensure_output_box_and_append_tool_result_updates_state_on_box_change() -> None:
     cardbox = _DummyCardBox()
     state_store = _DummyStateStore()
-    output_box_id = await ensure_output_box_and_append_tool_result(
+    output_box_id, claimed = await ensure_output_box_and_append_tool_result(
         cardbox=cardbox,
         state_store=state_store,
-        project_id="proj_1",
-        agent_id="agent_1",
-        expect_turn_epoch=3,
-        expect_agent_turn_id="turn_1",
+        ctx=CGContext(
+            project_id="proj_1",
+            agent_id="agent_1",
+            agent_turn_id="turn_1",
+            turn_epoch=3,
+        ),
         expect_status="running",
         current_output_box_id="box_old",
         tool_result_card_id="tr_1",
+        waiting_ctx=CGContext(
+            project_id="proj_1",
+            agent_id="agent_1",
+            agent_turn_id="turn_1",
+            turn_epoch=3,
+            tool_call_id="call_1",
+        ),
     )
     assert output_box_id == "box_new"
+    assert claimed is True
     assert len(state_store.update_calls) == 1
+    assert len(state_store.applied_calls) == 1
     assert state_store.update_calls[0]["output_box_id"] == "box_new"
     assert cardbox.append_calls == [("box_new", ["tr_1"], "proj_1")]
+
+
+@pytest.mark.asyncio
+async def test_ensure_output_box_and_append_tool_result_skips_append_when_apply_claim_lost() -> None:
+    cardbox = _DummyCardBox()
+    state_store = _DummyStateStore(claim_result=False)
+
+    output_box_id, claimed = await ensure_output_box_and_append_tool_result(
+        cardbox=cardbox,
+        state_store=state_store,
+        ctx=CGContext(
+            project_id="proj_1",
+            agent_id="agent_1",
+            agent_turn_id="turn_1",
+            turn_epoch=3,
+        ),
+        expect_status="running",
+        current_output_box_id="box_old",
+        tool_result_card_id="tr_1",
+        waiting_ctx=CGContext(
+            project_id="proj_1",
+            agent_id="agent_1",
+            agent_turn_id="turn_1",
+            turn_epoch=3,
+            tool_call_id="call_1",
+        ),
+    )
+
+    assert output_box_id == "box_new"
+    assert claimed is False
+    assert len(state_store.applied_calls) == 1
+    assert cardbox.append_calls == []
 
 
 @pytest.mark.asyncio
@@ -101,13 +150,13 @@ async def test_ensure_terminated_deliverable_reuses_existing_card() -> None:
         agent_id="agent_1",
         agent_turn_id="turn_1",
         step_id="step_1",
+        tool_call_id="call_1",
     )
     output_box_id, deliverable_card_id, created_card_id = await ensure_terminated_deliverable(
         cardbox=cardbox,
         ctx=ctx,
         output_box_id="box_1",
         result_payload={"ok": True},
-        tool_call_id="call_1",
         resume_status="success",
         task_status="success",
     )
@@ -129,13 +178,13 @@ async def test_ensure_terminated_deliverable_creates_new_card_when_missing() -> 
         trace_id="trace_1",
         step_id="step_1",
         parent_step_id="parent_1",
+        tool_call_id="call_1",
     )
     output_box_id, deliverable_card_id, created_card_id = await ensure_terminated_deliverable(
         cardbox=cardbox,
         ctx=ctx,
         output_box_id="box_1",
         result_payload={"error": {"message": "boom"}},
-        tool_call_id="call_1",
         resume_status="failed",
         task_status=STATUS_FAILED,
     )

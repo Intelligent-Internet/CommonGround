@@ -2,6 +2,8 @@
 
 本页提供完整路径：环境准备 → 初始化 → 启动服务 → 资源准备 → 跑通 Demo。更多协议与实现细节见 L0/L1 文档。
 
+当前仓库默认目标是 `v1` 系列的最终 `V1R4` 发布版本。如果你是从旧的 `v1r3` 部署升级，建议先看 `../05_operations/` 里的 release note 和 migration guide。
+
 ## 兼容性说明
 
 - 项目当前对 Linux/macOS 路径语义支持更完整；若你使用 Windows，建议在 **WSL2** 或 **Docker** 下运行文档流程，以规避路径与进程检测兼容问题。
@@ -15,7 +17,7 @@
 > `git submodule update --init --recursive`
 
 ### 依赖
-- Python 3.12+（仓库主干基于 3.12）
+- Python 3.13+（仓库主干基于 3.13）
 - `uv`
 - Postgres（建议 15+）
 - NATS（2.10+，启用 JetStream）
@@ -61,9 +63,11 @@ cp config.toml.sample config.toml
 ```
 按需修改 `config.toml` 中的 `[protocol]`、`[nats]`、`[cardbox]`，并设置 DB DSN。
 
-> 重要：`[protocol].version` 必须是 `v1r3`（且与部署协议一致）。若缺失或写错，NATS subject 会不匹配，Worker/PMO 可能收不到消息。
+> 重要：`[protocol].version` 必须是 `v1r4`（且与部署协议一致）。若缺失或写错，NATS subject 会不匹配，Worker/PMO 可能收不到消息。
 
 > 端口提示：docker-compose 默认 NATS 4222、Postgres 5432；仓库示例 DSN 可能使用 5433，请以本地 `config.toml` 为准。
+
+> 本地覆盖提示：如果你的机器上 `4222` 已被占用，可以直接修改 `config.toml` 里的 `[nats].servers`，或者先导出 `NATS_SERVERS=nats://127.0.0.1:4223`（或其他本地端口）再启动服务和示例。
 
 ## 2. 初始化数据库
 
@@ -212,7 +216,7 @@ uv run -m examples.quickstarts.demo_ui_action \
 
 ### 6.1 订阅流式输出
 ```bash
-nats sub "cg.v1r3.proj_demo_01.public.str.agent.*.chunk"
+nats sub "cg.v1r4.proj_demo_01.public.str.agent.*.chunk"
 ```
 
 ### 6.2 Agent 调度观察（脚本）

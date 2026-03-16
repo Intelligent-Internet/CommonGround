@@ -2,17 +2,85 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from core.cg_context import CGContext
 from core.errors import ProtocolViolationError
 from core.utils import safe_str
 
 from infra.observability.otel import get_tracer, mark_span_error, traced
 
-from .base import InternalHandlerResult
-from .context import InternalHandlerContext
+from .base import InternalHandlerDeps, InternalHandlerResult
 from ..agent_lifecycle import CreateAgentSpec, DerivedAgentSpec, ensure_agent_ready
+from ..delegation_guard import assert_can_delegate_to_profile_name
 
 
 _TRACER = get_tracer("services.pmo.internal_handlers.provision_agent")
+
+
+async def _resolve_profile_name_from_box(
+    *,
+    deps: InternalHandlerDeps,
+    project_id: str,
+    profile_box_id: str,
+    conn: Any = None,
+) -> str | None:
+    if not safe_str(profile_box_id):
+        return None
+    profile = await deps.resource_store.fetch_profile(project_id, profile_box_id, conn=conn)
+    if not isinstance(profile, dict):
+        return None
+    name = safe_str(profile.get("name"))
+    return name or None
+
+
+async def _resolve_provision_target_profile_name(
+    *,
+    deps: InternalHandlerDeps,
+    ctx: CGContext,
+    action: str,
+    target_agent_id: str,
+    profile_name: str | None,
+    profile_box_id: str | None,
+    derived_from: str | None,
+    conn: Any = None,
+) -> str | None:
+    explicit_profile_name = safe_str(profile_name) or None
+    explicit_profile_box_id = safe_str(profile_box_id) or None
+    if explicit_profile_name:
+        return explicit_profile_name
+    if explicit_profile_box_id:
+        return await _resolve_profile_name_from_box(
+            deps=deps,
+            project_id=ctx.project_id,
+            profile_box_id=explicit_profile_box_id,
+            conn=conn,
+        )
+    if action == "derive" and derived_from:
+        source_roster = await deps.resource_store.fetch_roster(
+            ctx.evolve(agent_id=derived_from),
+            conn=conn,
+        )
+        source_profile_box_id = safe_str((source_roster or {}).get("profile_box_id"))
+        if source_profile_box_id:
+            return await _resolve_profile_name_from_box(
+                deps=deps,
+                project_id=ctx.project_id,
+                profile_box_id=source_profile_box_id,
+                conn=conn,
+            )
+        return None
+    roster = await deps.resource_store.fetch_roster(
+        ctx.evolve(agent_id=target_agent_id),
+        conn=conn,
+    )
+    roster_profile_box_id = safe_str((roster or {}).get("profile_box_id"))
+    if roster_profile_box_id:
+        return await _resolve_profile_name_from_box(
+            deps=deps,
+            project_id=ctx.project_id,
+            profile_box_id=roster_profile_box_id,
+            conn=conn,
+        )
+    return None
 
 
 class ProvisionAgentHandler:
@@ -22,13 +90,12 @@ class ProvisionAgentHandler:
     async def handle(
         self,
         *,
-        ctx: InternalHandlerContext,
+        deps: InternalHandlerDeps,
+        ctx: CGContext,
+        cmd: Any,
         parent_after_execution: str,
         _span: Any = None,
     ) -> InternalHandlerResult:
-        deps = ctx.deps
-        meta = ctx.meta
-        cmd = ctx.cmd
         _ = parent_after_execution
         if cmd.tool_name != self.name:
             raise ProtocolViolationError(
@@ -64,20 +131,38 @@ class ProvisionAgentHandler:
             return False, {"status": "rejected", "error_code": "invalid_metadata"}
         metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
 
+        target_profile_name = await _resolve_provision_target_profile_name(
+            deps=deps,
+            ctx=ctx,
+            action=action,
+            target_agent_id=agent_id,
+            profile_name=profile_name,
+            profile_box_id=profile_box_id,
+            derived_from=derived_from,
+        )
+        if target_profile_name:
+            try:
+                await assert_can_delegate_to_profile_name(
+                    deps=deps,
+                    ctx=ctx,
+                    target_profile_name=target_profile_name,
+                )
+            except Exception as exc:  # noqa: BLE001
+                error_code = safe_str(getattr(exc, "code", None)) or "delegation_denied"
+                return False, {"status": "rejected", "error_code": error_code}
+
         trace_id = ctx.trace_id
 
         span = _span
         if span is not None:
-            span.set_attribute("cg.project_id", str(meta.project_id))
-            span.set_attribute("cg.channel_id", str(meta.channel_id))
-            span.set_attribute("cg.action", str(action))
-            span.set_attribute("cg.target_agent_id", str(agent_id))
-            if cmd.source_agent_id:
-                span.set_attribute("cg.source_agent_id", str(cmd.source_agent_id))
-            if cmd.step_id:
-                span.set_attribute("cg.parent_step_id", str(cmd.step_id))
+            span.set_attribute("cg.action", action)
+            span.set_attribute("cg.target_agent_id", agent_id)
+            if ctx.agent_id:
+                span.set_attribute("cg.source_agent_id", ctx.agent_id)
+            if ctx.step_id:
+                span.set_attribute("cg.parent_step_id", ctx.step_id)
             if derived_from:
-                span.set_attribute("cg.derived_from", str(derived_from))
+                span.set_attribute("cg.derived_from", derived_from)
 
         if action == "derive":
             if not derived_from:
@@ -88,7 +173,7 @@ class ProvisionAgentHandler:
                 profile_box_id=profile_box_id,
                 metadata=metadata,
                 display_name=display_name,
-                active_channel_id=active_channel_id or meta.channel_id,
+                active_channel_id=active_channel_id or ctx.channel_id,
                 worker_target=worker_target,
                 tags=tags,
             )
@@ -96,7 +181,7 @@ class ProvisionAgentHandler:
             resolved_profile_box_id = profile_box_id
             if not resolved_profile_box_id and profile_name:
                 profile = await deps.resource_store.find_profile_by_name(
-                    meta.project_id, profile_name
+                    ctx.project_id, profile_name
                 )
                 if not profile:
                     return False, {"status": "rejected", "error_code": "profile_not_found"}
@@ -108,7 +193,7 @@ class ProvisionAgentHandler:
                 metadata=metadata,
                 display_name=display_name,
                 owner_agent_id=owner_agent_id,
-                active_channel_id=active_channel_id or meta.channel_id,
+                active_channel_id=active_channel_id or ctx.channel_id,
                 worker_target=worker_target,
                 tags=tags,
             )
@@ -118,13 +203,13 @@ class ProvisionAgentHandler:
                 resource_store=deps.resource_store,
                 state_store=deps.state_store,
                 identity_store=deps.identity_store,
-                project_id=meta.project_id,
-                agent_id=agent_id,
+                target_ctx=ctx.evolve(
+                    agent_id=agent_id,
+                    trace_id=trace_id or ctx.trace_id,
+                    parent_agent_id=ctx.agent_id,
+                    parent_step_id=ctx.step_id,
+                ),
                 spec=spec,
-                source_agent_id=cmd.source_agent_id,
-                parent_step_id=cmd.step_id,
-                trace_id=trace_id,
-                channel_id=meta.channel_id,
             )
         except Exception as exc:  # noqa: BLE001
             mark_span_error(span, exc)

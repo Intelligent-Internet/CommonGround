@@ -20,10 +20,10 @@ from typing import Any, Dict, Tuple
 import httpx
 import uuid6
 
+from core.cg_context import CGContext
 from core.config import PROTOCOL_VERSION
-from core.headers import ensure_recursion_depth
+from core.headers import CG_AGENT_ID, CG_AGENT_TURN_ID, CG_TURN_EPOCH
 from core.time_utils import to_iso, utc_now
-from core.trace import ensure_trace_headers
 from infra.nats_client import NATSClient
 from scripts.utils.api import create_project, upload_profile_yaml, upsert_agent
 from scripts.utils.config import load_toml_config
@@ -70,6 +70,22 @@ async def _fetch_card(
     return resp.json()
 
 
+def _build_ui_headers(*, project: str, channel: str, ui_agent_id: str) -> Dict[str, str]:
+    headers = CGContext(
+        project_id=str(project),
+        channel_id=str(channel),
+        agent_id=str(ui_agent_id),
+    ).with_normalized_transport(
+        {},
+        trace_id=str(uuid6.uuid7()),
+        default_depth=0,
+    ).to_nats_headers()
+    headers[CG_AGENT_ID] = str(ui_agent_id)
+    headers[CG_AGENT_TURN_ID] = f"turn_{uuid6.uuid7().hex}"
+    headers[CG_TURN_EPOCH] = "1"
+    return headers
+
+
 async def _run_chat(
     *,
     args: argparse.Namespace,
@@ -78,7 +94,7 @@ async def _run_chat(
 ) -> int:
     ack_queue: asyncio.Queue = asyncio.Queue()
     task_queue: asyncio.Queue = asyncio.Queue()
-    suffix = uuid6.uuid7().hex[:8]
+    suffix = uuid6.uuid7().hex[-8:]
 
     subject_ack = f"cg.{PROTOCOL_VERSION}.{args.project}.{args.channel}.evt.sys.ui.action_ack"
     subject_task = f"cg.{PROTOCOL_VERSION}.{args.project}.{args.channel}.evt.agent.{args.chat_agent_id}.task"
@@ -100,7 +116,6 @@ async def _run_chat(
     subject_action = f"cg.{PROTOCOL_VERSION}.{args.project}.{args.channel}.cmd.sys.ui.action"
     payload = {
         "action_id": action_id,
-        "agent_id": args.ui_agent_id,
         "tool_name": "delegate_async",
         "args": {
             "target_strategy": "reuse",
@@ -112,8 +127,11 @@ async def _run_chat(
             "client_ts": to_iso(utc_now()),
         },
     }
-    headers, _, _ = ensure_trace_headers({}, trace_id=str(uuid6.uuid7()))
-    headers = ensure_recursion_depth(headers, default_depth=0)
+    headers = _build_ui_headers(
+        project=args.project,
+        channel=args.channel,
+        ui_agent_id=args.ui_agent_id,
+    )
     await nats.publish_event(subject_action, payload, headers=headers)
 
     start = time.monotonic()
@@ -145,7 +163,7 @@ async def _run_busy(
     nats: NATSClient,
 ) -> int:
     ack_queue: asyncio.Queue = asyncio.Queue()
-    suffix = uuid6.uuid7().hex[:8]
+    suffix = uuid6.uuid7().hex
     subject_ack = f"cg.{PROTOCOL_VERSION}.{args.project}.{args.channel}.evt.sys.ui.action_ack"
     await _subscribe_event(
         nats,
@@ -158,7 +176,6 @@ async def _run_busy(
     action_id_1 = uuid6.uuid7().hex
     action_id_2 = uuid6.uuid7().hex
     payload_base = {
-        "agent_id": args.ui_agent_id,
         "tool_name": "delegate_async",
         "args": {
             "target_strategy": "reuse",
@@ -171,8 +188,11 @@ async def _run_busy(
         },
     }
 
-    headers, _, _ = ensure_trace_headers({}, trace_id=str(uuid6.uuid7()))
-    headers = ensure_recursion_depth(headers, default_depth=0)
+    headers = _build_ui_headers(
+        project=args.project,
+        channel=args.channel,
+        ui_agent_id=args.ui_agent_id,
+    )
 
     payload1 = dict(payload_base)
     payload1["action_id"] = action_id_1
@@ -180,11 +200,41 @@ async def _run_busy(
     payload2 = dict(payload_base)
     payload2["action_id"] = action_id_2
 
+    ack_by_id: Dict[str, Dict[str, Any]] = {}
+
+    def _track_ack(payload: Dict[str, Any]) -> None:
+        ack_id = str(payload.get("action_id") or "")
+        if ack_id in (action_id_1, action_id_2):
+            ack_by_id[ack_id] = payload
+
     await nats.publish_event(subject_action, payload1, headers=headers)
+    # Synchronize on action1 ingress accepted ack (without result card) to narrow
+    # timing variance for busy-mode expectation.
+    accepted_deadline = time.monotonic() + float(args.timeout)
+    action1_ingress_accepted = False
+    while time.monotonic() < accepted_deadline:
+        remaining = max(0.1, accepted_deadline - time.monotonic())
+        try:
+            ack_payload, _ = await _wait_for_event(ack_queue, timeout_s=remaining)
+        except asyncio.TimeoutError:
+            break
+        _track_ack(ack_payload)
+        ack_id = str(ack_payload.get("action_id") or "")
+        status = str(ack_payload.get("status") or "")
+        has_result_card = bool(ack_payload.get("tool_result_card_id"))
+        if ack_id == action_id_1 and status == "accepted" and not has_result_card:
+            action1_ingress_accepted = True
+            break
+
+    if not action1_ingress_accepted:
+        print("[ack-1]", ack_by_id.get(action_id_1))
+        print("[ack-2]", ack_by_id.get(action_id_2))
+        print("[error] action1 ingress accepted ack not observed before timeout")
+        return 2
+
     await asyncio.sleep(float(args.delay))
     await nats.publish_event(subject_action, payload2, headers=headers)
 
-    ack_by_id: Dict[str, Dict[str, Any]] = {}
     deadline = time.monotonic() + float(args.timeout)
     while time.monotonic() < deadline and len(ack_by_id) < 2:
         remaining = max(0.1, deadline - time.monotonic())
@@ -192,9 +242,7 @@ async def _run_busy(
             ack_payload, _ = await _wait_for_event(ack_queue, timeout_s=remaining)
         except asyncio.TimeoutError:
             break
-        ack_id = str(ack_payload.get("action_id") or "")
-        if ack_id in (action_id_1, action_id_2):
-            ack_by_id[ack_id] = ack_payload
+        _track_ack(ack_payload)
 
     print("[ack-1]", ack_by_id.get(action_id_1))
     print("[ack-2]", ack_by_id.get(action_id_2))
@@ -292,7 +340,7 @@ def _parse_args(argv: list[str] | None = None, *, default_mode: str = "chat") ->
     parser.add_argument("--message", default="hello chat via ui")
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--fetch-deliverable", action="store_true")
-    parser.add_argument("--delay", type=float, default=0.1, help="delay before 2nd action")
+    parser.add_argument("--delay", type=float, default=0.0, help="delay before 2nd action")
     parser.add_argument("--expect-busy", action="store_true", help="assert 2nd action busy")
     parser.add_argument("--no-ensure-project", dest="ensure_project", action="store_false")
     parser.set_defaults(ensure_project=True)

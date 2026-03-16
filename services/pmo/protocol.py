@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from core.cg_context import CGContext
 from core.errors import BadRequestError, NotFoundError, ProtocolViolationError
 from core.subject import parse_subject
 from core.utp_protocol import extract_tool_call_args
@@ -38,24 +39,14 @@ def parse_subject_cmd(subject: str) -> Optional[SubjectMeta]:
 class PMOToolCommand:
     """Lightweight command DTO."""
 
-    def __init__(self, data: Dict[str, Any]):
+    def __init__(self, data: Dict[str, Any], ctx: CGContext):
         self.tool_name: str = data.get("tool_name") or "unknown"
-        self.tool_call_id: Optional[str] = data.get("tool_call_id")
-        if not self.tool_call_id:
-            raise BadRequestError("missing required field: tool_call_id")
-        self.agent_turn_id: Optional[str] = data.get("agent_turn_id")
-        if not self.agent_turn_id:
-            raise BadRequestError("missing required field: agent_turn_id")
-        self.turn_epoch: Optional[int] = data.get("turn_epoch")
-        if self.turn_epoch is None:
-            raise BadRequestError("missing required field: turn_epoch")
-        self.step_id: Optional[str] = data.get("step_id")
-        if not self.step_id:
-            raise BadRequestError("missing required field: step_id")
-
-        self.source_agent_id: str = data.get("agent_id") or ""
-        if not self.source_agent_id:
-            raise BadRequestError("missing required field: agent_id")
+        if "tool_call_id" in data:
+            raise ProtocolViolationError("protocol violation: payload.tool_call_id is forbidden (use CG-Tool-Call-Id)")
+        try:
+            self.tool_call_id = ctx.require_tool_call_id
+        except ProtocolViolationError as exc:
+            raise BadRequestError("missing required header: CG-Tool-Call-Id") from exc
         self.after_execution: str = data.get("after_execution") or ""
         if self.after_execution not in ("suspend", "terminate"):
             raise BadRequestError("invalid required field: after_execution")
@@ -85,9 +76,9 @@ class PMOToolCommand:
 async def decode_tool_command(
     *,
     data: Dict[str, Any],
+    ctx: CGContext,
     cardbox: CardBoxClient,
-    project_id: str,
 ) -> PMOToolCommand:
-    cmd = PMOToolCommand(data or {})
-    await cmd.hydrate_arguments(cardbox=cardbox, project_id=project_id)
+    cmd = PMOToolCommand(data or {}, ctx)
+    await cmd.hydrate_arguments(cardbox=cardbox, project_id=ctx.project_id)
     return cmd

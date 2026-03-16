@@ -10,26 +10,27 @@ from services.agent_worker.resume_context import (
 def test_parse_resume_command_extracts_expected_fields() -> None:
     cmd = parse_resume_command(
         {
-            "tool_call_id": "call_1",
             "status": "success",
             "after_execution": "suspend",
             "tool_result_card_id": "card_1",
-            "step_id": "step_1",
-            "source_agent_id": "agent_a",
         }
     )
-    assert cmd.tool_call_id == "call_1"
+    assert cmd.tool_call_id is None
     assert cmd.status == "success"
     assert cmd.after_execution == "suspend"
     assert cmd.tool_result_card_id == "card_1"
-    assert cmd.step_id_hint == "step_1"
-    assert cmd.source_agent_id == "agent_a"
     assert cmd.has_inline_result is False
+    assert cmd.forbidden_payload_keys == ()
 
 
 def test_parse_resume_command_marks_inline_result_as_forbidden() -> None:
     cmd = parse_resume_command({"result": {"ok": True}})
     assert cmd.has_inline_result is True
+
+
+def test_parse_resume_command_detects_forbidden_control_fields() -> None:
+    cmd = parse_resume_command({"step_id": "step_1", "source_agent_id": "agent_a"})
+    assert cmd.forbidden_payload_keys == ("source_agent_id", "step_id")
 
 
 def test_normalize_resume_status_falls_back_to_failed() -> None:

@@ -5,7 +5,7 @@ This document belongs to the L1 kernel layer and describes how PMO currently ass
 ## 1. Core Mental Model (P0)
 
 - **Centralized storage is not default visibility**: Cards/Boxes are stored centrally in CardBox/Postgres at project scope, but a single turn's LLM only sees the `context_box_id` and that turn's `output_box_id` (`Worker` merges `output_box_id` with `context_box_id` before passing to the LLM). PMO does not automatically hydrate full project history into context.
-- **`box_id` is not a security boundary (current implementation)**: at the system layer, access control based on boxes is not yet a fully enforced capability. Components with read access can access card content by `box_id`.
+- **`box_id` is not a full security boundary**: the system still does not provide a complete box-capability ACL. However, PMO no longer treats “box exists” as sufficient for inheritance. Built-in flows only inherit boxes already visible to the source turn plus explicitly authorized extra boxes (for example, clone-source output).
 - **Cross-Agent sharing must be explicit**: shared context is realized by explicitly passing `box_id` and repacking the context box; there is no global implicit concatenation.
 
 ## 2. Current Components and Boundaries
@@ -44,7 +44,8 @@ Function signature:
 
 - Reads the list of parameter names specified by `handover["context_packing_config"]["inherit_context"]["include_boxes_from_args"]`.
 - Each parameter value can be a single `box_id` (`str`/`int`) or a list.
-- For each box, its `card_ids` are read and appended to the new context in order, with set-based deduplication preserving first occurrence.
+- Each inherited box must also appear in `handover["authorized_inherit_box_ids"]`; otherwise the packer rejects the request.
+- For each authorized box, its `card_ids` are read and appended to the new context in order, with set-based deduplication preserving first occurrence.
 - Missing boxes raise `NotFoundError`; invalid argument types raise `BadRequestError`.
 
 4) `include_parent`
@@ -64,7 +65,7 @@ Function signature:
   - Inherits source:
     - `context_box_id` (optional);
     - if `target_strategy == "clone"`, also inherits current source `output_box_id`.
-  - Validates all source boxes with `validate_box_ids_exist`.
+  - Validates all source boxes with `validate_box_ids_exist`, which now enforces both existence and minimum authorization against the source turn's visible boxes plus explicitly allowed clone boxes.
   - Calls `pack_context_with_instruction` for unified context packing.
 - `fork_join`
   - Each task may carry `context_box_id`;
@@ -88,7 +89,7 @@ Thus `delegate_async/fork_join` context always includes at least:
 
 ## 6. Extensibility and Caveats
 
-- **Extension points are in handler and handover rules**: add/modify internal handler and define custom handover in its own flow, then call `pack_context`.
+- **Extension points are in handler and handover rules**: add/modify an internal handler, define custom handover in its own flow, and provide explicit authorized inherit box ids before calling `pack_context`.
 - `launch_principal` does not hand-write handover; its context is reused through the `delegate_async` path and follows the above behavior.
 - Output-side handling remains determined by Dispatcher/Worker; PMO does not write `output_box_id` here.
 

@@ -81,7 +81,7 @@ async def reset_streams(*, extra_streams: Optional[list[str]] = None) -> None:
     try:
         js = nc.jetstream()
         # If there is an old stream with legacy naming overlapping current subjects, do a subject->stream reverse lookup.
-        # A common case is an old stream like "cg-stream" capturing cg.v1r3.*.*.cmd.>.
+        # A common case is an old stream like "cg-stream" capturing cg.v1r4.*.*.cmd.>.
         probe_subjects = [
             f"cg.{PROTOCOL_VERSION}.probe.probe.cmd.agent.worker_generic.wakeup",
             f"cg.{PROTOCOL_VERSION}.probe.probe.evt.agent.probe.task",

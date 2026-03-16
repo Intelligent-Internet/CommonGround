@@ -75,9 +75,9 @@ Concurrency control:
 - Each `dispatch_pending_tasks` batch applies dual throttling via `watchdog_limit` and `dispatch_concurrency`.
 
 ## 5. Fork Reconciliation (reconcile / refill)
-`BatchManager.reconcile_dispatched_tasks` runs two passes per tick:
-- After 2 seconds: scan tasks where `status='dispatched'` and `current_turn_epoch IS NULL`, read `agent_inbox` (`correlation_id = agent_turn_id`) and fill in turn epoch.
-- After 60 seconds: for tasks still missing epoch, record warnings and metadata (`dispatch_warning_*`) only; trigger `dispatch_next` when needed. If the batch is `fail_fast` or the deadline has passed and inbox is not visible, mark task failed as `downstream_unavailable` and finalize the batch.
+`BatchManager.reconcile_dispatched_tasks` observes dispatched tasks whose lease is still pending:
+- After the pending window: if the child inbox row is still `queued`, record warnings and optionally trigger `dispatch_next`.
+- After the longer watchdog window: keep warning metadata, and if the batch is `fail_fast` or the deadline has passed while the child is still not making progress, mark the task failed as `downstream_unavailable` and finalize the batch.
 
 Important: the implementation explicitly states "do not auto rollback retries" to avoid duplicate replay from late ACKs.
 

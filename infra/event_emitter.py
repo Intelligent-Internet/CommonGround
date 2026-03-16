@@ -60,61 +60,41 @@ def _merge_stats(
     return merged
 
 
-def _resolve_agent_turn_context(ctx: CGContext) -> tuple[str, str, str, str, Dict[str, str]]:
-    resolved_project_id = str(ctx.project_id or "")
-    resolved_channel_id = str(ctx.channel_id or "")
-    resolved_agent_id = str(ctx.agent_id or "")
-    resolved_agent_turn_id = str(ctx.agent_turn_id or "")
-    resolved_headers = dict(ctx.headers or {})
-    if not resolved_project_id or not resolved_channel_id or not resolved_agent_id or not resolved_agent_turn_id:
-        raise ValueError("emit_agent_* requires project/channel/agent/agent_turn ids")
-    return (
-        resolved_project_id,
-        resolved_channel_id,
-        resolved_agent_id,
-        resolved_agent_turn_id,
-        resolved_headers,
-    )
-
-
 async def emit_agent_state(
     *,
     nats: NATSClient,
     ctx: CGContext,
-    turn_epoch: Optional[int],
     status: str,
     output_box_id: Optional[str],
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    if turn_epoch is None:
-        return
-    project_id, channel_id, agent_id, agent_turn_id, headers = _resolve_agent_turn_context(ctx)
-    subject = evt_agent_state_subject(project_id, channel_id, agent_id)
+    agent_turn_id = ctx.require_agent_turn_id
+    subject = evt_agent_state_subject(ctx.project_id, ctx.channel_id, ctx.agent_id)
     payload = AgentStatePayload(
-        agent_id=agent_id,
+        agent_id=ctx.agent_id,
         agent_turn_id=agent_turn_id,
         status=status,  # type: ignore[arg-type]
-        turn_epoch=int(turn_epoch),
+        turn_epoch=int(ctx.turn_epoch),
         updated_at=_iso_now(),
         output_box_id=safe_str(output_box_id),
         metadata=dict(metadata or {}),
     )
-    await nats.publish_event(subject, payload.model_dump(), headers=headers)
+    await nats.publish_event(subject, payload.model_dump(), headers=ctx.to_nats_headers())
 
 
 async def emit_agent_step(
     *,
     nats: NATSClient,
     ctx: CGContext,
-    step_id: str,
     phase: str,
     metadata: Optional[Dict[str, Any]] = None,
     new_card_ids: Optional[List[str]] = None,
     timing: Optional[Dict[str, Any]] = None,
     include_llm_meta: bool = False,
 ) -> None:
-    project_id, channel_id, agent_id, agent_turn_id, headers = _resolve_agent_turn_context(ctx)
-    subject = evt_agent_step_subject(project_id, channel_id, agent_id)
+    agent_turn_id = ctx.require_agent_turn_id
+    step_id = ctx.require_step_id
+    subject = evt_agent_step_subject(ctx.project_id, ctx.channel_id, ctx.agent_id)
     meta = _merge_metadata(metadata, timing=timing, include_llm_meta=include_llm_meta)
     payload = StepEventPayload(
         agent_turn_id=agent_turn_id,
@@ -123,7 +103,7 @@ async def emit_agent_step(
         metadata=meta,
         new_card_ids=new_card_ids or [],
     )
-    await nats.publish_event(subject, payload.model_dump(), headers=headers)
+    await nats.publish_event(subject, payload.model_dump(), headers=ctx.to_nats_headers())
 
 
 async def emit_agent_task(
@@ -140,8 +120,8 @@ async def emit_agent_task(
     timing: Optional[Dict[str, Any]] = None,
     include_llm_meta: bool = False,
 ) -> None:
-    project_id, channel_id, agent_id, agent_turn_id, headers = _resolve_agent_turn_context(ctx)
-    subject = evt_agent_task_subject(project_id, channel_id, agent_id)
+    agent_turn_id = ctx.require_agent_turn_id
+    subject = evt_agent_task_subject(ctx.project_id, ctx.channel_id, ctx.agent_id)
     merged_stats = _merge_stats(stats, timing=timing, include_llm_meta=include_llm_meta)
     payload = AgentResultPayload(
         agent_turn_id=agent_turn_id,
@@ -153,4 +133,4 @@ async def emit_agent_task(
         error_code=error_code,
         stats=merged_stats,
     )
-    await nats.publish_event(subject, payload.model_dump(), headers=headers)
+    await nats.publish_event(subject, payload.model_dump(), headers=ctx.to_nats_headers())

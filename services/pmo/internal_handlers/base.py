@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Protocol, Tuple
 
+from core.cg_context import CGContext
+
 
 InternalHandlerResult = Tuple[bool, Dict[str, Any]]
 
@@ -25,9 +27,8 @@ class InternalHandler(Protocol):
     async def handle(
         self,
         *,
-        ctx: "InternalHandlerContext",
+        deps: InternalHandlerDeps,
+        ctx: CGContext,
+        cmd: Any,
         parent_after_execution: str,
     ) -> InternalHandlerResult: ...
-
-
-from .context import InternalHandlerContext  # noqa: E402  (avoid import cycle in type checkers)

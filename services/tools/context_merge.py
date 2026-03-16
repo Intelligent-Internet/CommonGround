@@ -28,7 +28,7 @@ from core.utp_protocol import Card as SchemaCard, TextContent, extract_card_cont
 from infra.agent_routing import resolve_agent_target
 from infra.llm_gateway import LLMService
 from infra.service_runtime import ServiceBase
-from infra.tool_executor import ToolCallContext
+from infra.tool_executor import ToolCallEnvelope
 from services.tools.tool_runner import (
     ToolPayloadValidation,
     ToolRunner,
@@ -61,7 +61,7 @@ class ContextMergeTool(ServiceBase):
                 forbid_keys={"args"},
                 require_tool_call_card_id=True,
             ),
-            result_author_id="sys.tool.context_merge",
+            result_author_id="tool.context_merge",
             logger=logger,
             service_name="ContextMerge",
         )
@@ -111,34 +111,26 @@ class ContextMergeTool(ServiceBase):
 
     async def _execute_logic(
         self,
-        ctx: ToolCallContext,
+        envelope: ToolCallEnvelope,
     ) -> Dict[str, Any]:
-        parts = ctx.parts
-        payload = ctx.payload
-        tool_call_id = payload.tool_call_id
-        agent_turn_id = payload.agent_turn_id
-        turn_epoch = payload.turn_epoch
-        agent_id = payload.agent_id
-        after_exec = payload.after_execution or "suspend"
+        cg_ctx = envelope.ctx
+        tool_call_id = cg_ctx.tool_call_id or ""
 
-        target_agent_id = str(agent_id)
         target = await resolve_agent_target(
             resource_store=self.resource_store,
-            project_id=parts.project_id,
-            agent_id=target_agent_id,
+            ctx=cg_ctx,
         )
         if not target:
             raise ProtocolViolationError(
                 "missing worker_target for agent",
                 detail={
-                    "project_id": parts.project_id,
-                    "agent_id": target_agent_id,
+                    "project_id": cg_ctx.project_id,
+                    "agent_id": cg_ctx.agent_id,
                     "tool_call_id": tool_call_id,
                 },
             )
 
-        tool_call_meta = ctx.tool_call_meta
-        args = ctx.args
+        args = envelope.args
         box_ids = args.get("box_ids")
         mode = args.get("mode", "concat")  # concat | summarize
         instruction = args.get("instruction", "Summarize the following content.")
@@ -152,19 +144,19 @@ class ContextMergeTool(ServiceBase):
             "📥 Processing MERGE: mode=%s boxes=%s from=%s turn=%s call=%s epoch=%s after=%s",
             mode,
             len(box_ids),
-            agent_id,
-            agent_turn_id,
+            cg_ctx.agent_id,
+            cg_ctx.agent_turn_id,
             tool_call_id,
-            turn_epoch,
-            after_exec,
+            cg_ctx.turn_epoch,
+            envelope.base_after_execution,
         )
 
         # 1. Fetch all cards from all boxes
         all_cards: List[SchemaCard] = []
         for box_id in box_ids:
-            box = await self.cardbox.get_box(box_id, project_id=parts.project_id)
+            box = await self.cardbox.get_box(box_id, project_id=cg_ctx.project_id)
             if box and box.card_ids:
-                cards = await self.cardbox.get_cards(box.card_ids, project_id=parts.project_id)
+                cards = await self.cardbox.get_cards(box.card_ids, project_id=cg_ctx.project_id)
                 all_cards.extend(cards)
 
         # 2. Process
@@ -176,7 +168,7 @@ class ContextMergeTool(ServiceBase):
                 if content_str:
                     new_card = SchemaCard(
                         card_id=uuid6.uuid7().hex,
-                        project_id=parts.project_id,
+                        project_id=cg_ctx.project_id,
                         type="task.context",
                         content=TextContent(
                             text=self._build_concat_card_text(
@@ -185,7 +177,7 @@ class ContextMergeTool(ServiceBase):
                             )
                         ),
                         created_at=datetime.now(UTC),
-                        author_id=agent_id,
+                        author_id=cg_ctx.agent_id,
                         metadata={"role": "user"},
                     )
                     await self.cardbox.save_card(new_card)
@@ -197,7 +189,7 @@ class ContextMergeTool(ServiceBase):
             summary_text = await self._call_llm_summarize(full_text, instruction)
             new_card = SchemaCard(
                 card_id=uuid6.uuid7().hex,
-                project_id=parts.project_id,
+                project_id=cg_ctx.project_id,
                 type="task.context",
                 content=TextContent(text=f"# Summary\n\n{summary_text}"),
                 created_at=datetime.now(UTC),
@@ -209,7 +201,7 @@ class ContextMergeTool(ServiceBase):
         else:
             raise BadRequestError(f"Unknown mode: {mode}")
 
-        new_box_id = await self.cardbox.save_box(output_card_ids, project_id=parts.project_id)
+        new_box_id = await self.cardbox.save_box(output_card_ids, project_id=cg_ctx.project_id)
         return {
             "output_box_id": str(new_box_id),
             "mode": mode,
@@ -218,8 +210,8 @@ class ContextMergeTool(ServiceBase):
         }
 
     async def _handle_cmd(self, subject: str, data: Dict[str, Any], headers: Dict[str, str]):
-        async def _execute(ctx: ToolCallContext) -> Dict[str, Any]:
-            return await self._execute_logic(ctx)
+        async def _execute(envelope: ToolCallEnvelope) -> Dict[str, Any]:
+            return await self._execute_logic(envelope)
 
         run_result = await self.tool_runner.run(
             subject=subject,
@@ -231,7 +223,7 @@ class ContextMergeTool(ServiceBase):
         if not run_result.handled:
             return
 
-        tool_call_id = str(data.get("tool_call_id") or "")
+        tool_call_id = str((headers or {}).get("CG-Tool-Call-Id") or "")
         if run_result.is_leader:
             logger.info("ContextMerge tool_result sent (leader) tool_call_id=%s", tool_call_id)
         elif run_result.is_leader is False:

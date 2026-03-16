@@ -26,8 +26,17 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import uuid6
 
 from core.config import PROTOCOL_VERSION
+from core.cg_context import CGContext
 from core.errors import BadRequestError
-from core.headers import ensure_recursion_depth
+from core.headers import (
+    CG_AGENT_ID,
+    CG_AGENT_TURN_ID,
+    CG_STEP_ID,
+    CG_TOOL_CALL_ID,
+    CG_TURN_EPOCH,
+    ensure_recursion_depth,
+)
+from core.message_source import MessageSource
 from core.trace import ensure_trace_headers, next_traceparent
 from core.utp_protocol import Card, ToolCallContent, ToolResultContent
 from core.utils import safe_str
@@ -172,8 +181,7 @@ async def _wait_for_tool_result_inbox(
         if remaining <= 0:
             raise TimeoutError("timeout waiting for tool_result inbox")
         rows = await execution_store.list_inbox_by_correlation(
-            project_id=project_id,
-            agent_id=agent_id,
+            ctx=CGContext(project_id=project_id, agent_id=agent_id),
             correlation_id=tool_call_id,
             limit=20,
         )
@@ -241,38 +249,48 @@ async def _call_pmo_internal_tool(
     t_saved_tool_call_s = time.perf_counter()
 
     payload: Dict[str, Any] = {
-        "agent_id": caller_agent_id,
-        "agent_turn_id": agent_turn_id,
-        "turn_epoch": 1,
-        "tool_call_id": tool_call_id,
         "tool_name": tool_name,
         "after_execution": after_execution,
         "tool_call_card_id": tool_call_card.card_id,
-        "step_id": step_id,
     }
     headers, _, trace_id = ensure_trace_headers({}, trace_id=trace_id)
     headers = ensure_recursion_depth(headers, default_depth=0)
+    headers[CG_AGENT_ID] = caller_agent_id
+    headers[CG_AGENT_TURN_ID] = agent_turn_id
+    headers[CG_TURN_EPOCH] = "1"
+    headers[CG_STEP_ID] = step_id
+    headers[CG_TOOL_CALL_ID] = tool_call_id
     traceparent, trace_id = next_traceparent(headers.get("traceparent"), trace_id)
     headers = dict(headers)
     headers["traceparent"] = traceparent
 
     # Create an execution edge for correlation_id -> recursion_depth lookup (PMO tool_result report).
-    await execution_store.insert_execution_edge(
-        edge_id=f"edge_{uuid6.uuid7().hex}",
+    edge_ctx = CGContext(
         project_id=project_id,
         channel_id=channel_id,
+        agent_id="sys.pmo",
+        agent_turn_id="",
+        turn_epoch=0,
+        step_id=step_id,
+        trace_id=trace_id,
+        recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
+        parent_agent_id=caller_agent_id,
+        parent_agent_turn_id=agent_turn_id,
+        parent_step_id=step_id,
+        headers=dict(headers),
+    )
+    await execution_store.insert_execution_edge(
+        ctx=edge_ctx,
+        source=MessageSource(
+            agent_id=caller_agent_id,
+            agent_turn_id=agent_turn_id,
+            step_id=step_id,
+        ),
+        edge_id=f"edge_{uuid6.uuid7().hex}",
         primitive="enqueue",
         edge_phase="request",
-        source_agent_id=caller_agent_id,
-        source_agent_turn_id=agent_turn_id,
-        source_step_id=step_id,
-        target_agent_id="sys.pmo",
-        target_agent_turn_id=None,
         correlation_id=tool_call_id,
         enqueue_mode="call",
-        recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
-        trace_id=trace_id,
-        parent_step_id=step_id,
         metadata={
             "message_type": "tool_call",
             "enqueue_mode": "call",
@@ -399,6 +417,7 @@ async def _ensure_profiles(
 async def _ensure_roster_agents(
     *,
     project_id: str,
+    channel_id: str,
     pool: Any,
     state_store: StateStore,
     resource_store: ResourceStore,
@@ -410,8 +429,11 @@ async def _ensure_roster_agents(
 ) -> None:
     for agent_id in agent_ids:
         await resource_store.upsert_project_agent(
-            project_id=project_id,
-            agent_id=str(agent_id),
+            ctx=CGContext(
+                project_id=project_id,
+                channel_id=channel_id,
+                agent_id=str(agent_id),
+            ),
             profile_box_id=str(profile_box_id),
             worker_target=str(worker_target),
             tags=list(tags),
@@ -420,9 +442,11 @@ async def _ensure_roster_agents(
             metadata={"profile_name": str(profile_name)},
         )
         await state_store.init_if_absent(
-            project_id=project_id,
-            agent_id=str(agent_id),
-            active_channel_id=None,
+            ctx=CGContext(
+                project_id=project_id,
+                channel_id=channel_id,
+                agent_id=str(agent_id),
+            ),
             profile_box_id=str(profile_box_id),
         )
 
@@ -911,6 +935,7 @@ async def main() -> None:
             caller_agent_id = str(args.caller_agent_id)
             await _ensure_roster_agents(
                 project_id=project_id,
+                channel_id=channel_id,
                 pool=pool,
                 state_store=state_store,
                 resource_store=resource_store,
@@ -929,6 +954,7 @@ async def main() -> None:
             ]
             await _ensure_roster_agents(
                 project_id=project_id,
+                channel_id=channel_id,
                 pool=pool,
                 state_store=state_store,
                 resource_store=resource_store,

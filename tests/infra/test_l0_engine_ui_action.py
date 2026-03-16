@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pytest
 
+from core.cg_context import CGContext
 from infra.l0_engine import L0Engine
 
 
@@ -14,7 +15,7 @@ class DummyNats:
 
 class DummyExecutionStore:
     def __init__(self) -> None:
-        self.enqueues: List[Tuple[Any, Any]] = []
+        self.enqueues: List[Dict[str, Any]] = []
 
     async def get_request_recursion_depth_with_conn(
         self,
@@ -26,9 +27,10 @@ class DummyExecutionStore:
         _ = conn, project_id, correlation_id
         return None
 
-    async def enqueue_with_conn(self, conn: Any, *, inbox: Any, edge: Any) -> None:
+    async def enqueue_with_conn(self, conn: Any, **kwargs: Any) -> bool:
         _ = conn
-        self.enqueues.append((inbox, edge))
+        self.enqueues.append(dict(kwargs))
+        return True
 
 
 class DummyResourceStore:
@@ -59,25 +61,27 @@ async def test_enqueue_ui_action_leases_turn_and_patches_payload() -> None:
 
     result = await engine._enqueue_with_existing_conn(
         object(),
-        project_id="proj_test",
-        channel_id="public",
-        target_agent_id="ui_agent",
+        source_ctx=CGContext(
+            project_id="proj_test",
+            channel_id="public",
+            agent_id="sys.ui_worker",
+        ),
+        target_ctx=CGContext(
+            project_id="proj_test",
+            channel_id="public",
+            agent_id="ui_agent",
+            trace_id="11111111111111111111111111111111",
+            recursion_depth=0,
+            parent_step_id="step_test",
+            headers={},
+        ),
         message_type="ui_action",
         payload={
             "action_id": "act_1",
-            "agent_id": "ui_agent",
             "tool_name": "delegate_async",
             "args": {"target_strategy": "reuse", "target_ref": "chat_agent", "instruction": "hello"},
         },
         correlation_id="act_1",
-        recursion_depth=0,
-        headers={},
-        trace_id="11111111111111111111111111111111",
-        parent_step_id="step_test",
-        source_agent_id=None,
-        source_agent_turn_id=None,
-        source_step_id=None,
-        target_agent_turn_id=None,
         enqueue_mode="call",
         wakeup=False,
     )
@@ -89,10 +93,12 @@ async def test_enqueue_ui_action_leases_turn_and_patches_payload() -> None:
 
     assert len(state_store.calls) == 1
     assert len(execution_store.enqueues) == 1
-    inbox, _edge = execution_store.enqueues[0]
-    assert inbox.message_type == "ui_action"
-    assert inbox.payload.get("turn_epoch") == 3
-    assert inbox.payload.get("agent_turn_id") == result.payload.get("agent_turn_id")
+    enqueue_req = execution_store.enqueues[0]
+    assert enqueue_req["message_type"] == "ui_action"
+    assert "turn_epoch" not in enqueue_req["payload"]
+    assert "agent_turn_id" not in enqueue_req["payload"]
+    assert enqueue_req["ctx"].turn_epoch == 3
+    assert enqueue_req["ctx"].agent_turn_id == result.payload.get("agent_turn_id")
 
 
 @pytest.mark.asyncio
@@ -108,25 +114,27 @@ async def test_enqueue_ui_action_returns_busy_when_lease_fails() -> None:
 
     result = await engine._enqueue_with_existing_conn(
         object(),
-        project_id="proj_test",
-        channel_id="public",
-        target_agent_id="ui_agent",
+        source_ctx=CGContext(
+            project_id="proj_test",
+            channel_id="public",
+            agent_id="sys.ui_worker",
+        ),
+        target_ctx=CGContext(
+            project_id="proj_test",
+            channel_id="public",
+            agent_id="ui_agent",
+            trace_id="11111111111111111111111111111111",
+            recursion_depth=0,
+            parent_step_id="step_test",
+            headers={},
+        ),
         message_type="ui_action",
         payload={
             "action_id": "act_1",
-            "agent_id": "ui_agent",
             "tool_name": "delegate_async",
             "args": {"target_strategy": "reuse", "target_ref": "chat_agent", "instruction": "hello"},
         },
         correlation_id="act_1",
-        recursion_depth=0,
-        headers={},
-        trace_id="11111111111111111111111111111111",
-        parent_step_id="step_test",
-        source_agent_id=None,
-        source_agent_turn_id=None,
-        source_step_id=None,
-        target_agent_turn_id=None,
         enqueue_mode="call",
         wakeup=False,
     )

@@ -41,8 +41,8 @@ def apply_step_budget_controls(
             if isinstance(tools, list) and len(tools) != len(submit_tools):
                 logger.info(
                     "Step budget guard: final step turn=%s agent=%s; restricting tools to submit_result only.",
-                    item.agent_turn_id,
-                    item.agent_id,
+                    item.ctx.agent_turn_id,
+                    item.ctx.agent_id,
                 )
             tools = submit_tools
         else:

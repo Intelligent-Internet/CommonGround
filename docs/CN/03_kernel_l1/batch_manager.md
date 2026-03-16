@@ -75,9 +75,9 @@
 - 每批 `dispatch_pending_tasks` 使用 `watchdog_limit` 和 `dispatch_concurrency` 双重限流并发派发。
 
 ## 5. 分叉回收（reconcile / 回填）
-`BatchManager.reconcile_dispatched_tasks` 每 tick 执行两段逻辑：
-- 2 秒后：扫描 `status='dispatched'` 且 `current_turn_epoch IS NULL` 的任务，读取 `agent_inbox`（`correlation_id = agent_turn_id`）补齐 epoch。
-- 60 秒后：仍缺 epoch 的任务仅记录告警与元数据（`dispatch_warning_*`），必要时 `dispatch_next` 唤醒；若任务所属批是 `fail_fast` 或 `deadline` 已到且 inbox 未可见，则按 `downstream_unavailable` 直接失败该 task，触发批次收尾。
+`BatchManager.reconcile_dispatched_tasks` 会观察仍在等待 lease 的 dispatched 任务：
+- 超过 pending window 后：若 child inbox 仍处于 `queued`，记录告警并按需触发 `dispatch_next`。
+- 超过更长 watchdog window 后：继续记录告警元数据；若批次是 `fail_fast` 或 deadline 已到且 child 仍无进展，则按 `downstream_unavailable` 直接失败该 task，触发批次收尾。
 
 重要：实现明确注释“不要自动回滚重试”以避免 late ACK 重放导致重复。
 
@@ -140,4 +140,3 @@ batch 完成后返回（通过 `tool.result` 回写）：
 说明：
 - `summary` 来源于可解析的 `deliverable/result_fields`，取 `summary` 或前若干 `result_fields` 文本摘要。
 - `output_box_id`、`summary`、`error` 均为可选；失败任务会尽量带错误码（如 `downstream_unavailable`、`dispatch_*`、`missing_deliverable_card_id`）。
-

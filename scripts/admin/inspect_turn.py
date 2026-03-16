@@ -54,15 +54,15 @@ def _iter_tool_results(
         cur.execute(
             """
             SELECT correlation_id,
-                   payload->>'tool_name' AS tool_name,
                    payload->>'status' AS status,
+                   payload->>'after_execution' AS after_execution,
                    payload->>'tool_result_card_id' AS tool_result_card_id,
                    created_at
             FROM state.agent_inbox
             WHERE project_id=%s
               AND agent_id=%s
               AND message_type='tool_result'
-              AND payload->>'agent_turn_id'=%s
+              AND agent_turn_id=%s
             ORDER BY created_at DESC
             """,
             (project_id, agent_id, agent_turn_id),
@@ -149,7 +149,7 @@ def main() -> None:
                 )
 
         print("tool_results:")
-        for correlation_id, tool_name, status, card_id, created_at in _iter_tool_results(
+        for correlation_id, status, after_execution, card_id, created_at in _iter_tool_results(
             conn,
             args.project,
             args.agent_id,
@@ -161,7 +161,7 @@ def main() -> None:
                 if isinstance(content, dict):
                     summary = _summarize_tool_result(content)
             print(
-                f"- tool_call_id={correlation_id} tool={tool_name} status={status} "
+                f"- tool_call_id={correlation_id} status={status} after_execution={after_execution} "
                 f"card_id={card_id} created_at={created_at} {summary}"
             )
 

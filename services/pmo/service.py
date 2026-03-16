@@ -11,9 +11,11 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from core.cg_context import CGContext
 from core.config import PROTOCOL_VERSION
 from core.app_config import load_app_config
-from core.errors import BadRequestError, build_error_result_from_exception
+from core.errors import BadRequestError, ProtocolViolationError, build_error_result_from_exception
+from core.payload_control import sanitize_payload_control_fields
 from core.status import STATUS_FAILED, STATUS_SUCCESS, TOOL_RESULT_STATUS_SET
 from core.subject import parse_subject, subject_pattern
 from core.config_defaults import (
@@ -22,7 +24,6 @@ from core.config_defaults import (
     DEFAULT_PMO_DISPATCHED_TIMEOUT_SECONDS,
     DEFAULT_PMO_ACTIVE_REAP_SECONDS,
     DEFAULT_PMO_PENDING_WAKEUP_SECONDS,
-    DEFAULT_PMO_PENDING_WAKEUP_SKIP_SECONDS,
     DEFAULT_PMO_MAX_CONCURRENCY,
     DEFAULT_PMO_QUEUE_MAXSIZE,
     DEFAULT_PMO_FORK_JOIN_DEFAULT_DEADLINE_SECONDS,
@@ -31,10 +32,10 @@ from core.config_defaults import (
 from core.utils import safe_str, set_loop_policy
 from infra.observability.otel import get_tracer, is_compact_exception, mark_span_error, traced
 from infra.service_runtime import ServiceBase
+from infra.messaging.ingress import build_nats_ingress_context
 
 from .handover import HandoverPacker
 from .internal_handlers.base import InternalHandlerDeps
-from .internal_handlers.context import InternalHandlerContext
 from .internal_handlers.ask_expert import AskExpertHandler
 from .internal_handlers.delegate_async import DelegateAsyncHandler
 from .internal_handlers.fork_join import ForkJoinHandler
@@ -44,7 +45,7 @@ from .l0_guard import L0Guard
 from .l1_orchestrators import BatchManager
 from infra.l0.tool_reports import publish_tool_result_report
 from .protocol import PMOToolCommand, SubjectMeta, decode_tool_command, parse_subject_cmd
-from .reply import build_and_save_tool_result_reply, parse_best_effort_resume_context
+from .reply import build_and_save_tool_result_reply
 
 set_loop_policy()
 
@@ -81,27 +82,6 @@ def _is_fork_join_invalid_args(exc: Exception, *, tool_name: str) -> bool:
         and isinstance(exc, BadRequestError)
         and "invalid args" in str(exc)
     )
-
-
-def _subject_span_attrs(args: Dict[str, Any]) -> Dict[str, Any]:
-    return {"cg.subject": str(args.get("subject"))}
-
-
-def _work_item_span_attrs(args: Dict[str, Any]) -> Dict[str, Any]:
-    item = args.get("item")
-    if item is None:
-        return {}
-    return {
-        "cg.kind": str(getattr(item, "kind", "")),
-        "cg.subject": str(getattr(item, "subject", "")),
-    }
-
-
-def _internal_handler_span_attrs(args: Dict[str, Any]) -> Dict[str, Any]:
-    handler = args.get("handler")
-    if handler is None:
-        return {}
-    return {"cg.handler": str(getattr(handler, "name", type(handler).__name__))}
 
 
 # ----------------------------- Service ----------------------------- #
@@ -223,9 +203,6 @@ class PMOService(ServiceBase):
         self.pending_wakeup_seconds = float(
             pmo_cfg.get("pending_wakeup_seconds", DEFAULT_PMO_PENDING_WAKEUP_SECONDS)
         )
-        self.pending_wakeup_skip_seconds = float(
-            pmo_cfg.get("pending_wakeup_skip_seconds", DEFAULT_PMO_PENDING_WAKEUP_SKIP_SECONDS)
-        )
 
         self.queue_maxsize = int(pmo_cfg.get("queue_maxsize", DEFAULT_PMO_QUEUE_MAXSIZE))
         if self.queue_maxsize < 0:
@@ -247,12 +224,11 @@ class PMOService(ServiceBase):
             dispatched_timeout_seconds=self.dispatched_timeout_seconds,
             active_reap_seconds=self.active_reap_seconds,
             pending_wakeup_seconds=self.pending_wakeup_seconds,
-            pending_wakeup_skip_seconds=self.pending_wakeup_skip_seconds,
         )
     async def start(self) -> None:
         await self.open()
 
-        # Listen to COMMANDS: cg.v1r3.*.*.cmd.sys.pmo.>
+        # Listen to COMMANDS: cg.v1r4.*.*.cmd.sys.pmo.>
         subject = subject_pattern(
             project_id="*",
             channel_id="*",
@@ -348,7 +324,6 @@ class PMOService(ServiceBase):
         record_exception=True,
         set_status_on_exception=True,
         span_arg="_span",
-        attributes_getter=_work_item_span_attrs,
     )
     async def _handle_work_item(
         self,
@@ -376,12 +351,11 @@ class PMOService(ServiceBase):
 
     async def _watchdog_loop(self) -> None:
         logger.info(
-            "PMO watchdog started interval=%ss retry_dispatched=%ss timeout_dispatched=%ss pending_wakeup=%ss pending_wakeup_skip=%ss reap_active=%ss",
+            "PMO watchdog started interval=%ss retry_dispatched=%ss timeout_dispatched=%ss pending_wakeup=%ss reap_active=%ss",
             self.watchdog_interval_seconds,
             self.dispatched_retry_seconds,
             self.dispatched_timeout_seconds,
             self.pending_wakeup_seconds,
-            self.pending_wakeup_skip_seconds,
             self.active_reap_seconds,
         )
         while True:
@@ -401,7 +375,6 @@ class PMOService(ServiceBase):
         _TRACER,
         "pmo.handle_tool_command",
         span_arg="_span",
-        attributes_getter=_subject_span_attrs,
     )
     async def _handle_tool_command(
         self,
@@ -416,34 +389,60 @@ class PMOService(ServiceBase):
             logger.warning("⚠️ Unrecognized subject: %s", subject)
             return
 
+        ingress_ctx = None
+        try:
+            ingress_ctx, _ = build_nats_ingress_context(
+                headers=headers,
+                raw_payload=data if isinstance(data, dict) else {},
+                subject_parts=meta,
+            )
+        except ProtocolViolationError as exc:
+            logger.error("❌ Invalid ingress context: %s", exc)
+            fallback_payload = sanitize_payload_control_fields(data if isinstance(data, dict) else {})
+            try:
+                ingress_ctx, _ = build_nats_ingress_context(
+                    headers=headers,
+                    raw_payload=fallback_payload,
+                    subject_parts=meta,
+                )
+            except ProtocolViolationError as fallback_exc:
+                self._log_unreplyable_ingress_failure(
+                    subject=subject,
+                    data=data,
+                    headers=headers,
+                    exc=exc,
+                    fallback_exc=fallback_exc,
+                )
+                return
+            await self._reply_failed_best_effort(
+                meta=meta,
+                data=data,
+                ingress_ctx=ingress_ctx,
+                exc=exc,
+            )
+            return
         try:
             cmd = await decode_tool_command(
-                data=data or {},
+                data=dict(data or {}),
+                ctx=ingress_ctx,
                 cardbox=self.cardbox,
-                project_id=meta.project_id,
             )
         except Exception as exc:
             logger.error("❌ Failed to decode payload: %s", exc)
-            await self._reply_failed_best_effort(meta=meta, data=data, headers=headers, exc=exc)
+            await self._reply_failed_best_effort(
+                meta=meta,
+                data=data,
+                ingress_ctx=ingress_ctx,
+                exc=exc,
+            )
             return
 
-        if span is not None:
-            span.set_attribute("cg.project_id", str(meta.project_id))
-            span.set_attribute("cg.channel_id", str(meta.channel_id))
-            span.set_attribute("cg.tool_suffix", str(meta.tool_suffix))
-            span.set_attribute("cg.tool_name", str(cmd.tool_name))
-            span.set_attribute("cg.tool_call_id", str(cmd.tool_call_id or ""))
-            span.set_attribute("cg.source_agent_id", str(cmd.source_agent_id or ""))
-
-        ctx = InternalHandlerContext(deps=self._internal_deps, meta=meta, cmd=cmd, headers=headers)
-        ctx.normalize_headers()
-        # Replies should use normalized trace headers, not any handler-specific header mutations.
-        headers = ctx.headers
+        ctx = ingress_ctx.with_tool_call(cmd.tool_call_id)
 
         db_after, handler = await self._resolve_internal_handler(
             meta=meta,
             cmd=cmd,
-            headers=headers,
+            ctx=ctx,
         )
         if not handler:
             return
@@ -451,7 +450,9 @@ class PMOService(ServiceBase):
         try:
             defer_resume, result_data = await self._invoke_internal_handler(
                 handler=handler,
+                deps=self._internal_deps,
                 ctx=ctx,
+                cmd=cmd,
                 parent_after_execution=db_after or cmd.after_execution,
             )
         except Exception as exc:  # noqa: BLE001
@@ -475,7 +476,7 @@ class PMOService(ServiceBase):
             await self._reply_failed_from_exception(
                 meta,
                 cmd,
-                headers=headers,
+                ctx=ctx,
                 after_execution=db_after,
                 exc=exc,
             )
@@ -488,27 +489,30 @@ class PMOService(ServiceBase):
         await self._reply_resume(
             meta,
             cmd,
+            ctx=ctx,
             status=STATUS_SUCCESS,
             result=result_data or {"status": "processed"},
-            headers=headers,
             after_execution=db_after,
         )
 
     @traced(
         _TRACER,
         "pmo.internal_handler",
-        attributes_getter=_internal_handler_span_attrs,
         mark_error_on_exception=True,
     )
     async def _invoke_internal_handler(
         self,
         *,
         handler: Any,
-        ctx: InternalHandlerContext,
+        deps: InternalHandlerDeps,
+        ctx: CGContext,
+        cmd: PMOToolCommand,
         parent_after_execution: str,
     ) -> tuple[bool, Dict[str, Any]]:
         defer_resume, result_data = await handler.handle(
+            deps=deps,
             ctx=ctx,
+            cmd=cmd,
             parent_after_execution=parent_after_execution,
         )
         return defer_resume, result_data or {}
@@ -521,7 +525,7 @@ class PMOService(ServiceBase):
         *,
         meta: SubjectMeta,
         cmd: PMOToolCommand,
-        headers: Dict[str, str],
+        ctx: CGContext,
     ) -> tuple[Optional[str], Any]:
         internal_func = _parse_internal_function(meta.tool_suffix)
         tool_def = await self.resource_store.fetch_tool_definition_model(meta.project_id, cmd.tool_name)
@@ -530,7 +534,7 @@ class PMOService(ServiceBase):
             await self._reply_validation_failure(
                 meta=meta,
                 cmd=cmd,
-                headers=headers,
+                ctx=ctx,
                 error_code="tool_definition_missing",
                 error_message=f"Tool definition missing: {cmd.tool_name}",
                 after_execution=None,
@@ -542,7 +546,7 @@ class PMOService(ServiceBase):
             await self._reply_validation_failure(
                 meta=meta,
                 cmd=cmd,
-                headers=headers,
+                ctx=ctx,
                 error_code="after_execution_mismatch",
                 error_message=f"expected {db_after}, got {cmd.after_execution}",
                 after_execution=db_after,
@@ -553,7 +557,7 @@ class PMOService(ServiceBase):
             await self._reply_validation_failure(
                 meta=meta,
                 cmd=cmd,
-                headers=headers,
+                ctx=ctx,
                 error_code="unsupported_pmo_route",
                 error_message=(
                     "PMO only supports internal routes: expected suffix "
@@ -568,7 +572,7 @@ class PMOService(ServiceBase):
             await self._reply_validation_failure(
                 meta=meta,
                 cmd=cmd,
-                headers=headers,
+                ctx=ctx,
                 error_code="not_implemented",
                 error_message=f"PMO internal function not implemented: {internal_func}",
                 after_execution=db_after,
@@ -581,7 +585,7 @@ class PMOService(ServiceBase):
         *,
         meta: SubjectMeta,
         cmd: PMOToolCommand,
-        headers: Dict[str, str],
+        ctx: CGContext,
         error_code: str,
         error_message: str,
         after_execution: Optional[str],
@@ -589,9 +593,9 @@ class PMOService(ServiceBase):
         await self._reply_resume(
             meta,
             cmd,
+            ctx=ctx,
             status=STATUS_FAILED,
             result={"error_code": error_code, "error_message": error_message},
-            headers=headers,
             after_execution=after_execution,
         )
 
@@ -599,7 +603,6 @@ class PMOService(ServiceBase):
         _TRACER,
         "pmo.handle_task_event",
         span_arg="_span",
-        attributes_getter=_subject_span_attrs,
     )
     async def _handle_agent_task_event(
         self,
@@ -608,47 +611,51 @@ class PMOService(ServiceBase):
         headers: Dict[str, str],
         _span: Any = None,
     ) -> None:
-        _ = headers
-        span = _span
         parts = parse_subject(subject)
         if not parts:
             return
-        agent_turn_id = data.get("agent_turn_id")
-        status = data.get("status")
+        try:
+            ingress_ctx, safe_payload = build_nats_ingress_context(
+                headers=headers,
+                raw_payload=data if isinstance(data, dict) else {},
+                subject_parts=parts,
+            )
+        except ProtocolViolationError as exc:
+            logger.warning("Invalid agent task event context: %s", exc)
+            return
+        agent_turn_id = ingress_ctx.agent_turn_id
+        status = safe_payload.get("status")
         if not agent_turn_id or status not in TOOL_RESULT_STATUS_SET:
             return
-        if span is not None:
-            span.set_attribute("cg.project_id", str(parts.project_id))
-            span.set_attribute("cg.channel_id", str(parts.channel_id))
-            span.set_attribute("cg.agent_turn_id", str(agent_turn_id))
-            span.set_attribute("cg.status", str(status))
         await self.batch_manager.handle_child_task_event(
             project_id=parts.project_id,
             agent_turn_id=str(agent_turn_id),
             status=str(status),
-            output_box_id=safe_str(data.get("output_box_id")),
-            deliverable_card_id=safe_str(data.get("deliverable_card_id")),
-            tool_result_card_id=safe_str(data.get("tool_result_card_id")),
-            error=safe_str(data.get("error")),
+            output_box_id=safe_str(safe_payload.get("output_box_id")),
+            deliverable_card_id=safe_str(safe_payload.get("deliverable_card_id")),
+            tool_result_card_id=safe_str(safe_payload.get("tool_result_card_id")),
+            error=safe_str(safe_payload.get("error")),
         )
 
     async def _publish_tool_result_payload(
         self,
         *,
         meta: SubjectMeta,
+        ctx: CGContext,
         payload: Dict[str, Any],
-        headers: Dict[str, str],
+        correlation_id: Optional[str] = None,
     ) -> None:
+        source_ctx = ctx.evolve(agent_id="sys.pmo", agent_turn_id="", step_id=None)
         await publish_tool_result_report(
             nats=self.nats,
             execution_store=self.execution_store,
+            cardbox=self.cardbox,
             resource_store=self.resource_store,
             state_store=self.state_store,
-            project_id=meta.project_id,
-            channel_id=meta.channel_id,
+            source_ctx=source_ctx,
+            target_ctx=ctx,
             payload=payload,
-            headers=headers,
-            source_agent_id="sys.pmo",
+            correlation_id=correlation_id,
         )
 
     async def _reply_failed_from_exception(
@@ -656,7 +663,7 @@ class PMOService(ServiceBase):
         meta: SubjectMeta,
         cmd: PMOToolCommand,
         *,
-        headers: Dict[str, str],
+        ctx: CGContext,
         after_execution: Optional[str],
         exc: Exception,
     ) -> None:
@@ -664,10 +671,10 @@ class PMOService(ServiceBase):
         await self._reply_resume(
             meta,
             cmd,
+            ctx=ctx,
             status=STATUS_FAILED,
             result=result,
             error=error,
-            headers=headers,
             after_execution=after_execution,
         )
 
@@ -676,43 +683,72 @@ class PMOService(ServiceBase):
         *,
         meta: SubjectMeta,
         data: Dict[str, Any],
-        headers: Dict[str, str],
+        ingress_ctx: CGContext,
         exc: Exception,
     ) -> None:
-        ctx = parse_best_effort_resume_context(data or {})
-        if not ctx:
+        try:
+            tool_call_id = ingress_ctx.require_tool_call_id
+        except ProtocolViolationError:
             return
+        agent_turn_id = safe_str(ingress_ctx.agent_turn_id)
+        if not tool_call_id or not agent_turn_id:
+            return
+        after_execution = safe_str((data or {}).get("after_execution")) or "suspend"
+        if after_execution not in ("suspend", "terminate"):
+            after_execution = "suspend"
+        tool_name = safe_str((data or {}).get("tool_name")) or "unknown"
+        tool_call_card_id = safe_str((data or {}).get("tool_call_card_id"))
         result, error = build_error_result_from_exception(exc, source="worker")
         cmd_data = {
-            "tool_call_id": ctx.tool_call_id,
-            "agent_turn_id": ctx.agent_turn_id,
-            "turn_epoch": ctx.turn_epoch,
-            "agent_id": ctx.agent_id,
-            "after_execution": ctx.after_execution,
-            "tool_name": ctx.tool_name,
+            "after_execution": after_execution,
+            "tool_name": tool_name,
         }
+        reply_ctx = ingress_ctx.with_tool_call(tool_call_id)
         payload, _ = await build_and_save_tool_result_reply(
             cardbox=self.cardbox,
-            project_id=meta.project_id,
-            tool_call_card_id=ctx.tool_call_card_id,
+            ctx=reply_ctx,
+            tool_call_card_id=tool_call_card_id,
             cmd_data=cmd_data,
             status=STATUS_FAILED,
             result=result,
             error=error,
-            function_name=ctx.tool_name,
-            after_execution=ctx.after_execution,
+            function_name=tool_name,
+            after_execution=after_execution,
             warn_context="bad_request",
         )
-        await self._publish_tool_result_payload(meta=meta, payload=payload, headers=headers)
+        await self._publish_tool_result_payload(
+            meta=meta,
+            ctx=reply_ctx,
+            payload=payload,
+            correlation_id=tool_call_id,
+        )
+
+    def _log_unreplyable_ingress_failure(
+        self,
+        *,
+        subject: str,
+        data: Dict[str, Any],
+        headers: Dict[str, str],
+        exc: Exception,
+        fallback_exc: Exception,
+    ) -> None:
+        logger.error(
+            "❌ PMO ingress failure is not replyable subject=%s primary=%s fallback=%s payload_keys=%s header_keys=%s",
+            subject,
+            exc,
+            fallback_exc,
+            sorted(str(k) for k in (data or {}).keys()) if isinstance(data, dict) else [],
+            sorted(str(k) for k in (headers or {}).keys()),
+        )
 
 
     async def _reply_resume(
         self,
         meta: SubjectMeta,
         cmd: PMOToolCommand,
+        ctx: CGContext,
         status: str,
         result: Any,
-        headers: Dict[str, str],
         after_execution: Optional[str] = None,
         error: Optional[Any] = None,
     ) -> None:
@@ -723,16 +759,12 @@ class PMOService(ServiceBase):
             error = result
 
         cmd_data = {
-            "tool_call_id": cmd.tool_call_id,
-            "agent_turn_id": cmd.agent_turn_id,
-            "turn_epoch": cmd.turn_epoch,
-            "agent_id": cmd.source_agent_id,
             "after_execution": after_exec,
             "tool_name": cmd.tool_name,
         }
         payload, _ = await build_and_save_tool_result_reply(
             cardbox=self.cardbox,
-            project_id=meta.project_id,
+            ctx=ctx,
             tool_call_card_id=cmd.tool_call_card_id,
             cmd_data=cmd_data,
             status=status,
@@ -742,8 +774,13 @@ class PMOService(ServiceBase):
             after_execution=after_exec,
             warn_context="resume",
         )
-        await self._publish_tool_result_payload(meta=meta, payload=payload, headers=headers)
-        logger.info(f"↩️  Replied RESUME to {cmd.source_agent_id} (status={status})")
+        await self._publish_tool_result_payload(
+            meta=meta,
+            ctx=ctx,
+            payload=payload,
+            correlation_id=cmd.tool_call_id,
+        )
+        logger.info(f"↩️  Replied RESUME to {ctx.agent_id} (status={status})")
 
 
 

@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import argparse
 import asyncio
+import json
 import os
 from typing import Any, Dict, Optional
 
@@ -25,8 +26,10 @@ import uuid6
 
 import pytest
 
+from core.cg_context import CGContext
 from core.config import PROTOCOL_VERSION
 from core.headers import ensure_recursion_depth
+from core.message_source import MessageSource
 from core.trace import ensure_trace_headers
 from infra.nats_client import NATSClient
 from infra.primitives import enqueue as enqueue_primitive
@@ -94,42 +97,37 @@ async def _run(args: argparse.Namespace) -> int:
         headers, _, trace_id = ensure_trace_headers({}, trace_id=str(uuid6.uuid7()))
         headers = ensure_recursion_depth(headers, default_depth=0)
         correlation_id = f"tc_{uuid6.uuid7().hex}"
+        agent_turn_id = f"turn_{uuid6.uuid7().hex}"
+        step_id = f"step_{uuid6.uuid7().hex}"
         payload = {
-            "tool_call_id": correlation_id,
-            "agent_id": args.agent_id,
-            "agent_turn_id": f"turn_{uuid6.uuid7().hex}",
-            "turn_epoch": 1,
-            "step_id": f"step_{uuid6.uuid7().hex}",
+            "status": "success",
+            "after_execution": "suspend",
             "tool_result_card_id": f"card_{uuid6.uuid7().hex}",
         }
         enqueue_payload = {
-            "tool_call_id": correlation_id,
-            "agent_id": args.agent_id,
-            "agent_turn_id": payload["agent_turn_id"],
-            "turn_epoch": payload["turn_epoch"],
-            "step_id": payload["step_id"],
+            "kind": "traceparent_flow_probe",
         }
         async with execution_store.pool.connection() as conn:
             async with conn.transaction():
-                enqueue_result = await enqueue_primitive(
-                    store=execution_store,
+                enqueue_ctx = CGContext(
                     project_id=args.project,
                     channel_id=args.channel,
-                    target_agent_id=args.agent_id,
+                    agent_id=args.agent_id,
+                    agent_turn_id=agent_turn_id,
+                    step_id=step_id,
+                    trace_id=trace_id,
+                    recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
+                    parent_agent_id="sys.test_traceparent_flow",
+                    parent_step_id=step_id,
+                    headers=headers,
+                )
+                enqueue_result = await enqueue_primitive(
+                    store=execution_store,
+                    ctx=enqueue_ctx,
+                    source=MessageSource.from_ctx(enqueue_ctx),
                     message_type="tool_call",
                     payload=enqueue_payload,
-                    enqueue_mode="call",
                     correlation_id=correlation_id,
-                    recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
-                    headers=headers,
-                    traceparent=headers.get("traceparent"),
-                    tracestate=headers.get("tracestate"),
-                    trace_id=trace_id,
-                    parent_step_id=enqueue_payload["step_id"],
-                    source_agent_id="sys.test_traceparent_flow",
-                    source_agent_turn_id=None,
-                    source_step_id=enqueue_payload["step_id"],
-                    target_agent_turn_id=enqueue_payload["agent_turn_id"],
                     conn=conn,
                 )
         headers = dict(headers)
@@ -137,30 +135,43 @@ async def _run(args: argparse.Namespace) -> int:
 
         async with execution_store.pool.connection() as conn:
             async with conn.transaction():
-                report_result = await report_primitive(
-                    store=execution_store,
+                report_ctx = CGContext(
                     project_id=args.project,
                     channel_id=args.channel,
-                    target_agent_id=args.agent_id,
+                    agent_id=args.agent_id,
+                    agent_turn_id=agent_turn_id,
+                    step_id=step_id,
+                    trace_id=trace_id,
+                    recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
+                    parent_agent_id="sys.test_traceparent_flow",
+                    parent_step_id=step_id,
+                    headers=headers,
+                )
+                report_result = await report_primitive(
+                    store=execution_store,
+                    ctx=report_ctx,
+                    source=MessageSource.from_ctx(report_ctx),
                     message_type="tool_result",
                     payload=payload,
                     correlation_id=correlation_id,
-                    headers=headers,
-                    traceparent=headers.get("traceparent"),
-                    tracestate=headers.get("tracestate"),
-                    trace_id=trace_id,
-                    parent_step_id=payload["step_id"],
-                    source_agent_id="sys.test_traceparent_flow",
                     conn=conn,
                 )
 
         rows = await execution_store.list_inbox_by_correlation(
-            project_id=args.project,
-            agent_id=args.agent_id,
+            ctx=CGContext(project_id=args.project, agent_id=args.agent_id, channel_id=args.channel),
             correlation_id=correlation_id,
             limit=10,
         )
-        inbox_traceparent = rows[0].get("traceparent") if rows else None
+        inbox_traceparent = None
+        if rows:
+            headers = rows[0].get("context_headers") or {}
+            if isinstance(headers, str):
+                try:
+                    headers = json.loads(headers)
+                except Exception:  # noqa: BLE001
+                    headers = {}
+            if isinstance(headers, dict):
+                inbox_traceparent = headers.get("traceparent")
         assert inbox_traceparent == report_result.traceparent, (
             f"traceparent mismatch: inbox={inbox_traceparent} report={report_result.traceparent}"
         )

@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import os
-from pathlib import Path
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, Optional
@@ -16,11 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from core.app_config import load_app_config, config_to_dict
-from core.config import PROTOCOL_VERSION
+from core.cg_context import CGContext
 from core.config_defaults import DEFAULT_API_LISTEN_HOST, DEFAULT_API_PORT
 from core.utils import set_loop_policy, REPO_ROOT
-from core.headers import ensure_recursion_depth
-from core.trace import ensure_trace_headers
 from core.errors import (
     BadRequestError,
     CGError,
@@ -30,10 +27,9 @@ from core.errors import (
     http_detail_from_exception,
     http_status_from_exception,
 )
-import uuid6
 from infra.cardbox_client import CardBoxClient
 from infra.nats_client import NATSClient
-from infra.l0_engine import L0Engine
+from infra.l0_engine import AddressIntent, L0Engine, TurnRef
 from infra.project_bootstrap import ProjectBootstrapper
 from infra.service_runtime import ServiceRuntime
 from infra.stores import (
@@ -82,7 +78,8 @@ from services.api.artifact_models import ArtifactSignedUrlResponse, ArtifactUplo
 from infra.gcs_client import GcsConfig
 from infra.gcs_client import GcsClient
 from infra.artifacts import ArtifactManager
-from core.utp_protocol import Card, ToolCallContent, ToolResultContent
+from services.tools.tool_caller import ToolCaller
+import uuid6
 
 set_loop_policy()
 
@@ -882,7 +879,7 @@ async def get_project_agent(
     agent_id: str,
     resource_store: ResourceStore = Depends(get_resource_store),
 ) -> AgentRoster:
-    row = await resource_store.fetch_roster(project_id, agent_id)
+    row = await resource_store.fetch_roster(CGContext(project_id=project_id, agent_id=agent_id))
     if not row:
         _raise_http_exception(NotFoundError("agent not found"))
     return AgentRoster.model_validate(row)
@@ -932,8 +929,11 @@ async def upsert_project_agent(
         metadata["profile_name"] = profile_name_value
 
     await resource_store.upsert_project_agent(
-        project_id=project_id,
-        agent_id=payload.agent_id,
+        ctx=CGContext(
+            project_id=project_id,
+            channel_id=payload.channel_id or "public",
+            agent_id=payload.agent_id,
+        ),
         profile_box_id=str(profile_box_id),
         worker_target=worker_target,
         tags=tags,
@@ -943,13 +943,17 @@ async def upsert_project_agent(
     )
     if payload.init_state:
         await state_store.init_if_absent(
-            project_id=project_id,
-            agent_id=payload.agent_id,
-            active_channel_id=payload.channel_id or "public",
+            ctx=CGContext(
+                project_id=project_id,
+                channel_id=payload.channel_id or "public",
+                agent_id=payload.agent_id,
+            ),
             profile_box_id=str(profile_box_id),
         )
 
-    row = await resource_store.fetch_roster(project_id, payload.agent_id)
+    row = await resource_store.fetch_roster(
+        CGContext(project_id=project_id, agent_id=payload.agent_id, channel_id=payload.channel_id or "public")
+    )
     if not row:
         _raise_http_exception(InternalError("failed to upsert agent"))
     return AgentRoster.model_validate(row)
@@ -1234,41 +1238,6 @@ async def batch_get_cards(
     return BatchCardsResponse(cards=cards_out, missing_ids=missing_ids)
 
 
-async def _wait_tool_result_inbox_via_store(
-    *,
-    execution_store: ExecutionStore,
-    project_id: str,
-    agent_id: str,
-    tool_call_id: str,
-    timeout_seconds: float,
-) -> Dict[str, Any]:
-    deadline = asyncio.get_event_loop().time() + float(timeout_seconds)
-    while True:
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            raise TimeoutError("timeout waiting for tool_result inbox")
-        rows = await execution_store.list_inbox_by_correlation(
-            project_id=project_id,
-            agent_id=agent_id,
-            correlation_id=tool_call_id,
-            limit=20,
-        )
-        for row in rows:
-            if row.get("message_type") != "tool_result":
-                continue
-            inbox_id = row.get("inbox_id")
-            if inbox_id:
-                await execution_store.update_inbox_status(
-                    inbox_id=inbox_id,
-                    project_id=project_id,
-                    status="consumed",
-                )
-            payload = row.get("payload") or {}
-            if isinstance(payload, dict):
-                return payload
-        await asyncio.sleep(min(0.5, remaining))
-
-
 @app.post("/projects/{project_id}/god/pmo/{tool_name}:call", response_model=PMOToolCallResponse)
 async def god_call_pmo_internal_tool(
     project_id: str,
@@ -1276,115 +1245,57 @@ async def god_call_pmo_internal_tool(
     data: PMOToolCallRequest,
     nats: NATSClient = Depends(get_nats),
     execution_store: ExecutionStore = Depends(get_execution_store),
+    resource_store: ResourceStore = Depends(get_resource_store),
     cardbox: CardBoxClient = Depends(get_cardbox),
 ) -> PMOToolCallResponse:
     if not _is_god_api_enabled():
         _raise_http_exception(NotFoundError("Not Found"))
-
-    tool_call_id = f"call_{uuid6.uuid7().hex}"
-    step_id = f"step_gc_{uuid6.uuid7().hex}"
-    agent_turn_id = f"turn_gc_{uuid6.uuid7().hex}"
-
-    pmo_subject = f"cg.{PROTOCOL_VERSION}.{project_id}.{data.channel_id}.cmd.sys.pmo.internal.{tool_name}"
-    tool_call_card = Card(
-        card_id=uuid6.uuid7().hex,
-        project_id=project_id,
-        type="tool.call",
-        content=ToolCallContent(
-            tool_name=tool_name,
-            arguments=dict(data.args or {}),
-            status="called",
-            target_subject=pmo_subject,
-        ),
-        created_at=datetime.utcnow(),
-        author_id=str(data.caller_agent_id),
-        metadata={
-            "agent_turn_id": agent_turn_id,
-            "step_id": step_id,
-            "tool_call_id": tool_call_id,
-            "role": "assistant",
-            "trace_id": str(data.trace_id or uuid6.uuid7()),
-        },
-        tool_call_id=tool_call_id,
-    )
-    await cardbox.save_card(tool_call_card)
-
-    payload = {
-        "agent_id": str(data.caller_agent_id),
-        "agent_turn_id": agent_turn_id,
-        "turn_epoch": 1,
-        "tool_call_id": tool_call_id,
-        "tool_name": tool_name,
-        "after_execution": str(data.after_execution),
-        "tool_call_card_id": tool_call_card.card_id,
-        "step_id": step_id,
-    }
-
-    headers, _, trace_id = ensure_trace_headers({}, trace_id=data.trace_id)
-    headers = ensure_recursion_depth(headers, default_depth=0)
-
-    await execution_store.insert_execution_edge(
-        edge_id=f"edge_{uuid6.uuid7().hex}",
-        project_id=project_id,
-        channel_id=data.channel_id,
-        primitive="enqueue",
-        edge_phase="request",
-        source_agent_id=str(data.caller_agent_id),
-        source_agent_turn_id=agent_turn_id,
-        source_step_id=step_id,
-        target_agent_id="sys.pmo",
-        target_agent_turn_id=None,
-        correlation_id=tool_call_id,
-        enqueue_mode="call",
-        recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
-        trace_id=trace_id,
-        parent_step_id=step_id,
-        metadata={
-            "message_type": "tool_call",
-            "enqueue_mode": "call",
-            "inbox_id": tool_call_id,
-            "recursion_depth": int(headers.get("CG-Recursion-Depth", "0")),
-        },
-    )
-    await nats.publish_event(pmo_subject, payload, headers=headers)
-
     try:
-        inbox_payload = await _wait_tool_result_inbox_via_store(
-            execution_store=execution_store,
+        tool_call_id = f"call_{uuid6.uuid7().hex}"
+        step_id = f"step_gc_{uuid6.uuid7().hex}"
+        agent_turn_id = f"turn_gc_{uuid6.uuid7().hex}"
+        caller_ctx = CGContext(
             project_id=project_id,
+            channel_id=data.channel_id,
             agent_id=str(data.caller_agent_id),
-            tool_call_id=tool_call_id,
-            timeout_seconds=float(data.timeout_seconds),
+        ).with_trace_transport(
+            base_headers={},
+            trace_id=data.trace_id,
+            default_depth=0,
         )
-    except TimeoutError as exc:
-        _raise_http_exception(BadRequestError(str(exc)))
-
-    tool_result: Dict[str, Any] = {}
-    tool_result_card_id = inbox_payload.get("tool_result_card_id")
-    if isinstance(tool_result_card_id, str) and tool_result_card_id:
-        cards = await cardbox.get_cards([tool_result_card_id], project_id=project_id)
-        tr = cards[0] if cards else None
-        if tr:
-            content_obj = getattr(tr, "content", None)
-            if isinstance(content_obj, ToolResultContent):
-                tool_result = {
-                    "status": content_obj.status,
-                    "after_execution": content_obj.after_execution,
-                    "result": content_obj.result,
-                    "error": content_obj.error,
-                }
-            elif isinstance(content_obj, dict):
-                tool_result = content_obj
-            else:
-                tool_result = {"status": "failed", "result": {"error_message": "tool.result content not dict"}}
-
-    _ = trace_id
-    return PMOToolCallResponse(
-        tool_call_id=tool_call_id,
-        step_id=step_id,
-        tool_result_card_id=str(tool_result_card_id) if tool_result_card_id else None,
-        tool_result=tool_result,
-    )
+        tool_caller = ToolCaller(
+            cardbox=cardbox,
+            nats=nats,
+            resource_store=resource_store,
+            execution_store=execution_store,
+        )
+        call_result = await tool_caller.call(
+            caller_ctx=caller_ctx,
+            tool_name=tool_name,
+            args=dict(data.args or {}),
+            after_execution_override=str(data.after_execution),
+            tool_call_id=tool_call_id,
+            step_id=step_id,
+            agent_turn_id=agent_turn_id,
+            await_result=True,
+            ack_result=True,
+            timeout_s=float(data.timeout_seconds),
+        )
+        tool_result_payload = call_result.payload if isinstance(call_result.payload, dict) else None
+        if tool_result_payload is None:
+            _raise_http_exception(BadRequestError("timeout waiting for tool_result inbox"))
+        tool_result_card_id = str(call_result.tool_result_card_id) if call_result.tool_result_card_id else None
+        return PMOToolCallResponse(
+            tool_call_id=call_result.tool_call_id,
+            step_id=call_result.step_id,
+            tool_result_card_id=tool_result_card_id,
+            tool_result=dict(tool_result_payload),
+        )
+    except CGError as exc:
+        _raise_http_exception(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("god_call_pmo_internal_tool failed")
+        _raise_http_exception(exc)
 
 
 @app.post("/projects/{project_id}/god/stop", response_model=GodStopResponse)
@@ -1399,14 +1310,8 @@ async def god_stop(
     if not _is_god_api_enabled():
         _raise_http_exception(NotFoundError("Not Found"))
     payload = {
-        "agent_id": data.agent_id,
-        "agent_turn_id": data.agent_turn_id,
-        "turn_epoch": int(data.turn_epoch),
         "reason": data.reason,
     }
-    headers = {"CG-Source": "ground_control"}
-    headers, _, trace_id = ensure_trace_headers(headers)
-    headers = ensure_recursion_depth(headers, default_depth=0)
     l0 = L0Engine(
         nats=nats,
         execution_store=execution_store,
@@ -1416,19 +1321,24 @@ async def god_stop(
     wakeup_signals = []
     async with execution_store.pool.connection() as conn:
         async with conn.transaction():
-            result = await l0.report(
+            source_ctx = CGContext(
                 project_id=project_id,
                 channel_id=data.channel_id,
-                target_agent_id=str(data.agent_id),
-                message_type="stop",
-                payload=payload,
-                correlation_id=str(data.agent_turn_id),
-                recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
-                trace_id=trace_id,
-                source_agent_id="sys.ground_control",
-                headers=headers,
-                wakeup=True,
+                agent_id="sys.ground_control",
+            ).with_trace_transport(base_headers={}, default_depth=0)
+            result = await l0.enqueue_intent(
+                source_ctx=source_ctx,
+                intent=AddressIntent(
+                    target=TurnRef(
+                        project_id=project_id,
+                        agent_id=str(data.agent_id),
+                        agent_turn_id=str(data.agent_turn_id),
+                    ),
+                    message_type="stop",
+                    payload=payload,
+                ),
                 conn=conn,
+                wakeup=True,
             )
             wakeup_signals = list(result.wakeup_signals or ())
     if wakeup_signals:

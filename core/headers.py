@@ -6,6 +6,23 @@ from core.errors import ProtocolViolationError
 
 
 RECURSION_DEPTH_HEADER = "CG-Recursion-Depth"
+# Canonical control-flow identity headers.
+CG_PROJECT_ID = "CG-Project-Id"
+CG_CHANNEL_ID = "CG-Channel-Id"
+CG_AGENT_ID = "CG-Agent-Id"
+CG_AGENT_TURN_ID = "CG-Turn-Id"
+CG_TURN_EPOCH = "CG-Turn-Epoch"
+CG_STEP_ID = "CG-Step-Id"
+CG_TOOL_CALL_ID = "CG-Tool-Call-Id"
+CG_PARENT_AGENT_ID = "CG-Parent-Agent-Id"
+CG_PARENT_AGENT_TURN_ID = "CG-Parent-Turn-Id"
+CG_PARENT_STEP_ID = "CG-Parent-Step-Id"
+CG_PARENT_TRACEPARENT_HEADER = "CG-Parent-Traceparent"
+# W3C trace context headers.
+TRACEPARENT_HEADER = "traceparent"
+TRACESTATE_HEADER = "tracestate"
+# Backward-compatible alias.
+CG_RECURSION_DEPTH = RECURSION_DEPTH_HEADER
 # Optional overall. When `require_ack=true` on an L0 cmd, this header MUST be
 # present and point to a Core NATS inbox subject (Request-Reply style).
 L0_ACK_REPLY_HEADER = "CG-L0-Ack-Reply"

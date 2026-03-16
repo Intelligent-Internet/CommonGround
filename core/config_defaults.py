@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
-DEFAULT_PROTOCOL_VERSION = "v1r3"
+DEFAULT_PROTOCOL_VERSION = "v1r4"
 
 DEFAULT_NATS_SERVERS = ["nats://localhost:4222"]
 DEFAULT_NATS_TLS_ENABLED = False
@@ -23,6 +23,7 @@ DEFAULT_WORKER_MAX_CONCURRENCY = 1
 DEFAULT_WORKER_INBOX_FETCH_LIMIT = 20
 DEFAULT_WORKER_WATCHDOG_INTERVAL_SECONDS = 5.0
 DEFAULT_WORKER_INBOX_PROCESSING_TIMEOUT_SECONDS = 300.0
+DEFAULT_WORKER_MAX_RESUME_DEFER_RETRIES = 3
 DEFAULT_WORKER_QUEUE_MAXSIZE_FACTOR = 4
 DEFAULT_WORKER_TARGETS = ["worker_generic"]
 
@@ -33,7 +34,6 @@ DEFAULT_PMO_DISPATCHED_RETRY_SECONDS = 10.0
 DEFAULT_PMO_DISPATCHED_TIMEOUT_SECONDS = 30.0
 DEFAULT_PMO_ACTIVE_REAP_SECONDS = 300.0
 DEFAULT_PMO_PENDING_WAKEUP_SECONDS = 5.0
-DEFAULT_PMO_PENDING_WAKEUP_SKIP_SECONDS = 300.0
 DEFAULT_PMO_FORK_JOIN_DEFAULT_DEADLINE_SECONDS = 900.0
 DEFAULT_PMO_FORK_JOIN_MAX_TASKS = 8
 
@@ -82,6 +82,7 @@ def default_config() -> Dict[str, Any]:
             "inbox_fetch_limit": DEFAULT_WORKER_INBOX_FETCH_LIMIT,
             "watchdog_interval_seconds": DEFAULT_WORKER_WATCHDOG_INTERVAL_SECONDS,
             "inbox_processing_timeout_seconds": DEFAULT_WORKER_INBOX_PROCESSING_TIMEOUT_SECONDS,
+            "max_resume_defer_retries": DEFAULT_WORKER_MAX_RESUME_DEFER_RETRIES,
             "worker_targets": list(DEFAULT_WORKER_TARGETS),
         },
         "pmo": {
@@ -92,7 +93,6 @@ def default_config() -> Dict[str, Any]:
             "dispatched_timeout_seconds": DEFAULT_PMO_DISPATCHED_TIMEOUT_SECONDS,
             "active_reap_seconds": DEFAULT_PMO_ACTIVE_REAP_SECONDS,
             "pending_wakeup_seconds": DEFAULT_PMO_PENDING_WAKEUP_SECONDS,
-            "pending_wakeup_skip_seconds": DEFAULT_PMO_PENDING_WAKEUP_SKIP_SECONDS,
             "fork_join_default_deadline_seconds": DEFAULT_PMO_FORK_JOIN_DEFAULT_DEADLINE_SECONDS,
             "fork_join_max_tasks": DEFAULT_PMO_FORK_JOIN_MAX_TASKS,
         },

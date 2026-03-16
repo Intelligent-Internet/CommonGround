@@ -48,7 +48,7 @@
 1) **Enqueue/Report**：`L0Engine` 或其封装（如 `infra/l0/tool_reports.py`）将请求写入 `state.agent_inbox` 并记录 `execution_edges`。
 2) **Wakeup**：L0 根据 `worker_target` 发布 `cmd.agent.{target}.wakeup`（`target` 为目标 agent 在 `resource.roster` 的 `worker_target`，例如 `worker_generic`）。
 3) **Worker**：竞争锁 → 批量 claim inbox → 水合 `state/resource/cards` → 执行 LLM。
-4) **Tool Call**：Worker 写 `tool.call` 卡，并按工具定义中的 `target_subject` 发布命令（通常是 `cmd.sys.pmo.internal.*` 或 `cmd.tool.*`）。
+4) **Tool Call**：Worker/ToolCaller/API 写 `tool.call` 卡后，通过 `L0Engine.command_intent` 统一下发命令（通常是 `cmd.sys.pmo.internal.*` 或 `cmd.tool.*`）。
 5) **Report**：工具回调写 `tool.result` 卡，通过 `infra/l0/tool_reports.py` 回流到 `L0Engine.report`，写入 `state.agent_inbox` 并再次触发 `cmd.agent.{target}.wakeup`。
 6) **Finalize**：Worker 结束 Turn 时写/更新 `task.deliverable`，并发布 `evt.agent.*.task`。
 > 约束：**一个 Turn 的成功/失败会汇聚为该 Turn 的一次 `evt.agent.*.task` 结果事件**；`BatchManager` 下发的是多个子 Turn（因此会产生多个 task 结果）。
@@ -74,7 +74,7 @@
   - 透传与递增：
     - 当前 L0 原语默认 `enqueue_mode` 处理为 `"call"`；代码层并未保留 `transfer/notify` 模式。
     - 深度通常按调用关系“透传”；默认用户入口是 `0`。
-    - 在需要显式派生子调用场景中，PMO 会手工加一，例如 `services/pmo/internal_handlers/context.py::bump_recursion_depth` 与 `services/pmo/l1_orchestrators/batch_manager.py::child_depth = parent_depth + 1`。
+    - spawn 类子调用现在统一走 L0 `SpawnIntent`；调用方只提交 target intent 与 lineage，child depth / topology 由 L0 派生。
     - `Join/Report` 会通过 `correlation_id` 约束并继承原始深度；`tool_result`/`timeout` 路径保持一致。
   - 区分：该阈值用于“跨 Agent 调用链”稳定性，与单 Agent 内 `max_steps` 互补而非替代。
 

@@ -20,13 +20,14 @@ import sys
 import time
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import toml
 import uuid6
-from datetime import datetime, UTC
 
-from core.utils import set_loop_policy, set_python_path, REPO_ROOT
+from infra.messaging.ingress import build_nats_ingress_context
+from core.cg_context import CGContext
+from core.utils import safe_str, set_loop_policy, set_python_path, REPO_ROOT
 from core.time_utils import to_iso, utc_now
 from core.utp_protocol import ALLOWED_AFTER_EXECUTION_VALUES, ToolCommandPayload
 from core.status import STATUS_FAILED, STATUS_SUCCESS, STATUS_TIMEOUT
@@ -44,7 +45,7 @@ set_python_path()
 
 from infra.nats_client import NATSClient  # noqa: E402
 from infra.cardbox_client import CardBoxClient  # noqa: E402
-from infra.primitives import report as report_primitive  # noqa: E402
+from infra.l0_engine import L0Engine, ReportIntent, TurnRef  # noqa: E402
 from infra.stores import (  # noqa: E402
     ExecutionStore,
     ResourceStore,
@@ -53,10 +54,8 @@ from infra.stores import (  # noqa: E402
     SandboxStore,
     SkillTaskStore,
 )
-from infra.agent_routing import resolve_agent_target  # noqa: E402
 from core.config import PROTOCOL_VERSION  # noqa: E402
-from core.subject import format_subject, parse_subject  # noqa: E402
-from core.trace import trace_id_from_headers  # noqa: E402
+from core.subject import parse_subject  # noqa: E402
 from infra.idempotency import (  # noqa: E402
     IdempotencyOutcome,
     IdempotentExecutor,
@@ -65,18 +64,19 @@ from infra.idempotency import (  # noqa: E402
 )
 from infra.gcs_client import GcsClient, GcsConfig  # noqa: E402
 from infra.artifacts import ArtifactManager  # noqa: E402
-from infra.skills import SkillManager, _safe_relpath  # noqa: E402
+from infra.skills import SkillManager  # noqa: E402
 from infra.e2b_executor import E2BExecutor  # noqa: E402
 from infra.srt_executor import SrtExecutor  # noqa: E402
 from infra.sandbox_registry import SandboxRegistry  # noqa: E402
-from infra.worker_helpers import normalize_headers  # noqa: E402
 from infra.tool_executor import (  # noqa: E402
+    ToolCallEnvelope,
+    ToolCallHydrationError,
     ToolResultBuilder,
     ToolResultContext,
-    extract_tool_call_args,
-    extract_tool_call_metadata,
+    hydrate_tool_call_context,
 )
 from pydantic import ValidationError  # noqa: E402
+from services.tools.tool_helpers import build_validation_failure_package  # noqa: E402
 
 
 def _configure_logging() -> None:
@@ -124,6 +124,13 @@ class SkillsToolService:
         dsn = cardbox_cfg.get("postgres_dsn", "postgresql://postgres:postgres@localhost:5433/cardbox")
         self.resource_store = ResourceStore(dsn)
         self.execution_store = ExecutionStore(dsn)
+        self.l0 = L0Engine(
+            nats=self.nats,
+            execution_store=self.execution_store,
+            resource_store=self.resource_store,
+            state_store=None,
+            cardbox=self.cardbox,
+        )
         self.skill_store = SkillStore(dsn)
         self.artifact_store = ArtifactStore(dsn)
         self.sandbox_store = SandboxStore(dsn)
@@ -257,7 +264,7 @@ class SkillsToolService:
         self,
         *,
         project_id: str,
-        session_id: str,
+        session_key: str,
         workdir: str,
         ports: list[int],
     ) -> tuple[str, list[dict[str, Any]]]:
@@ -268,7 +275,7 @@ class SkillsToolService:
         work_root = getattr(self.executor, "work_root", None)
         if not isinstance(work_root, str) or not work_root:
             raise BadRequestError("executor work_root unavailable for expose_ports")
-        base_dir = Path(work_root) / project_id / session_id
+        base_dir = Path(work_root) / project_id / session_key
         workdir_val = str(workdir or "skill").strip() or "skill"
         uds_dir = base_dir / workdir_val / ".srt" / "ports"
         endpoints: list[dict[str, Any]] = []
@@ -405,10 +412,8 @@ class SkillsToolService:
     def _resolve_session_id(
         self,
         *,
-        parts: Any,
-        data: Dict[str, Any],
+        ctx: CGContext,
         args: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
     ) -> Optional[str]:
         def _sanitize(value: str) -> str:
             return value.replace(":", "_")
@@ -416,13 +421,26 @@ class SkillsToolService:
         explicit = args.get("session_id")
         if isinstance(explicit, str) and explicit.strip():
             return _sanitize(explicit.strip())
-        agent_id = data.get("agent_id")
-        if isinstance(agent_id, str) and agent_id.strip():
-            return _sanitize(f"{parts.project_id}:{agent_id.strip()}")
-        fallback = tool_call_meta.get("tool_call_id") or data.get("tool_call_id")
-        if isinstance(fallback, str) and fallback.strip():
-            return _sanitize(fallback.strip())
+        agent_id = ctx.agent_id
+        if agent_id:
+            return _sanitize(f"{ctx.project_id}:{agent_id}")
+        fallback = ctx.tool_call_id or ""
+        if fallback:
+            return _sanitize(fallback)
         return None
+
+    def _resolve_session_key(
+        self,
+        *,
+        ctx: CGContext,
+        session_id: Optional[str],
+    ) -> Optional[str]:
+        alias = str(session_id or "").strip()
+        if not alias:
+            return None
+        owner_agent_id = safe_str(ctx.agent_id) or "anonymous"
+        project_id = safe_str(ctx.project_id) or "project"
+        return f"{project_id}:{owner_agent_id}:{alias}".replace(":", "_")
 
     def _normalize_inputs(
         self,
@@ -453,8 +471,8 @@ class SkillsToolService:
             )
         return normalized
 
-    def _session_lock_key(self, session_id: Optional[str], workdir: Optional[str]) -> str:
-        sid = str(session_id or "").strip() or "default"
+    def _session_lock_key(self, session_key: Optional[str], workdir: Optional[str]) -> str:
+        sid = str(session_key or "").strip() or "default"
         wdir = str(workdir or "skill").strip() or "skill"
         return f"{sid}:{wdir}"
 
@@ -468,15 +486,15 @@ class SkillsToolService:
     async def _find_session_conflict(
         self,
         *,
-        session_id: Optional[str],
+        session_key: Optional[str],
         workdir: Optional[str],
     ) -> Optional[Dict[str, Any]]:
-        lock_key = self._session_lock_key(session_id, workdir)
+        lock_key = self._session_lock_key(session_key, workdir)
         lock = self._get_session_lock(lock_key)
         if lock.locked():
             return {
                 "type": "lock",
-                "session_id": session_id,
+                "session_id": None,
                 "workdir": workdir or "skill",
                 "lock_key": lock_key,
                 "status": "locked",
@@ -485,7 +503,7 @@ class SkillsToolService:
             for job in self._jobs.values():
                 if job.get("status") not in ("queued", "running"):
                     continue
-                if self._session_lock_key(job.get("session_id"), job.get("workdir")) != lock_key:
+                if self._session_lock_key(job.get("session_key") or job.get("session_id"), job.get("workdir")) != lock_key:
                     continue
                 return {
                     "type": "job",
@@ -506,7 +524,7 @@ class SkillsToolService:
                 # rely on callers to avoid destructive overlaps.
                 if task.get("mode") == "service":
                     continue
-                if self._session_lock_key(task.get("session_id"), task.get("workdir")) != lock_key:
+                if self._session_lock_key(task.get("session_key") or task.get("session_id"), task.get("workdir")) != lock_key:
                     continue
                 return {
                     "type": "task",
@@ -596,11 +614,11 @@ class SkillsToolService:
     async def _spawn_bg_task(
         self,
         *,
-        parts: Any,
-        data: Dict[str, Any],
+        ctx: CGContext,
         skill_name: str,
         command: str,
         session_id: Optional[str],
+        session_key: Optional[str],
         timeout_sec: Optional[int],
         mode: str = "batch",
         env: Optional[Dict[str, Any]] = None,
@@ -617,7 +635,7 @@ class SkillsToolService:
         async with self._bg_lock:
             self._bg_tasks[task_id] = {
                 "task_id": task_id,
-                "project_id": parts.project_id,
+                "project_id": ctx.project_id,
                 "provider": provider_name,
                 "status": "queued",
                 "mode": mode_val,
@@ -633,6 +651,7 @@ class SkillsToolService:
                 "stdout_truncated": False,
                 "stderr_truncated": False,
                 "session_id": session_id,
+                "session_key": session_key,
                 "skill_name": skill_name.strip(),
                 "command": command,
                 "workdir": workdir_val,
@@ -662,11 +681,11 @@ class SkillsToolService:
             try:
                 extra_files: list[dict[str, Any]] = []
                 version_hash = ""
-                sandbox_agent_id = data.get("agent_id")
+                sandbox_agent_id = ctx.agent_id
                 skill_root = None
                 if self.mode == "local":
                     info = await self.skills.ensure_skill_local(
-                        project_id=parts.project_id, skill_name=skill_name.strip()
+                        project_id=ctx.project_id, skill_name=skill_name.strip()
                     )
                     version_hash = info["version_hash"]
                     local_dir = Path(info["local_dir"])
@@ -681,22 +700,20 @@ class SkillsToolService:
                             raise BadRequestError(f"skill file too large: {rel}")
                         extra_files.append({"path": target_path, "data": data_bytes})
                 else:
-                    if session_id:
-                        sandbox_agent_id = session_id
+                    if session_key:
+                        sandbox_agent_id = session_key
                     version_hash = await self._ensure_remote_activated(
-                        project_id=parts.project_id,
-                        agent_id=sandbox_agent_id,
+                        ctx=ctx,
+                        sandbox_agent_id=sandbox_agent_id,
                         skill_name=skill_name.strip(),
-                        tool_call_id=data.get("tool_call_id"),
                         timeout_sec=timeout_sec,
                     )
                 if mode_val == "service":
                     if self.mode != "local":
                         raise BadRequestError("run_service only supported in local mode")
                     handle = await self.executor.start_process(
-                        project_id=parts.project_id,
-                        tool_call_id=data.get("tool_call_id"),
-                        session_id=session_id if self.mode == "local" else None,
+                        ctx=ctx,
+                        session_id=session_key if self.mode == "local" else None,
                         code=self._with_env_prefix(env, command),
                         inputs=normalized_inputs,
                         outputs=outputs,
@@ -733,10 +750,9 @@ class SkillsToolService:
                 )
                 exec_command = self._with_env_prefix(env, command)
                 result = await self.executor.execute(
-                    project_id=parts.project_id,
-                    agent_id=sandbox_agent_id if self.mode != "local" else data.get("agent_id"),
-                    tool_call_id=data.get("tool_call_id"),
-                    session_id=session_id if self.mode == "local" else None,
+                    ctx=ctx,
+                    sandbox_agent_id=sandbox_agent_id if self.mode != "local" else ctx.agent_id,
+                    session_id=session_key if self.mode == "local" else None,
                     language="bash",
                     code=exec_command,
                     inputs=normalized_inputs,
@@ -1164,87 +1180,47 @@ class SkillsToolService:
 
     async def _execute_logic(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        headers: Dict[str, str],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
-        try:
-            payload = ToolCommandPayload.validate(
-                data,
-                forbid_keys={"args", "arguments", "result"},
-                require_tool_call_card_id=True,
-            )
-        except ValidationError as exc:
-            missing = ToolCommandPayload.missing_fields_from_error(exc)
-            err = BadRequestError(f"missing required fields {missing or ['unknown']}")
-            result, error = build_error_result_from_exception(err, source="tool")
-            return self._create_result_package(parts, data, {}, STATUS_FAILED, result, error)
-        except (BadRequestError, ProtocolViolationError) as exc:
-            result, error = build_error_result_from_exception(exc, source="tool")
-            return self._create_result_package(parts, data, {}, STATUS_FAILED, result, error)
-
-        tool_call_id = payload.tool_call_id
-        tool_call_card_id = payload.tool_call_card_id
-        tool_call_cards = await self.cardbox.get_cards([str(tool_call_card_id)], project_id=parts.project_id)
-        tool_call_card = tool_call_cards[0] if tool_call_cards else None
-        if not tool_call_card:
-            result, error = build_error_result_from_exception(
-                NotFoundError(f"tool_call_card_id not found: {tool_call_card_id}"),
-                source="tool",
-            )
-            return self._create_result_package(parts, data, {}, STATUS_FAILED, result, error)
-
-        if getattr(tool_call_card, "type", None) != "tool.call":
-            result, error = build_error_result_from_exception(
-                ProtocolViolationError("tool_call_card_id type mismatch: expected 'tool.call'"),
-                source="tool",
-            )
-            return self._create_result_package(parts, data, {}, STATUS_FAILED, result, error)
-
-        if getattr(tool_call_card, "tool_call_id", None) not in (None, "", tool_call_id):
-            result, error = build_error_result_from_exception(
-                ProtocolViolationError("tool_call_id mismatch between payload and tool.call card"),
-                source="tool",
-            )
-            return self._create_result_package(parts, data, extract_tool_call_metadata(tool_call_card), STATUS_FAILED, result, error)
-
-        tool_call_meta = extract_tool_call_metadata(tool_call_card)
-        try:
-            args = extract_tool_call_args(tool_call_card)
-        except ProtocolViolationError as exc:
-            result, error = build_error_result_from_exception(exc, source="tool")
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
-
-        tool_name = data.get("tool_name")
-        if tool_name == "skills.load":
-            return await self._handle_load(parts, data, tool_call_meta, args)
-        if tool_name == "skills.run_cmd":
-            return await self._handle_run_cmd(parts, data, tool_call_meta, args)
-        if tool_name == "skills.run_cmd_async":
-            return await self._handle_run_cmd_async(parts, data, tool_call_meta, args)
-        if tool_name == "skills.run_service":
-            return await self._handle_run_service(parts, data, tool_call_meta, args)
-        if tool_name == "skills.start_job":
-            return await self._handle_start_job(parts, data, tool_call_meta, args)
-        if tool_name == "skills.job_status":
-            return await self._handle_job_status(parts, data, tool_call_meta, args)
-        if tool_name == "skills.job_cancel":
-            return await self._handle_job_cancel(parts, data, tool_call_meta, args)
-        if tool_name == "skills.job_watch":
-            return await self._handle_job_watch(parts, data, tool_call_meta, args)
-        if tool_name == "skills.activate":
-            return await self._handle_activate(parts, data, tool_call_meta, args)
-        if tool_name == "skills.task_status":
-            return await self._handle_task_status(parts, data, tool_call_meta, args)
-        if tool_name == "skills.task_cancel":
-            return await self._handle_task_cancel(parts, data, tool_call_meta, args)
-        if tool_name == "skills.task_watch":
-            return await self._handle_task_watch(parts, data, tool_call_meta, args)
+        tool_name = envelope.tool_name
+        handlers = {
+            "skills.load": self._handle_load,
+            "skills.run_cmd": self._handle_run_cmd,
+            "skills.run_cmd_async": self._handle_run_cmd_async,
+            "skills.run_service": self._handle_run_service,
+            "skills.start_job": self._handle_start_job,
+            "skills.job_status": self._handle_job_status,
+            "skills.job_cancel": self._handle_job_cancel,
+            "skills.job_watch": self._handle_job_watch,
+            "skills.activate": self._handle_activate,
+            "skills.task_status": self._handle_task_status,
+            "skills.task_cancel": self._handle_task_cancel,
+            "skills.task_watch": self._handle_task_watch,
+        }
+        handler = handlers.get(str(tool_name))
+        if handler is not None:
+            return await handler(envelope)
         result, error = build_error_result_from_exception(
             BadRequestError(f"unsupported tool_name: {tool_name}"),
             source="tool",
         )
-        return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+        return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
+
+    def _create_envelope_result_package(
+        self,
+        envelope: ToolCallEnvelope,
+        status: str,
+        result: Any = None,
+        error: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], Any]:
+        return self._create_result_package(
+            ctx=envelope.ctx,
+            tool_name=envelope.tool_name,
+            after_execution=envelope.base_after_execution,
+            status=status,
+            result=result,
+            error=error,
+        )
 
     async def _fetch_skill_zip_bytes(
         self, *, project_id: str, skill_name: str
@@ -1289,14 +1265,17 @@ class SkillsToolService:
     async def _ensure_remote_activated(
         self,
         *,
-        project_id: str,
-        agent_id: Optional[str],
+        ctx: CGContext,
+        sandbox_agent_id: Optional[str],
         skill_name: str,
-        tool_call_id: Optional[str],
         timeout_sec: Optional[int],
     ) -> str:
         if not self.sandbox_registry or not self.sandbox_registry.enabled:
             return ""
+        project_id = str(ctx.project_id or "")
+        if not project_id:
+            raise BadRequestError("project_id is required for remote sandbox reuse")
+        agent_id = str(sandbox_agent_id or ctx.agent_id or "")
         if not agent_id:
             raise BadRequestError("agent_id is required for remote sandbox reuse")
         active = await self.sandbox_registry.get_active(project_id=project_id, agent_id=str(agent_id))
@@ -1313,9 +1292,8 @@ class SkillsToolService:
             project_id=project_id, skill_name=skill_name
         )
         result_obj = await self.executor.prepare_remote_zip(
-            project_id=project_id,
-            agent_id=agent_id,
-            tool_call_id=tool_call_id,
+            ctx=ctx,
+            sandbox_agent_id=agent_id,
             zip_bytes=zip_bytes,
             dest_dir="skill",
             zip_path="/tmp/skill.zip",
@@ -1331,30 +1309,28 @@ class SkillsToolService:
 
     async def _handle_load(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
+        parts = envelope.ctx
+        args = envelope.args
         skill_name = args.get("skill_name")
         path = args.get("path") or "SKILL.md"
         session_id = self._resolve_session_id(
-            parts=parts,
-            data=data,
+            ctx=parts,
             args=args,
-            tool_call_meta=tool_call_meta,
         )
+        session_key = self._resolve_session_key(ctx=parts, session_id=session_id)
         if not isinstance(skill_name, str) or not skill_name.strip():
             result, error = build_error_result_from_exception(
                 BadRequestError("skill_name is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         try:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "tool_call_id=%s skill_name=%s path=%s session_id=%s",
-                    tool_call_meta.get("tool_call_id"),
+                    parts.tool_call_id,
                     skill_name,
                     path,
                     session_id,
@@ -1375,42 +1351,42 @@ class SkillsToolService:
                 if self.mode == "local":
                     work_root = getattr(self.executor, "work_root", None)
                     if isinstance(work_root, str) and work_root:
-                        session_root = (Path(work_root) / parts.project_id / session_id / "skill").resolve()
+                        session_root = (
+                            Path(work_root) / parts.project_id / str(session_key or session_id) / "skill"
+                        ).resolve()
                         session_root.mkdir(parents=True, exist_ok=True)
                         result_obj["session_root"] = str(session_root)
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_SUCCESS, result_obj, None)
+            return self._create_envelope_result_package(envelope, STATUS_SUCCESS, result_obj)
         except Exception as exc:  # noqa: BLE001
             result, error = build_error_result_from_exception(exc, source="tool")
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
 
     async def _handle_run_cmd(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
+        parts = envelope.ctx
+        args = envelope.args
         skill_name = args.get("skill_name")
         command = args.get("command")
         session_id = self._resolve_session_id(
-            parts=parts,
-            data=data,
+            ctx=parts,
             args=args,
-            tool_call_meta=tool_call_meta,
         )
+        session_key = self._resolve_session_key(ctx=parts, session_id=session_id)
         if not isinstance(skill_name, str) or not skill_name.strip():
             result, error = build_error_result_from_exception(
                 BadRequestError("skill_name is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         if not isinstance(command, str) or not command.strip():
             result, error = build_error_result_from_exception(
                 BadRequestError("command is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
-        conflict = await self._find_session_conflict(session_id=session_id, workdir="skill")
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
+        conflict = await self._find_session_conflict(session_key=session_key, workdir="skill")
         if conflict:
             result, error = build_error_result_from_exception(
                 ConflictError(
@@ -1419,11 +1395,11 @@ class SkillsToolService:
                 ),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         try:
             extra_files: list[dict[str, Any]] = []
             version_hash = ""
-            sandbox_agent_id = data.get("agent_id")
+            sandbox_agent_id = parts.agent_id
             if self.mode == "local":
                 info = await self.skills.ensure_skill_local(
                     project_id=parts.project_id, skill_name=skill_name.strip()
@@ -1442,20 +1418,19 @@ class SkillsToolService:
                         raise BadRequestError(f"skill file too large: {rel}")
                     extra_files.append({"path": target_path, "data": data_bytes})
             else:
-                if session_id:
-                    sandbox_agent_id = session_id
+                if session_key:
+                    sandbox_agent_id = session_key
                 version_hash = await self._ensure_remote_activated(
-                    project_id=parts.project_id,
-                    agent_id=sandbox_agent_id,
+                    ctx=parts,
+                    sandbox_agent_id=sandbox_agent_id,
                     skill_name=skill_name.strip(),
-                    tool_call_id=data.get("tool_call_id"),
                     timeout_sec=args.get("timeout_sec"),
                 )
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "tool_call_id=%s skill_name=%s session_id=%s command=%s timeout=%s workdir=%s",
-                    tool_call_meta.get("tool_call_id"),
+                    parts.tool_call_id,
                     skill_name,
                     session_id,
                     _truncate_for_log(command),
@@ -1464,10 +1439,9 @@ class SkillsToolService:
                 )
 
             result = await self.executor.execute(
-                project_id=parts.project_id,
-                agent_id=sandbox_agent_id if self.mode != "local" else data.get("agent_id"),
-                tool_call_id=data.get("tool_call_id"),
-                session_id=session_id if self.mode == "local" else None,
+                ctx=parts,
+                sandbox_agent_id=sandbox_agent_id if self.mode != "local" else parts.agent_id,
+                session_id=session_key if self.mode == "local" else None,
                 language="bash",
                 code=command,
                 inputs=self._normalize_inputs(args.get("inputs"), workdir="skill"),
@@ -1491,47 +1465,45 @@ class SkillsToolService:
                 result_obj["skill_root"] = str(skill_root)
                 if session_id:
                     result_obj["session_id"] = session_id
-            return self._create_result_package(parts, data, tool_call_meta, status, result_obj, None)
+            return self._create_envelope_result_package(envelope, status, result_obj)
         except Exception as exc:  # noqa: BLE001
             result, error = build_error_result_from_exception(exc, source="tool")
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
 
     async def _handle_run_background_command(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
+        envelope: ToolCallEnvelope,
         args: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], Any]:
+        parts = envelope.ctx
         skill_name = args.get("skill_name")
         command = args.get("command")
         mode = args.get("mode") or "batch"
         session_id = self._resolve_session_id(
-            parts=parts,
-            data=data,
+            ctx=parts,
             args=args,
-            tool_call_meta=tool_call_meta,
         )
+        session_key = self._resolve_session_key(ctx=parts, session_id=session_id)
         if not isinstance(skill_name, str) or not skill_name.strip():
             result, error = build_error_result_from_exception(
                 BadRequestError("skill_name is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         if not isinstance(command, str) or not command.strip():
             result, error = build_error_result_from_exception(
                 BadRequestError("command is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         if str(mode).lower() == "service" and self.mode != "local":
             result, error = build_error_result_from_exception(
                 BadRequestError("run_service only supported in local mode"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         if str(mode).lower() != "service":
-            conflict = await self._find_session_conflict(session_id=session_id, workdir=args.get("workdir"))
+            conflict = await self._find_session_conflict(session_key=session_key, workdir=args.get("workdir"))
             if conflict:
                 result, error = build_error_result_from_exception(
                     ConflictError(
@@ -1540,7 +1512,7 @@ class SkillsToolService:
                     ),
                     source="tool",
                 )
-                return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+                return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
 
         expose_ports = self._normalize_expose_ports(args.get("expose_ports"))
         endpoints: list[dict[str, Any]] = []
@@ -1552,21 +1524,21 @@ class SkillsToolService:
             try:
                 expose_cmd, endpoints = self._build_expose_ports_command(
                     project_id=parts.project_id,
-                    session_id=str(session_id or "").strip(),
+                    session_key=str(session_key or session_id or "").strip(),
                     workdir=str(args.get("workdir") or "skill"),
                     ports=expose_ports,
                 )
                 wrapped_command = f"{expose_cmd}\nexec {command}"
             except Exception as exc:  # noqa: BLE001
                 result, error = build_error_result_from_exception(exc, source="tool")
-                return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+                return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
 
         task_id = await self._spawn_bg_task(
-            parts=parts,
-            data=data,
+            ctx=parts,
             skill_name=skill_name.strip(),
             command=wrapped_command,
             session_id=session_id,
+            session_key=session_key,
             timeout_sec=args.get("timeout_sec"),
             mode=str(mode).lower(),
             env=args.get("env") if isinstance(args, dict) else None,
@@ -1593,7 +1565,7 @@ class SkillsToolService:
                 except Exception:
                     logger.exception("failed to cancel task after expose_ports error")
                 result, error = build_error_result_from_exception(exc, source="tool")
-                return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+                return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         result_obj = {
             "task_id": task_id,
             "provider": "srt" if self.mode == "local" else "e2b",
@@ -1605,57 +1577,50 @@ class SkillsToolService:
         }
         if expose_ports and str(mode).lower() == "service":
             result_obj["exposed_endpoints"] = endpoints
-        return self._create_result_package(parts, data, tool_call_meta, STATUS_SUCCESS, result_obj, None)
+        return self._create_envelope_result_package(envelope, STATUS_SUCCESS, result_obj)
 
     async def _handle_run_cmd_async(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
-        args = dict(args or {})
+        args = dict(envelope.args or {})
         args["mode"] = "batch"
-        return await self._handle_run_background_command(parts, data, tool_call_meta, args)
+        return await self._handle_run_background_command(envelope, args)
 
     async def _handle_run_service(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
+        args = envelope.args
         session_id = args.get("session_id")
         if not isinstance(session_id, str) or not session_id.strip():
             result, error = build_error_result_from_exception(
                 BadRequestError("session_id is required for run_service"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         args = dict(args or {})
         args["mode"] = "service"
-        return await self._handle_run_background_command(parts, data, tool_call_meta, args)
+        return await self._handle_run_background_command(envelope, args)
 
     async def _handle_activate(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
+        parts = envelope.ctx
+        args = envelope.args
         skill_name = args.get("skill_name")
         session_id = self._resolve_session_id(
-            parts=parts,
-            data=data,
+            ctx=parts,
             args=args,
-            tool_call_meta=tool_call_meta,
         )
+        session_key = self._resolve_session_key(ctx=parts, session_id=session_id)
         if not isinstance(skill_name, str) or not skill_name.strip():
             result, error = build_error_result_from_exception(
                 BadRequestError("skill_name is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         dest_dir = "skill"
         zip_path = "/tmp/skill.zip"
         unzip = True
@@ -1665,7 +1630,7 @@ class SkillsToolService:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "tool_call_id=%s skill_name=%s session_id=%s mode=%s",
-                    tool_call_meta.get("tool_call_id"),
+                    parts.tool_call_id,
                     skill_name,
                     session_id,
                     self.mode,
@@ -1683,16 +1648,15 @@ class SkillsToolService:
                 }
                 if session_id:
                     result_obj["session_id"] = session_id
-                return self._create_result_package(parts, data, tool_call_meta, STATUS_SUCCESS, result_obj, None)
+                return self._create_envelope_result_package(envelope, STATUS_SUCCESS, result_obj)
 
             zip_bytes, version_hash = await self._fetch_skill_zip_bytes(
                 project_id=parts.project_id, skill_name=skill_name.strip()
             )
-            sandbox_agent_id = session_id or data.get("agent_id")
+            sandbox_agent_id = session_key or parts.agent_id
             result_obj = await self.executor.prepare_remote_zip(
-                project_id=parts.project_id,
-                agent_id=sandbox_agent_id,
-                tool_call_id=data.get("tool_call_id"),
+                ctx=parts,
+                sandbox_agent_id=sandbox_agent_id,
                 zip_bytes=zip_bytes,
                 dest_dir=str(dest_dir),
                 zip_path=str(zip_path),
@@ -1709,18 +1673,17 @@ class SkillsToolService:
             result_obj["skill_name"] = skill_name.strip()
             if session_id:
                 result_obj["session_id"] = session_id
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_SUCCESS, result_obj, None)
+            return self._create_envelope_result_package(envelope, STATUS_SUCCESS, result_obj)
         except Exception as exc:  # noqa: BLE001
             result, error = build_error_result_from_exception(exc, source="tool")
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
 
     async def _handle_start_job(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
+        parts = envelope.ctx
+        args = envelope.args
         session_id = args.get("session_id")
         steps = args.get("steps")
         if not isinstance(session_id, str) or not session_id.strip():
@@ -1728,23 +1691,24 @@ class SkillsToolService:
                 BadRequestError("session_id is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         if not isinstance(steps, list) or not steps:
             result, error = build_error_result_from_exception(
                 BadRequestError("steps must be a non-empty list"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         skill_name = args.get("skill_name")
         if not isinstance(skill_name, str) or not skill_name.strip():
             result, error = build_error_result_from_exception(
                 BadRequestError("skill_name is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
 
         workdir = str(args.get("workdir") or "skill")
-        conflict = await self._find_session_conflict(session_id=session_id, workdir=workdir)
+        session_key = self._resolve_session_key(ctx=parts, session_id=session_id.strip())
+        conflict = await self._find_session_conflict(session_key=session_key, workdir=workdir)
         if conflict:
             result, error = build_error_result_from_exception(
                 ConflictError(
@@ -1753,7 +1717,7 @@ class SkillsToolService:
                 ),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         job_env = args.get("env") if isinstance(args.get("env"), dict) else {}
         max_wall_time_sec = int(args.get("max_wall_time_sec") or self._job_default_timeout_sec)
         created_at = to_iso(utc_now())
@@ -1781,7 +1745,7 @@ class SkillsToolService:
                 BadRequestError("steps must include at least one valid command"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
 
         async with self._jobs_lock:
             self._jobs[job_id] = {
@@ -1789,6 +1753,7 @@ class SkillsToolService:
                 "status": "queued",
                 "project_id": parts.project_id,
                 "session_id": session_id.strip(),
+                "session_key": session_key,
                 "skill_name": skill_name.strip(),
                 "workdir": workdir,
                 "env": job_env,
@@ -1805,13 +1770,13 @@ class SkillsToolService:
             job_snapshot = dict(self._jobs[job_id])
         await self._persist_job_snapshot(job_id, job_snapshot)
 
-        asyncio.create_task(self._run_job(job_id, parts, data))
+        asyncio.create_task(self._run_job(job_id, parts))
         result_obj = {
             "job_id": job_id,
             "status": "queued",
             "session_id": session_id.strip(),
         }
-        return self._create_result_package(parts, data, tool_call_meta, STATUS_SUCCESS, result_obj, None)
+        return self._create_envelope_result_package(envelope, STATUS_SUCCESS, result_obj)
 
     async def _get_job_status_snapshot(self, job_id: str, tail_bytes: int) -> Dict[str, Any]:
         job = None
@@ -1858,11 +1823,9 @@ class SkillsToolService:
 
     async def _handle_job_status(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
+        args = envelope.args
         job_id = args.get("job_id")
         tail_bytes = int(args.get("tail_bytes") or 8192)
         if not isinstance(job_id, str) or not job_id.strip():
@@ -1870,21 +1833,20 @@ class SkillsToolService:
                 BadRequestError("job_id is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         try:
             result_obj = await self._get_job_status_snapshot(job_id, tail_bytes)
         except Exception as exc:  # noqa: BLE001
             result, error = build_error_result_from_exception(exc, source="tool")
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
-        return self._create_result_package(parts, data, tool_call_meta, STATUS_SUCCESS, result_obj, None)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
+        return self._create_envelope_result_package(envelope, STATUS_SUCCESS, result_obj)
 
     async def _handle_job_watch(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
+        parts = envelope.ctx
+        args = envelope.args
         poll_interval = max(1, int(args.get("poll_interval_sec") or 2))
         timeout_sec = int(args.get("timeout_sec") or 600)
         heartbeat_sec = max(5, int(args.get("heartbeat_sec") or 20))
@@ -1895,9 +1857,9 @@ class SkillsToolService:
                 BadRequestError("job_id is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         if not dedupe_key:
-            dedupe_key = f"{parts.project_id}:{data.get('agent_id')}:{job_id}"
+            dedupe_key = f"{parts.project_id}:{parts.agent_id}:{job_id}"
         started = time.monotonic()
         last_emit = 0.0
         last_status: Dict[str, Any] = {}
@@ -1909,9 +1871,7 @@ class SkillsToolService:
                     "dedupe_key": dedupe_key,
                     "status": existing.get("last_status"),
                 }
-                return self._create_result_package(
-                    parts, data, tool_call_meta, STATUS_SUCCESS, result_obj, None
-                )
+                return self._create_envelope_result_package(envelope, STATUS_SUCCESS, result_obj, None)
             while True:
                 last_status = await self._get_job_status_snapshot(
                     str(job_id), int(args.get("tail_bytes") or 8192)
@@ -1930,8 +1890,7 @@ class SkillsToolService:
                 if now - last_emit >= heartbeat_sec:
                     await self._emit_task_watch_heartbeat(
                         parts=parts,
-                        data=data,
-                        tool_call_meta=tool_call_meta,
+                        tool_name=envelope.tool_name or "skills.job_watch",
                         status_payload={"job_watch": "running", "status": last_status},
                     )
                     last_emit = now
@@ -1940,21 +1899,21 @@ class SkillsToolService:
             status = STATUS_SUCCESS if state_val == "succeeded" else STATUS_FAILED
             if dedupe_key in self._watch_registry:
                 self._watch_registry.pop(dedupe_key, None)
-            return self._create_result_package(parts, data, tool_call_meta, status, last_status, None)
+            return self._create_envelope_result_package(envelope, status, last_status)
         except Exception as exc:  # noqa: BLE001
             result, error = build_error_result_from_exception(exc, source="tool")
             if last_status:
                 result = {"last_status": last_status, "error": str(exc)}
             if dedupe_key in self._watch_registry:
                 self._watch_registry.pop(dedupe_key, None)
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
 
-    async def _run_job(self, job_id: str, parts: Any, data: Dict[str, Any]) -> None:
+    async def _run_job(self, job_id: str, ctx: CGContext) -> None:
         async with self._jobs_lock:
             job = self._jobs.get(job_id)
         if not job:
             return
-        lock_key = self._session_lock_key(job.get("session_id"), job.get("workdir"))
+        lock_key = self._session_lock_key(job.get("session_key") or job.get("session_id"), job.get("workdir"))
         lock = self._get_session_lock(lock_key)
         async with lock:
             async with self._jobs_lock:
@@ -1992,11 +1951,11 @@ class SkillsToolService:
                 step_env = step.get("env") if isinstance(step.get("env"), dict) else {}
                 merged_env.update(step_env)
                 task_id = await self._spawn_bg_task(
-                    parts=parts,
-                    data=data,
+                    ctx=ctx,
                     skill_name=job.get("skill_name") or "",
                     command=step.get("command") or "",
                     session_id=job.get("session_id"),
+                    session_key=job.get("session_key"),
                     timeout_sec=step.get("timeout_sec"),
                     env=merged_env,
                     workdir=job.get("workdir"),
@@ -2069,11 +2028,9 @@ class SkillsToolService:
 
     async def _handle_job_cancel(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
+        args = envelope.args
         job_id = args.get("job_id")
         reason = args.get("reason") if isinstance(args.get("reason"), str) else "canceled"
         if not isinstance(job_id, str) or not job_id.strip():
@@ -2081,7 +2038,7 @@ class SkillsToolService:
                 BadRequestError("job_id is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         async with self._jobs_lock:
             job = self._jobs.get(job_id)
             if not job:
@@ -2089,7 +2046,7 @@ class SkillsToolService:
                     NotFoundError(f"job not found: {job_id}"),
                     source="tool",
                 )
-                return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+                return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
             job["status"] = "canceled"
             job["error_message"] = reason
             job["finished_at"] = to_iso(utc_now())
@@ -2109,7 +2066,7 @@ class SkillsToolService:
             except Exception:
                 logger.exception("failed to cancel task on job_cancel: %s", task_id)
         result_obj = {"job_id": job_id, "status": "canceled", "reason": reason}
-        return self._create_result_package(parts, data, tool_call_meta, STATUS_SUCCESS, result_obj, None)
+        return self._create_envelope_result_package(envelope, STATUS_SUCCESS, result_obj)
     def _extract_task_state(
         self,
         payload: Dict[str, Any],
@@ -2143,19 +2100,18 @@ class SkillsToolService:
     async def _query_task_cmd(
         self,
         *,
-        parts: Any,
-        data: Dict[str, Any],
+        ctx: CGContext,
         command: str,
         timeout_sec: int,
         workdir: str,
         session_id: Optional[str],
+        session_key: Optional[str],
     ) -> Dict[str, Any]:
-        sandbox_agent_id = session_id or data.get("agent_id")
+        sandbox_agent_id = session_key or ctx.agent_id
         result = await self.executor.execute(
-            project_id=parts.project_id,
-            agent_id=sandbox_agent_id if self.mode != "local" else data.get("agent_id"),
-            tool_call_id=data.get("tool_call_id"),
-            session_id=session_id if self.mode == "local" else None,
+            ctx=ctx,
+            sandbox_agent_id=sandbox_agent_id if self.mode != "local" else ctx.agent_id,
+            session_id=session_key if self.mode == "local" else None,
             language="bash",
             code=command,
             inputs=None,
@@ -2180,19 +2136,17 @@ class SkillsToolService:
     async def _get_task_status(
         self,
         *,
-        parts: Any,
-        data: Dict[str, Any],
+        ctx: CGContext,
         args: Dict[str, Any],
     ) -> Dict[str, Any]:
         provider = str(args.get("provider") or "cmd").lower()
         task_id = args.get("task_id") or args.get("job_id") or args.get("id")
         tail_bytes = int(args.get("tail_bytes") or 8192)
         session_id = self._resolve_session_id(
-            parts=parts,
-            data=data,
+            ctx=ctx,
             args=args,
-            tool_call_meta={},
         )
+        session_key = self._resolve_session_key(ctx=ctx, session_id=session_id)
         status_field = str(args.get("status_field") or "status")
         progress_field = args.get("progress_field")
         events_field = args.get("events_field")
@@ -2214,12 +2168,12 @@ class SkillsToolService:
                 raise BadRequestError("query_command is required for provider=cmd")
             workdir = str(args.get("workdir") or "skill")
             raw_payload = await self._query_task_cmd(
-                parts=parts,
-                data=data,
+                ctx=ctx,
                 command=command.strip(),
                 timeout_sec=timeout_sec,
                 workdir=workdir,
                 session_id=session_id,
+                session_key=session_key,
             )
             if "json" in raw_payload:
                 raw_payload = raw_payload["json"]
@@ -2248,53 +2202,49 @@ class SkillsToolService:
 
     async def _handle_task_status(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
+        parts = envelope.ctx
+        args = envelope.args
         try:
-            result_obj = await self._get_task_status(parts=parts, data=data, args=args)
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_SUCCESS, result_obj, None)
+            result_obj = await self._get_task_status(ctx=parts, args=args)
+            return self._create_envelope_result_package(envelope, STATUS_SUCCESS, result_obj)
         except Exception as exc:  # noqa: BLE001
             result, error = build_error_result_from_exception(exc, source="tool")
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
 
     async def _handle_task_cancel(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
+        args = envelope.args
         task_id = args.get("task_id") or args.get("id")
         if not isinstance(task_id, str) or not task_id.strip():
             result, error = build_error_result_from_exception(
                 BadRequestError("task_id is required"),
                 source="tool",
             )
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
         try:
             result_obj = await self._cancel_task(task_id.strip())
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_SUCCESS, result_obj, None)
+            return self._create_envelope_result_package(envelope, STATUS_SUCCESS, result_obj)
         except Exception as exc:  # noqa: BLE001
             result, error = build_error_result_from_exception(exc, source="tool")
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
 
     async def _handle_task_watch(
         self,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        envelope: ToolCallEnvelope,
     ) -> Tuple[Dict[str, Any], Any]:
+        parts = envelope.ctx
+        args = envelope.args
         poll_interval = max(1, int(args.get("poll_interval_sec") or 2))
         timeout_sec = int(args.get("timeout_sec") or 600)
         heartbeat_sec = max(5, int(args.get("heartbeat_sec") or 20))
         dedupe_key = str(args.get("dedupe_key") or "").strip()
         if not dedupe_key:
             task_id = args.get("task_id") or args.get("job_id") or args.get("id") or ""
-            dedupe_key = f"{parts.project_id}:{data.get('agent_id')}:{task_id}:{args.get('query_command')}"
+            dedupe_key = f"{parts.project_id}:{parts.agent_id}:{task_id}:{args.get('query_command')}"
         started = time.monotonic()
         last_emit = 0.0
         last_status: Dict[str, Any] = {}
@@ -2306,11 +2256,9 @@ class SkillsToolService:
                     "dedupe_key": dedupe_key,
                     "status": existing.get("last_status"),
                 }
-                return self._create_result_package(
-                    parts, data, tool_call_meta, STATUS_SUCCESS, result_obj, None
-                )
+                return self._create_envelope_result_package(envelope, STATUS_SUCCESS, result_obj, None)
             while True:
-                last_status = await self._get_task_status(parts=parts, data=data, args=args)
+                last_status = await self._get_task_status(ctx=parts, args=args)
                 self._watch_registry[dedupe_key] = {
                     "expires_at": time.monotonic() + timeout_sec,
                     "last_status": last_status,
@@ -2323,8 +2271,7 @@ class SkillsToolService:
                 if now - last_emit >= heartbeat_sec:
                     await self._emit_task_watch_heartbeat(
                         parts=parts,
-                        data=data,
-                        tool_call_meta=tool_call_meta,
+                        tool_name=envelope.tool_name or "skills.task_watch",
                         status_payload=last_status,
                     )
                     last_emit = now
@@ -2333,164 +2280,189 @@ class SkillsToolService:
             status = STATUS_SUCCESS if not last_status.get("error") else STATUS_FAILED
             if dedupe_key in self._watch_registry:
                 self._watch_registry.pop(dedupe_key, None)
-            return self._create_result_package(parts, data, tool_call_meta, status, last_status, None)
+            return self._create_envelope_result_package(envelope, status, last_status)
         except Exception as exc:  # noqa: BLE001
             result, error = build_error_result_from_exception(exc, source="tool")
             if last_status:
                 result = {"last_status": last_status, "error": str(exc)}
             if dedupe_key in self._watch_registry:
                 self._watch_registry.pop(dedupe_key, None)
-            return self._create_result_package(parts, data, tool_call_meta, STATUS_FAILED, result, error)
+            return self._create_envelope_result_package(envelope, STATUS_FAILED, result, error)
 
     async def _emit_task_watch_heartbeat(
         self,
         *,
-        parts: Any,
-        data: Dict[str, Any],
-        tool_call_meta: Dict[str, Any],
+        parts: CGContext,
+        tool_name: str,
         status_payload: Dict[str, Any],
     ) -> None:
-        tool_call_id = data.get("tool_call_id")
         payload_out, card = self._create_result_package(
-            parts,
-            data,
-            tool_call_meta,
-            STATUS_SUCCESS,
-            {
+            ctx=parts,
+            tool_name=tool_name,
+            after_execution="suspend",
+            status=STATUS_SUCCESS,
+            result={
                 "task_watch": "running",
                 "status": status_payload,
             },
-            None,
-            after_execution="suspend",
+            error=None,
         )
         await self.cardbox.save_card(card)
-        safe_headers, _, _ = normalize_headers(
-            nats=self.nats,
-            headers={},
-            default_depth=0,
-        )
+        safe_headers = parts.with_trace_transport(
+            base_headers={},
+            trace_id=parts.trace_id,
+            default_depth=int(parts.recursion_depth),
+        ).to_nats_headers()
         await self._report_tool_result_and_wakeup(
-            parts=parts,
             payload=payload_out,
-            correlation_id=str(tool_call_id or ""),
+            correlation_id=str(parts.tool_call_id or ""),
             safe_headers=safe_headers,
-            fallback_agent_id=str(data.get("agent_id") or ""),
+            source_ctx=parts,
         )
 
     async def _report_tool_result_and_wakeup(
         self,
         *,
-        parts: Any,
         payload: Dict[str, Any],
         correlation_id: str,
         safe_headers: Dict[str, str],
-        fallback_agent_id: str,
+        source_ctx: CGContext,
     ) -> None:
-        resolved_agent_id = str(payload.get("agent_id") or fallback_agent_id or "")
+        transport_ctx = source_ctx.with_trace_transport(
+            base_headers=dict(safe_headers or {}),
+            trace_id=source_ctx.trace_id,
+            default_depth=int(source_ctx.recursion_depth),
+        )
+        report_source_ctx = transport_ctx.evolve(
+            agent_id="tool.skills",
+            agent_turn_id="",
+            step_id=None,
+            tool_call_id=None,
+        )
+        target_ref = TurnRef(
+            project_id=transport_ctx.project_id,
+            agent_id=transport_ctx.agent_id,
+            agent_turn_id=transport_ctx.require_agent_turn_id,
+            expected_turn_epoch=int(transport_ctx.turn_epoch) if int(transport_ctx.turn_epoch) > 0 else None,
+        )
+        wakeup_signals = []
         async with self.execution_store.pool.connection() as conn:
             async with conn.transaction():
-                report_result = await report_primitive(
-                    store=self.execution_store,
-                    project_id=parts.project_id,
-                    channel_id=parts.channel_id,
-                    target_agent_id=resolved_agent_id,
-                    message_type="tool_result",
-                    payload=payload,
-                    correlation_id=correlation_id,
-                    headers=safe_headers,
-                    traceparent=safe_headers.get("traceparent"),
-                    tracestate=safe_headers.get("tracestate"),
-                    trace_id=trace_id_from_headers(safe_headers),
-                    parent_step_id=str(payload.get("step_id") or ""),
-                    source_agent_id="tool.skills",
+                result = await self.l0.report_intent(
+                    source_ctx=report_source_ctx,
+                    intent=ReportIntent(
+                        target=target_ref,
+                        message_type="tool_result",
+                        payload=payload,
+                        correlation_id=correlation_id,
+                    ),
                     conn=conn,
+                    wakeup=True,
                 )
-        safe_headers = dict(safe_headers)
-        safe_headers["traceparent"] = report_result.traceparent
-        target = await resolve_agent_target(
-            resource_store=self.resource_store,
-            project_id=parts.project_id,
-            agent_id=resolved_agent_id,
-        )
-        wakeup_subject = format_subject(
-            parts.project_id,
-            parts.channel_id,
-            "cmd",
-            "agent",
-            target,
-            "wakeup",
-        )
-        await self.nats.publish_event(
-            wakeup_subject,
-            {
-                "agent_id": resolved_agent_id,
-                "agent_turn_id": payload.get("agent_turn_id"),
-            },
-            headers=safe_headers,
-        )
+                if result.status != "accepted":
+                    code = str(result.error_code or "")
+                    raise RuntimeError(
+                        "skills tool_result report rejected: "
+                        f"status={result.status}"
+                        + (f" code={code}" if code else "")
+                    )
+                wakeup_signals = list(result.wakeup_signals or ())
+        if wakeup_signals:
+            await self.l0.publish_wakeup_signals(wakeup_signals)
 
-    def _create_result_package(
+    async def _publish_validation_failure(
         self,
-        parts: Any,
-        original_data: Dict[str, Any],
-        tool_call_meta: Optional[Dict[str, Any]],
-        status: str,
-        result: Any = None,
-        error: Optional[Dict[str, Any]] = None,
-        after_execution: Optional[str] = None,
-    ) -> Tuple[Dict[str, Any], Any]:
-        if after_execution is None:
-            after_execution = original_data.get("after_execution")
-        tool_name = original_data.get("tool_name") or "skills"
-        result_context = ToolResultContext.from_cmd_data(
-            project_id=parts.project_id,
-            cmd_data=original_data,
-            tool_call_meta=tool_call_meta,
-        )
-        return ToolResultBuilder(
-            result_context,
+        *,
+        ingress_ctx: Optional[CGContext],
+        data: Dict[str, Any],
+        headers: Dict[str, str],
+        exc: Exception,
+    ) -> bool:
+        package = await build_validation_failure_package(
+            cardbox=self.cardbox,
+            ingress_ctx=ingress_ctx,
+            data=dict(data or {}),
+            exc=exc,
+            default_tool_name="skills",
             author_id="tool.skills",
-            function_name=tool_name,
-            error_source="tool",
-        ).build(
-            status=status,
-            result=result,
-            error=error,
-            function_name=tool_name,
-            after_execution=after_execution,
+            allowed_after_execution=ALLOWED_AFTER_EXECUTION_VALUES,
         )
+        if package is None:
+            return False
+        validation_ctx, payload_out, card = package
+        await self.cardbox.save_card(card)
+        safe_headers = validation_ctx.with_trace_transport(
+            base_headers=dict(headers or {}),
+            trace_id=validation_ctx.trace_id,
+            default_depth=int(validation_ctx.recursion_depth),
+        ).to_nats_headers()
+        await self._report_tool_result_and_wakeup(
+            payload=payload_out,
+            correlation_id=validation_ctx.require_tool_call_id,
+            safe_headers=safe_headers,
+            source_ctx=validation_ctx,
+        )
+        return True
 
     async def _handle_cmd(self, subject: str, data: Dict[str, Any], headers: Dict[str, str]):
         try:
             parts = parse_subject(subject)
             if not parts or parts.target != "skills":
                 return
+            ingress_ctx: Optional[CGContext] = None
             try:
+                ingress_ctx, _ = build_nats_ingress_context(
+                    headers=headers,
+                    raw_payload=data,
+                    subject_parts=parts,
+                )
                 payload = ToolCommandPayload.validate(
-                    data,
+                    dict(data or {}),
                     require_tool_name=True,
                     require_after_execution=True,
                     allowed_after_execution=ALLOWED_AFTER_EXECUTION_VALUES,
                 )
-            except (ValidationError, BadRequestError) as exc:
+                tool_ctx = await hydrate_tool_call_context(
+                    cardbox=self.cardbox,
+                    cg_ctx=ingress_ctx,
+                    data=dict(data or {}),
+                    payload=payload,
+                    require_tool_call_type=True,
+                    validate_tool_call_id_match=True,
+                )
+            except (ValidationError, BadRequestError, ToolCallHydrationError, ProtocolViolationError) as exc:
                 logger.error("Invalid tool payload: %s", exc)
+                if ingress_ctx is None:
+                    try:
+                        ingress_ctx, _ = build_nats_ingress_context(
+                            headers=headers,
+                            raw_payload={},
+                            subject_parts=parts,
+                        )
+                    except ProtocolViolationError:
+                        ingress_ctx = None
+                published = await self._publish_validation_failure(
+                    ingress_ctx=ingress_ctx,
+                    data=dict(data or {}),
+                    headers=dict(headers or {}),
+                    exc=exc,
+                )
+                if not published:
+                    logger.error("Failed to publish validation failure result for %s", subject)
                 return
 
             tool_name = payload.tool_name
-            tool_call_id = payload.tool_call_id
-            agent_id = payload.agent_id
+            tool_cg_ctx = tool_ctx.ctx
+            tool_call_id = tool_cg_ctx.tool_call_id
 
-            safe_headers = dict(headers or {})
-            correlation_id = str(tool_call_id or "")
-            safe_headers, _, _ = normalize_headers(
-                nats=self.nats,
-                headers=safe_headers,
+            safe_headers = tool_cg_ctx.with_trace_transport(
+                base_headers=headers,
                 default_depth=0,
-            )
+            ).to_nats_headers()
             key = build_idempotency_key("tool", parts.project_id, str(tool_name), str(tool_call_id))
 
             async def _leader_execute():
-                payload_out, card = await self._execute_logic(parts, data, headers)
+                payload_out, card = await self._execute_logic(tool_ctx)
                 await self.cardbox.save_card(card)
                 return payload_out
 
@@ -2502,16 +2474,6 @@ class SkillsToolService:
                 if entry and entry.get("status") == "done":
                     outcome = IdempotencyOutcome(is_leader=False, payload=entry.get("payload"))
                 else:
-                    tool_call_meta: Dict[str, Any] = {}
-                    tool_call_card_id = data.get("tool_call_card_id")
-                    if tool_call_card_id:
-                        cards = await self.cardbox.get_cards(
-                            [str(tool_call_card_id)],
-                            project_id=parts.project_id,
-                        )
-                        tool_call_card = cards[0] if cards else None
-                        if tool_call_card and getattr(tool_call_card, "type", None) == "tool.call":
-                            tool_call_meta = extract_tool_call_metadata(tool_call_card)
                     error_detail = {"key": key, "status": entry.get("status") if entry else None}
                     error = build_error_payload(
                         "idempotency_timeout",
@@ -2528,21 +2490,20 @@ class SkillsToolService:
                         "error_detail": error_detail,
                     }
                     payload_out, card = self._create_result_package(
-                        parts,
-                        data,
-                        tool_call_meta,
-                        STATUS_TIMEOUT,
-                        result,
-                        error,
+                        ctx=tool_cg_ctx,
+                        tool_name=tool_ctx.tool_name or "skills",
+                        after_execution=tool_ctx.base_after_execution,
+                        status=STATUS_TIMEOUT,
+                        result=result,
+                        error=error,
                     )
                     await self.cardbox.save_card(card)
                     outcome = IdempotencyOutcome(is_leader=False, payload=payload_out)
             await self._report_tool_result_and_wakeup(
-                parts=parts,
                 payload=outcome.payload,
                 correlation_id=str(tool_call_id),
                 safe_headers=safe_headers,
-                fallback_agent_id=str(agent_id),
+                source_ctx=tool_cg_ctx,
             )
         except Exception:
             logger.exception("Unexpected error handling %s", subject)

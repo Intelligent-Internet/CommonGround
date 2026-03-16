@@ -40,8 +40,8 @@ This document belongs to the L1 kernel layer and describes how the Worker implem
 3) When entering processing, Worker sets `agent_turn` to `running` (state transition with CAS protection), then hydrates in order: `state.agent_state_head` → `resource.*` → `profile_box_id/context_box_id/output_box_id`.
 4) **Greedy Batch**: fetch all executable inbox for the same Worker-correlated agents from `claim_pending_inbox`, and process them in chronological order.
 5) If tool calls exist: write `tool.call` card and publish `cmd.tool.*` / `cmd.sys.pmo.internal.*`, record `tool_call_id` within the step, and set `activity=executing_tool` (LLM step metadata).
-6) Each tool wait writes `turn_waiting_tools` to state and sets `resume_deadline`; `suspend_timeout` is governed by worker-specific config and tool-side timeout constraints. The current implementation does not persistently persist `expecting_correlation_id` as a matching condition (common path is `None`); instead it uses `tool_waiting + resume_ledger` for resume judgment.
-7) When `status=suspended`, wake/resume no longer depends on single-correlation filtering; watchdog and resume paths replay resume records and write back to inbox when consumability conditions are met, then continue running.
+6) Each tool wait writes `turn_waiting_tools` to state and sets `resume_deadline`; `suspend_timeout` is governed by worker-specific config and tool-side timeout constraints. The current implementation does not persist `expecting_correlation_id` as the matching condition (common path is `None`); resume judgment is unified on `turn_waiting_tools + state.agent_inbox(correlation=tool_call_id)`.
+7) When `status=suspended`, wake/resume no longer depends on single-correlation filtering; watchdog and resume paths reconcile `turn_waiting_tools` rows in `waiting/received` state and claim the matching due inbox rows (`pending/deferred`) before continuing.
 8) After tool return, or for normal LLM turns with no tool calls, continue to the next step under `next_step(is_continuation=True)` within the same `agent_turn_id/turn_epoch` (intra-turn continuation; `resume` may cause turn_epoch reordering).
 9) Terminal state: write `task.deliverable`, publish `evt.agent.*.task`, clear `active_agent_turn_id`, and return `status` to `idle`.
 
@@ -82,9 +82,9 @@ Supplemental note (visibility boundary):
 
 ## 8. Idempotency and Error Handling
 - Any `UPDATE state` must include `turn_epoch + active_agent_turn_id`; zero affected rows means stop side effects.
-- Idempotency and convergence of `tool_result`/tool callback are jointly constrained by `turn_waiting_tools` / `resume_ledger`; key dimensions include agent, turn, epoch, and tool_call to avoid duplicate dispatch from repeated deliveries.
+- Idempotency and convergence of `tool_result`/tool callback are jointly constrained by `turn_waiting_tools` + `state.agent_inbox(correlation_id=tool_call_id)`; apply is single-winner on the waiting row, and later duplicates converge as idempotent consume rather than duplicate append.
 - If `status` or `turn` mismatch/box expired, resume is rerouted to drop/retry and emits observability signals instead of blind duplicate submission.
-- `Worker watchdog` rescans `resume_ledger` and wait tables: on timeout and replay conditions, it injects `tool.result` timeout report and drives wakeup back into the same turn flow.
+- `Worker watchdog` rescans wait tables and claims due rows from `state.agent_inbox`: on timeout and replay conditions, it injects `tool.result` timeout report and drives wakeup back into the same turn flow.
 - `error/parse` failures use a failure fallback path: for example, when `task.result_fields` or tool schemas are invalid or parse errors occur, it logs warnings and continues an available degraded path; it is not treated as hard protocol rejection unless the model request cannot be built.
 - Worker crashes are reclaimed by PMO; `watchdog` and `resume` handle timeout and replay, and should not modify others' state across agents.
 

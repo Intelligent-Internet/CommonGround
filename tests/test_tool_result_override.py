@@ -1,6 +1,7 @@
 import pytest
 
 from card_box_core.structures import ToolResultContent
+from core.cg_context import CGContext
 from core.utp_protocol import extract_tool_result_payload, resolve_effective_after_execution
 from infra.tool_executor import ToolResultContext
 
@@ -54,8 +55,13 @@ def test_extract_tool_result_payload_after_execution_override(result_payload, ex
 
 def test_tool_result_context_result_override_has_highest_priority():
     ctx = ToolResultContext.from_cmd_data(
-        project_id="proj_1",
-        cmd_data={"after_execution": "suspend"},
+        ctx=CGContext(
+            project_id="proj_1",
+            channel_id="public",
+            agent_id="agent_1",
+            tool_call_id="call_1",
+        ),
+        cmd_data={"after_execution": "suspend", "tool_call_id": "call_1"},
     )
     ctx.override_after_execution("terminate")
     assert ctx.effective_after_execution({"__cg_control": {"after_execution": "suspend"}}) == "suspend"

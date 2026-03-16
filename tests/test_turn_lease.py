@@ -1,5 +1,6 @@
 import pytest
 
+from core.cg_context import CGContext
 from infra.stores.turn_lease import (
     ensure_agent_state_row_with_conn,
     lease_agent_turn_with_conn,
@@ -31,11 +32,13 @@ async def test_ensure_agent_state_row_with_conn_builds_expected_insert_params() 
 
     await ensure_agent_state_row_with_conn(
         conn,
-        project_id="proj_1",
-        agent_id="agent_1",
-        active_channel_id="public",
-        parent_step_id="step_parent",
-        trace_id="trace_1",
+        ctx=CGContext(
+            project_id="proj_1",
+            agent_id="agent_1",
+            channel_id="public",
+            parent_step_id="step_parent",
+            trace_id="trace_1",
+        ),
         profile_box_id="box_profile",
         context_box_id="box_context",
         output_box_id="box_output",
@@ -62,16 +65,18 @@ async def test_lease_agent_turn_with_conn_insert_then_update_and_return_epoch() 
 
     epoch = await lease_agent_turn_with_conn(
         conn,
-        project_id="proj_1",
-        agent_id="agent_1",
-        agent_turn_id="turn_1",
-        active_channel_id="public",
+        ctx=CGContext(
+            project_id="proj_1",
+            agent_id="agent_1",
+            channel_id="public",
+            agent_turn_id="turn_1",
+            recursion_depth=3,
+            parent_step_id="step_parent",
+            trace_id="trace_1",
+        ),
         profile_box_id="box_profile",
         context_box_id="box_context",
         output_box_id="box_output",
-        parent_step_id="step_parent",
-        trace_id="trace_1",
-        active_recursion_depth=3,
     )
 
     assert epoch == 7
@@ -110,9 +115,7 @@ async def test_lease_agent_turn_with_conn_returns_none_when_row_missing() -> Non
 
     epoch = await lease_agent_turn_with_conn(
         conn,
-        project_id="proj_1",
-        agent_id="agent_1",
-        agent_turn_id="turn_1",
+        ctx=CGContext(project_id="proj_1", agent_id="agent_1", agent_turn_id="turn_1"),
     )
 
     assert epoch is None

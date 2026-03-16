@@ -17,19 +17,13 @@ class StepRecorder:
         item: AgentTurnWorkItem,
         step_id: str,
         status: str = "started",
-        agent_turn_id: Optional[str] = None,
         profile_box_id: Optional[str] = None,
         context_box_id: Optional[str] = None,
         output_box_id: Optional[str] = None,
     ) -> None:
+        step_ctx = item.ctx.with_new_step(step_id)
         await self.step_store.insert_step(
-            project_id=item.project_id,
-            agent_id=item.agent_id,
-            step_id=step_id,
-            agent_turn_id=agent_turn_id if agent_turn_id is not None else item.agent_turn_id,
-            channel_id=item.channel_id,
-            parent_step_id=item.parent_step_id,
-            trace_id=item.trace_id,
+            ctx=step_ctx,
             status=status,
             profile_box_id=profile_box_id if profile_box_id is not None else item.profile_box_id,
             context_box_id=context_box_id if context_box_id is not None else item.context_box_id,
@@ -86,9 +80,7 @@ class StepRecorder:
         update_fields: Optional[Dict[str, Any]] = None,
     ) -> None:
         update_kwargs: Dict[str, Any] = {
-            "project_id": item.project_id,
-            "agent_id": item.agent_id,
-            "step_id": step_id,
+            "ctx": item.ctx.with_new_step(step_id),
             "status": status,
             "ended": ended,
             "error": error,

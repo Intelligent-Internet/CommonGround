@@ -42,7 +42,7 @@ def build_stream_start_metadata(*, item: Any, profile: Any) -> Dict[str, Any]:
     else:
         llm_cfg.pop("provider_options", None)
     return {
-        "agent_id": item.agent_id,
+        "agent_id": item.ctx.agent_id,
         "profile_id": profile.card_id,
         "profile_name": profile.name,
         "display_name": profile.display_name,
@@ -61,16 +61,13 @@ def build_card_metadata(
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     meta: Dict[str, Any] = {
-        "agent_turn_id": item.agent_turn_id,
+        "agent_turn_id": item.ctx.agent_turn_id,
         "step_id": step_id,
         "role": role,
+        **item.ctx.to_lineage_meta(exclude_step_id=True),
     }
     if tool_call_id:
         meta["tool_call_id"] = tool_call_id
-    if item.trace_id:
-        meta["trace_id"] = item.trace_id
-    if item.parent_step_id:
-        meta["parent_step_id"] = item.parent_step_id
     if extra:
         meta.update(extra)
     return meta

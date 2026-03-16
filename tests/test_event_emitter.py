@@ -21,7 +21,7 @@ class FakeNATS:
 
 
 @pytest.mark.asyncio
-async def test_emit_agent_state_skips_missing_epoch() -> None:
+async def test_emit_agent_state_uses_ctx_turn_epoch() -> None:
     nats = FakeNATS()
     await emit_agent_state(
         nats=nats,
@@ -30,12 +30,13 @@ async def test_emit_agent_state_skips_missing_epoch() -> None:
             channel_id="public",
             agent_id="agent",
             agent_turn_id="turn_1",
+            turn_epoch=3,
         ),
-        turn_epoch=None,
         status="idle",
         output_box_id=None,
     )
-    assert nats.calls == []
+    assert len(nats.calls) == 1
+    assert nats.calls[0]["payload"]["turn_epoch"] == 3
 
 
 @pytest.mark.asyncio
@@ -54,9 +55,9 @@ async def test_emit_agent_step_merges_metadata_with_llm_timing() -> None:
             channel_id="public",
             agent_id="agent",
             agent_turn_id="turn_1",
+            step_id="step_1",
             headers={"h": "1"},
         ),
-        step_id="step_1",
         phase="executing",
         metadata={"llm_request_started_at": "preset"},
         timing=timing,
@@ -82,16 +83,18 @@ async def test_emit_agent_state_accepts_ctx() -> None:
             channel_id="public",
             agent_id="agent",
             agent_turn_id="turn_2",
+            turn_epoch=2,
             headers={"h": "2"},
         ),
-        turn_epoch=2,
         status="running",
         output_box_id="box_2",
     )
     assert len(nats.calls) == 1
     call = nats.calls[0]
     assert call["subject"] == evt_agent_state_subject("proj", "public", "agent")
-    assert call["headers"] == {"h": "2"}
+    assert call["headers"]["h"] == "2"
+    assert call["headers"]["CG-Project-Id"] == "proj"
+    assert call["headers"]["CG-Agent-Id"] == "agent"
     assert call["payload"]["agent_turn_id"] == "turn_2"
     assert call["payload"]["output_box_id"] == "box_2"
 

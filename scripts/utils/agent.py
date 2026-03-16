@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.cg_context import CGContext
 from core.utils import safe_str
 from infra.stores import ResourceStore, StateStore
 from services.pmo.agent_lifecycle import CreateAgentSpec, ensure_agent_ready
@@ -40,7 +41,12 @@ async def ensure_agent(
     tags: Optional[List[str]],
     metadata_source: str,
 ) -> Tuple[Dict[str, Any], str]:
-    roster = await resource_store.fetch_roster(project_id, agent_id)
+    target_ctx = CGContext(
+        project_id=project_id,
+        channel_id=channel_id,
+        agent_id=agent_id,
+    )
+    roster = await resource_store.fetch_roster(target_ctx)
     roster_profile_box_id = safe_str(roster.get("profile_box_id")) if roster else None
     if roster and roster_profile_box_id:
         return roster, roster_profile_box_id
@@ -64,8 +70,7 @@ async def ensure_agent(
     lifecycle_result = await ensure_agent_ready(
         resource_store=resource_store,
         state_store=state_store,
-        project_id=project_id,
-        agent_id=agent_id,
+        target_ctx=target_ctx,
         spec=CreateAgentSpec(
             profile_box_id=resolved_profile_box_id,
             metadata={"source": metadata_source},
@@ -79,7 +84,7 @@ async def ensure_agent(
     if lifecycle_result.error_code:
         raise RuntimeError(f"ensure_agent_ready failed: {lifecycle_result.error_code}")
 
-    roster = await resource_store.fetch_roster(project_id, agent_id)
+    roster = await resource_store.fetch_roster(target_ctx)
     roster_profile_box_id = safe_str(roster.get("profile_box_id")) if roster else None
     if not roster or not roster_profile_box_id:
         raise RuntimeError("agent roster missing after ensure-agent")

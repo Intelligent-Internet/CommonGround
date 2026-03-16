@@ -128,9 +128,10 @@ class BatchCardsResponse(BaseModel):
 
 
 class GodStopRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     agent_id: str
     agent_turn_id: str
-    turn_epoch: int
     channel_id: str = "public"
     target: str = "worker_generic"
     reason: str = "admin_intervention"

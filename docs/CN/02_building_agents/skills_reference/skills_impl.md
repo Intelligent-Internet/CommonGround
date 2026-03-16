@@ -123,8 +123,9 @@ sequenceDiagram
 
 ### Sandbox 复用与回收
 - 默认每次调用创建新 sandbox（`tools.e2b.reuse_mode=none`）。
-- 开启复用后，sandbox 按 `project_id + agent_id` 复用，依赖与文件会保留。
+- 开启复用后，运行时会基于 `project_id + agent_id + session_id(alias)` 派生内部 owner-scoped session key，并按该 key 复用；不同 agent 即使使用同名 alias 也不会冲突。
 - 通过回收服务定期清理过期 sandbox。
+- 对外暴露的 `session_id` 仍只是调用者可见 alias，不是底层 sandbox identity。
  - **自建 E2B 兼容**：优先走 `Sandbox.connect`，若 `/connect` 缺失（404），会 fallback：
    - 读取 `get_info`，若 `state=paused` 则调用 `/sandboxes/{id}/resume`
    - 再次 `get_info`，用 `envdAccessToken + domain` 直接构造 client
@@ -191,6 +192,7 @@ CREATE UNIQUE INDEX idx_agent_inbox_unique
 - `skills.run_cmd` 为同步调用：默认等待命令结束后返回标准输出、stderr、退出码与 artifacts。
 - `skills.load` 会在当前 session 下确保 skill 内容注入到 sandbox（本地 `local` 与远端 `remote` 行为不同）。
 - `skills.run_service` 需要 `session_id`，用于长期服务启动场景；仅在 `skills.mode=local` 下可用。
+- `session_id` 应视为调用者稳定选择的 alias，而不是可跨 agent 复用的全局 sandbox id。
 
 - 使用 `skills.run_cmd` 的示例（短任务）：
   - 会注入 skill 文件到 `skill/`

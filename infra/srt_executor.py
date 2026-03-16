@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import uuid6
 
+from core.cg_context import CGContext
 from core.errors import BadRequestError
 
 
@@ -314,8 +315,7 @@ class SrtExecutor:
     async def start_process(
         self,
         *,
-        project_id: str,
-        tool_call_id: Optional[str],
+        ctx: CGContext,
         session_id: Optional[str],
         code: str,
         inputs: List[Dict[str, Any]] | None,
@@ -326,8 +326,8 @@ class SrtExecutor:
         if not isinstance(code, str) or not code.strip():
             raise BadRequestError("code is empty")
         base_dir, cwd, _workdir_val, output_items, settings_path, settings_mode = await self._prepare_run(
-            project_id=project_id,
-            tool_call_id=tool_call_id,
+            project_id=ctx.project_id,
+            tool_call_id=ctx.tool_call_id,
             session_id=session_id,
             inputs=inputs,
             outputs=outputs,
@@ -359,9 +359,7 @@ class SrtExecutor:
     async def execute(
         self,
         *,
-        project_id: str,
-        agent_id: Optional[str],
-        tool_call_id: Optional[str],
+        ctx: CGContext,
         session_id: Optional[str],
         language: str,
         code: str,
@@ -382,8 +380,8 @@ class SrtExecutor:
         timeout_val = min(timeout_val, self.timeout_sec_max)
 
         base_dir, cwd, workdir_val, output_items, settings_path, settings_mode = await self._prepare_run(
-            project_id=project_id,
-            tool_call_id=tool_call_id,
+            project_id=ctx.project_id,
+            tool_call_id=ctx.tool_call_id,
             session_id=session_id,
             inputs=inputs,
             outputs=outputs,
@@ -421,7 +419,7 @@ class SrtExecutor:
             self._cleanup_settings(settings_path, settings_mode)
 
         created, output_errors = await self._collect_outputs(
-            project_id=project_id,
+            project_id=ctx.project_id,
             base_dir=base_dir,
             workdir=workdir_val,
             output_items=output_items,

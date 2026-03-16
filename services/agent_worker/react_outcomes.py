@@ -12,7 +12,6 @@ async def normalize_action_outcomes(
     *,
     cardbox: Any,
     ctx: CGContext,
-    turn_epoch: int,
     tool_calls: Sequence[Dict[str, Any]],
     outcomes: Sequence[Any],
     logger: Any,
@@ -27,9 +26,7 @@ async def normalize_action_outcomes(
             function_name = (tool_call.get("function") or {}).get("name") or "unknown"
             error_card = await save_failed_tool_result_card(
                 cardbox=cardbox,
-                ctx=ctx,
-                turn_epoch=turn_epoch,
-                tool_call_id=str(tool_call_id),
+                ctx=ctx.with_tool_call(str(tool_call_id)),
                 function_name=function_name,
                 error=outcome,
             )
@@ -48,9 +45,7 @@ async def normalize_action_outcomes(
             function_name = (tool_call.get("function") or {}).get("name") or "unknown"
             error_card = await save_failed_tool_result_card(
                 cardbox=cardbox,
-                ctx=ctx,
-                turn_epoch=turn_epoch,
-                tool_call_id=str(tool_call_id),
+                ctx=ctx.with_tool_call(str(tool_call_id)),
                 function_name=function_name,
                 error="tool returned no result cards and did not suspend or complete",
             )

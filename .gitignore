@@ -4,6 +4,10 @@ __pycache__/
 .venv/
 venv/
 env/
+exports/
+
+#uv 
+uv.lock
 
 # Database
 *.duckdb
@@ -49,3 +53,4 @@ examples/skills
 # Local build metadata
 commonground_next.egg-info/
 .opencode/
+.aider*

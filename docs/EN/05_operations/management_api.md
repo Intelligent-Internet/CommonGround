@@ -87,6 +87,11 @@ This document is synchronized with the current `services/api/main.py`.
 | POST | `/projects/{project_id}/god/pmo/{tool_name}:call` | `PMOToolCallRequest` | `PMOToolCallResponse` | Dispatch PMO internal tool |
 | POST | `/projects/{project_id}/god/stop` | `GodStopRequest` | `GodStopResponse` | Stop agent turn |
 
+Additional implementation constraint:
+- The `/god/pmo/{tool_name}:call` request/response contract is unchanged.
+- Internal dispatch now goes through L0 `command_intent` (L0 writes `execution_edges` and publishes `cmd.sys.pmo.internal.*`), instead of API-level direct edge write/direct cmd publish.
+- `/god/stop` no longer accepts `turn_epoch`; stop now targets the specified `agent_turn_id` turn without epoch-exact matching.
+
 ## 4. Differences vs Previous Docs (Revised)
 
 - The old doc only covered `projects / profiles / tools`, and missed Skill, Artifact, Agent/State, CardBox, God, and observability endpoints.

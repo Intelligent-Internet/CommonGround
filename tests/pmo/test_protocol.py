@@ -1,5 +1,7 @@
 import pytest
 
+from core.cg_context import CGContext
+from core.config import PROTOCOL_VERSION
 from core.errors import BadRequestError, NotFoundError, ProtocolViolationError
 from core.subject import format_subject
 from core.utp_protocol import ToolCallContent
@@ -25,14 +27,20 @@ class _DummyCardBox:
 def _base_payload() -> dict:
     return {
         "tool_name": "delegate_async",
-        "tool_call_id": "call_1",
-        "agent_turn_id": "turn_1",
-        "turn_epoch": 1,
-        "step_id": "step_1",
-        "agent_id": "agent_1",
         "after_execution": "suspend",
         "tool_call_card_id": "card_1",
     }
+
+
+def _base_ctx() -> CGContext:
+    return CGContext(
+        project_id="proj_1",
+        agent_id="agent_1",
+        agent_turn_id="turn_1",
+        turn_epoch=1,
+        step_id="step_1",
+        tool_call_id="call_1",
+    )
 
 
 def test_parse_subject_cmd_accepts_valid_pmo_subject() -> None:
@@ -64,15 +72,15 @@ async def test_decode_tool_command_hydrates_arguments_from_tool_call_card() -> N
                         "instruction": "hello",
                     },
                     status="called",
-                    target_subject="cg.v1r3.proj_1.public.cmd.sys.pmo.internal.delegate_async",
+                    target_subject=f"cg.{PROTOCOL_VERSION}.proj_1.public.cmd.sys.pmo.internal.delegate_async",
                 )
             )
         ]
     )
     cmd = await decode_tool_command(
         data=_base_payload(),
+        ctx=_base_ctx(),
         cardbox=cardbox,
-        project_id="proj_1",
     )
     assert cmd.arguments == {
         "target_strategy": "reuse",
@@ -85,12 +93,12 @@ async def test_decode_tool_command_hydrates_arguments_from_tool_call_card() -> N
 @pytest.mark.asyncio
 async def test_decode_tool_command_rejects_missing_required_fields() -> None:
     data = _base_payload()
-    data.pop("tool_call_id")
+    data.pop("tool_call_card_id")
     with pytest.raises(BadRequestError):
         await decode_tool_command(
             data=data,
+            ctx=_base_ctx(),
             cardbox=_DummyCardBox(),
-            project_id="proj_1",
         )
 
 
@@ -101,8 +109,8 @@ async def test_decode_tool_command_rejects_forbidden_args_field() -> None:
     with pytest.raises(ProtocolViolationError):
         await decode_tool_command(
             data=data,
+            ctx=_base_ctx(),
             cardbox=_DummyCardBox(),
-            project_id="proj_1",
         )
 
 
@@ -111,6 +119,41 @@ async def test_decode_tool_command_raises_when_tool_call_card_missing() -> None:
     with pytest.raises(NotFoundError):
         await decode_tool_command(
             data=_base_payload(),
+            ctx=_base_ctx(),
             cardbox=_DummyCardBox(cards=[]),
-            project_id="proj_1",
+        )
+
+
+@pytest.mark.asyncio
+async def test_decode_tool_command_rejects_payload_tool_call_id() -> None:
+    data = _base_payload()
+    data["tool_call_id"] = "call_payload_conflict"
+    with pytest.raises(ProtocolViolationError):
+        await decode_tool_command(
+            data=data,
+            ctx=_base_ctx(),
+            cardbox=_DummyCardBox(
+                cards=[
+                    _Card(
+                        ToolCallContent(
+                            tool_name="delegate_async",
+                            arguments={},
+                            status="called",
+                            target_subject=f"cg.{PROTOCOL_VERSION}.proj_1.public.cmd.sys.pmo.internal.delegate_async",
+                        )
+                    )
+                ]
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_decode_tool_command_rejects_missing_tool_call_id_in_context() -> None:
+    data = _base_payload()
+    ctx = _base_ctx().with_tool_call(None)
+    with pytest.raises(BadRequestError):
+        await decode_tool_command(
+            data=data,
+            ctx=ctx,
+            cardbox=_DummyCardBox(),
         )
