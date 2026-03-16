@@ -3,6 +3,7 @@ from typing import Optional, List, Any, Dict
 
 from psycopg_pool import AsyncConnectionPool
 
+from core.cg_context import CGContext
 from .base import BaseStore
 
 
@@ -22,18 +23,13 @@ class StepStore(BaseStore):
     async def insert_step(
         self,
         *,
-        project_id: str,
-        agent_id: str,
-        step_id: str,
-        agent_turn_id: str,
-        channel_id: Optional[str],
-        parent_step_id: Optional[str],
-        trace_id: Optional[str],
+        ctx: CGContext,
         status: str,
         profile_box_id: Optional[str],
         context_box_id: Optional[str],
         output_box_id: Optional[str],
     ) -> None:
+        step_id = ctx.require_step_id
         sql = """
             INSERT INTO state.agent_steps (
                 project_id, agent_id, step_id, agent_turn_id, channel_id, parent_step_id, trace_id, status,
@@ -46,13 +42,13 @@ class StepStore(BaseStore):
             await conn.execute(
                 sql,
                 (
-                    project_id,
-                    agent_id,
+                    ctx.project_id,
+                    ctx.agent_id,
                     step_id,
-                    agent_turn_id,
-                    channel_id,
-                    parent_step_id,
-                    trace_id,
+                    ctx.agent_turn_id,
+                    ctx.channel_id or None,
+                    ctx.parent_step_id,
+                    ctx.trace_id,
                     status,
                     profile_box_id,
                     context_box_id,
@@ -63,9 +59,7 @@ class StepStore(BaseStore):
     async def update_step(
         self,
         *,
-        project_id: str,
-        agent_id: str,
-        step_id: str,
+        ctx: CGContext,
         status: Optional[str] = None,
         request_box_id: Optional[str] = None,
         api_log_id: Optional[int] = None,
@@ -101,12 +95,13 @@ class StepStore(BaseStore):
         if not clauses:
             return
 
+        step_id = ctx.require_step_id
         sql = f"""
             UPDATE state.agent_steps
             SET {', '.join(clauses)}
             WHERE project_id=%s AND agent_id=%s AND step_id=%s
         """
-        params.extend([project_id, agent_id, step_id])
+        params.extend([ctx.project_id, ctx.agent_id, step_id])
 
         async with self.pool.connection() as conn:
             await conn.execute(sql, tuple(params))

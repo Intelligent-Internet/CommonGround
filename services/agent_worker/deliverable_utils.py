@@ -31,7 +31,7 @@ async def ensure_terminal_deliverable(
         box = await call_with_optional_conn(
             cardbox.get_box,
             str(item.output_box_id),
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
             conn=conn,
         )
         if not box:
@@ -42,7 +42,7 @@ async def ensure_terminal_deliverable(
             await call_with_optional_conn(
                 cardbox.get_cards,
                 card_ids,
-                project_id=item.project_id,
+                project_id=item.ctx.project_id,
                 conn=conn,
             )
             if card_ids
@@ -77,11 +77,11 @@ async def ensure_terminal_deliverable(
         deliverable_card_id = uuid6.uuid7().hex
         deliverable = Card(
             card_id=deliverable_card_id,
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
             type="task.deliverable",
             content=JsonContent(data=fallback_data),
             created_at=datetime.now(UTC),
-            author_id=item.agent_id,
+            author_id=item.ctx.agent_id,
             metadata=card_metadata_builder(
                 item,
                 step_id=step_id,
@@ -94,7 +94,7 @@ async def ensure_terminal_deliverable(
             cardbox.append_to_box,
             str(item.output_box_id),
             [deliverable.card_id],
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
             conn=conn,
         )
         return deliverable.card_id
@@ -116,10 +116,10 @@ async def append_partial_deliverable(
     if not item.output_box_id:
         return None
     try:
-        box = await cardbox.get_box(item.output_box_id, project_id=item.project_id)
+        box = await cardbox.get_box(item.output_box_id, project_id=item.ctx.project_id)
         if not box or not box.card_ids:
             return None
-        cards = await cardbox.get_cards(list(box.card_ids), project_id=item.project_id)
+        cards = await cardbox.get_cards(list(box.card_ids), project_id=item.ctx.project_id)
         if not cards:
             return None
 
@@ -151,16 +151,16 @@ async def append_partial_deliverable(
         deliverable_card_id = uuid6.uuid7().hex
         deliverable = Card(
             card_id=deliverable_card_id,
-            project_id=item.project_id,
+            project_id=item.ctx.project_id,
             type="task.deliverable",
             content=JsonContent(data=fallback_data),
             created_at=datetime.now(UTC),
-            author_id=item.agent_id,
+            author_id=item.ctx.agent_id,
             metadata=card_metadata_builder(item, step_id=step_id, role="assistant", extra={"partial": True}),
         )
         await cardbox.save_card(deliverable)
         item.output_box_id = await cardbox.append_to_box(
-            item.output_box_id, [deliverable.card_id], project_id=item.project_id
+            item.output_box_id, [deliverable.card_id], project_id=item.ctx.project_id
         )
         return deliverable_card_id
     except Exception as exc:  # noqa: BLE001

@@ -61,7 +61,6 @@
 | `pmo.dispatched_timeout_seconds` | `CG__pmo__dispatched_timeout_seconds` | `30.0` | `dispatched` 超时回收（置回 idle） | benchmark 建议 `0`（禁用）；线上需要大于最坏排队时间，否则会误伤 |
 | `pmo.active_reap_seconds` | `CG__pmo__active_reap_seconds` | `300.0` | 扫描长期 `running` 的 head 并回收 | 线上一般保持默认；出现异常长任务堆积可缩短并结合告警 |
 | `pmo.pending_wakeup_seconds` | `CG__pmo__pending_wakeup_seconds` | `5.0` | `queued/pending` inbox 超时重发阈值 | 可适当下调，减少 pending 堆积后可见延迟 |
-| `pmo.pending_wakeup_skip_seconds` | `CG__pmo__pending_wakeup_skip_seconds` | `300.0` | 缺失 `channel` 的 pending inbox 跳过阈值（<=0 禁用） | 用于避免脏数据无限重试，值太小可能误丢告警 |
 
 ### 2.3 PMO L0 顺序与排队现状（已无独立 L0Subscriber 配置）
 

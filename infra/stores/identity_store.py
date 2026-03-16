@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 import uuid6
 from psycopg_pool import AsyncConnectionPool
 
+from core.cg_context import CGContext
+
 from .base import BaseStore
 
 class IdentityStore(BaseStore):
@@ -36,13 +38,8 @@ class IdentityStore(BaseStore):
     async def insert_identity_edge(
         self,
         *,
-        project_id: str,
-        channel_id: Optional[str],
+        ctx: CGContext,
         action: str,
-        source_agent_id: Optional[str],
-        target_agent_id: str,
-        trace_id: Optional[str],
-        parent_step_id: Optional[str],
         metadata: Optional[Dict[str, Any]] = None,
         edge_id: Optional[str] = None,
         conn: Any = None,
@@ -66,13 +63,13 @@ class IdentityStore(BaseStore):
                 sql,
                 (
                     edge_id,
-                    project_id,
-                    channel_id,
+                    ctx.project_id,
+                    ctx.channel_id or None,
                     action,
-                    source_agent_id,
-                    target_agent_id,
-                    trace_id,
-                    parent_step_id,
+                    ctx.parent_agent_id,
+                    ctx.agent_id,
+                    ctx.trace_id,
+                    ctx.parent_step_id,
                     meta_json,
                 ),
             )
@@ -82,13 +79,13 @@ class IdentityStore(BaseStore):
                 sql,
                 (
                     edge_id,
-                    project_id,
-                    channel_id,
+                    ctx.project_id,
+                    ctx.channel_id or None,
                     action,
-                    source_agent_id,
-                    target_agent_id,
-                    trace_id,
-                    parent_step_id,
+                    ctx.parent_agent_id,
+                    ctx.agent_id,
+                    ctx.trace_id,
+                    ctx.parent_step_id,
                     meta_json,
                 ),
             )

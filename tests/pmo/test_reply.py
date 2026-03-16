@@ -1,10 +1,10 @@
 import pytest
 
+from core.cg_context import CGContext
 from core.status import STATUS_FAILED, STATUS_SUCCESS
 from services.pmo.reply import (
     build_and_save_tool_result_reply,
     load_tool_call_lineage,
-    parse_best_effort_resume_context,
 )
 
 
@@ -34,45 +34,9 @@ class _DummyCardBox:
 
 def _base_cmd_data() -> dict:
     return {
-        "tool_call_id": "call_1",
-        "agent_turn_id": "turn_1",
-        "turn_epoch": 1,
-        "agent_id": "agent_1",
         "after_execution": "suspend",
         "tool_name": "delegate_async",
     }
-
-
-def _base_resume_payload() -> dict:
-    return {
-        "tool_call_id": "call_1",
-        "agent_turn_id": "turn_1",
-        "agent_id": "agent_1",
-        "turn_epoch": "2",
-        "after_execution": "suspend",
-        "tool_name": "delegate_async",
-        "tool_call_card_id": "tc_card_1",
-    }
-
-
-def test_parse_best_effort_resume_context_accepts_valid_payload() -> None:
-    ctx = parse_best_effort_resume_context(_base_resume_payload())
-    assert ctx is not None
-    assert ctx.turn_epoch == 2
-    assert ctx.tool_name == "delegate_async"
-    assert ctx.tool_call_card_id == "tc_card_1"
-
-
-def test_parse_best_effort_resume_context_rejects_invalid_after_execution() -> None:
-    payload = _base_resume_payload()
-    payload["after_execution"] = "continue"
-    assert parse_best_effort_resume_context(payload) is None
-
-
-def test_parse_best_effort_resume_context_rejects_bad_turn_epoch() -> None:
-    payload = _base_resume_payload()
-    payload["turn_epoch"] = "oops"
-    assert parse_best_effort_resume_context(payload) is None
 
 
 @pytest.mark.asyncio
@@ -93,7 +57,7 @@ async def test_build_and_save_tool_result_reply_uses_tool_call_lineage() -> None
     )
     payload, result_card = await build_and_save_tool_result_reply(
         cardbox=cardbox,
-        project_id="proj_1",
+        ctx=CGContext(project_id="proj_1", agent_id="agent_1", agent_turn_id="turn_1"),
         tool_call_card_id="tc_card_1",
         cmd_data=_base_cmd_data(),
         status=STATUS_SUCCESS,
@@ -103,7 +67,10 @@ async def test_build_and_save_tool_result_reply_uses_tool_call_lineage() -> None
         after_execution="suspend",
         warn_context="resume",
     )
-    assert payload["step_id"] == "step_1"
+    # SSOT: identity fields come from ctx; lineage lookup is best-effort metadata source only.
+    assert payload["status"] == STATUS_SUCCESS
+    assert payload["tool_result_card_id"]
+    assert "step_id" not in payload
     assert cardbox.get_calls == [(["tc_card_1"], "proj_1")]
     assert len(cardbox.saved_cards) == 1
     assert cardbox.saved_cards[0].card_id == result_card.card_id
@@ -115,7 +82,7 @@ async def test_build_and_save_tool_result_reply_continues_when_lineage_lookup_fa
     cardbox = _DummyCardBox(fail_get=True)
     payload, result_card = await build_and_save_tool_result_reply(
         cardbox=cardbox,
-        project_id="proj_1",
+        ctx=CGContext(project_id="proj_1", agent_id="agent_1", agent_turn_id="turn_1"),
         tool_call_card_id="tc_card_1",
         cmd_data=_base_cmd_data(),
         status=STATUS_FAILED,
@@ -125,7 +92,9 @@ async def test_build_and_save_tool_result_reply_continues_when_lineage_lookup_fa
         after_execution="suspend",
         warn_context="bad_request",
     )
-    assert payload["step_id"] is None
+    assert payload["status"] == STATUS_FAILED
+    assert payload["tool_result_card_id"]
+    assert "step_id" not in payload
     assert cardbox.get_calls == [(["tc_card_1"], "proj_1")]
     assert len(cardbox.saved_cards) == 1
     assert cardbox.saved_cards[0].card_id == result_card.card_id

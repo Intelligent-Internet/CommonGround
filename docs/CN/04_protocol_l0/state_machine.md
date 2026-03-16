@@ -1,15 +1,17 @@
 # 状态机与生命周期
 
 本文是 L0 权威定义，描述 AgentTurn 状态机、原子 I/O 顺序、交付契约与 Inbox/Wakeup 约束。
-若需完整的 Agent/PMO I/O 契约，请参见 `agent_pmo_protocol.md`。
+若需完整的 L1 实现契约，请参见 `../03_kernel_l1/agent_worker.md` 和 `../03_kernel_l1/pmo_orchestration.md`。
 
 > 拓扑概念与模式请参见 `01_getting_started/architecture_intro.md`；实现与行为以本 L0 协议为准。
+> 历史迁移说明：`turn_resume_ledger` 的运行时依赖是在 `v1r3 -> v1r4` 硬切期间移除的，恢复路径统一切到 `state.agent_inbox`（含 `deferred/retry_count/next_retry_at`）。这个提示主要面向历史升级场景，不是 fresh `V1R4` 部署的当前风险。
 
 ## 1. 核心不变量
 - 同一 `agent_id` 严禁并发（单活跃 Turn）。
 - 所有 state 更新必须受 `turn_epoch + active_agent_turn_id` 门禁保护。
 - 终态必须存在 `task.deliverable`，并在 `evt.agent.*.task` 返回 `deliverable_card_id`。
 - **Inbox 为执行面真源**：执行请求/回执必须写入 `state.agent_inbox`，NATS 仅用于唤醒。
+- **恢复单轨**：`tool_result/timeout` 的重试与回放只走 `state.agent_inbox`（`pending/deferred`），不再依赖 `turn_resume_ledger` 运行时状态机。
 - **一条 Enqueue 对应一个 Turn**：每个 Enqueue 由 **L0** 绑定独立 `agent_turn_id/turn_epoch` 并完成一次交付（`turn_epoch` 允许在 queued→pending 的派发阶段生成）。
 - **每个 Turn 仅产生一次 `evt.agent.*.task`**。
 - **Wakeup header 仅为门铃**：语义字段以 inbox 记录为准，header 不作为审计真源。
@@ -50,7 +52,7 @@
 - `join`（`primitive="join"`，`edge_phase="request|response"`）：用于子任务协作 join 语义记录。
 
 ### 3.2 Wakeup + Claim（Worker）
-- 收到 wakeup 后 **先 claim pending inbox**（`FOR UPDATE SKIP LOCKED`，按 `created_at ASC`）。
+- 收到 wakeup 后 **先 claim 到期 inbox**（`status in (pending,deferred)` 且 `next_retry_at<=now()`，`FOR UPDATE SKIP LOCKED`，按 `next_retry_at, created_at ASC`）。
 - state 更新采用 **CAS 门禁**（`turn_epoch + active_agent_turn_id`），不依赖 state 行锁。
 - Worker 不得自行生成 `agent_turn_id/turn_epoch`；inbox 缺失或非法视为协议错误（应拒绝处理）。
 - `status=idle`：由 **L0** 在入队/lease 时生成/接管 `agent_turn_id` 并 `turn_epoch+=1`，写入 `trace_id/parent_step_id`，置 `status=dispatched`。
@@ -62,7 +64,7 @@
 
 ### 3.3 Tool Call（Worker）
 - 写 `tool.call` 卡。
-- 发布 `cmd.tool.*` 或 `cmd.sys.pmo.internal.*`。
+- 调用 `L0Engine.command_intent` 生成命令信号（事务内写 `execution_edges(primitive=tool_call,edge_phase=request)`，事务后统一发布 `cmd.tool.*` 或 `cmd.sys.pmo.internal.*`）。
 - 若 `after_execution=suspend`：
   - 设置 `waiting_tool_count`，记录 `resume_deadline`。
   - 写入/更新 `turn_waiting_tools`（`tool_call_id` 及 `step_id`）作为恢复集合。
@@ -77,6 +79,7 @@
   - `resume_handler` 校验 `state= suspended` 且 `tool_call_id` 在当前 `turn_waiting_tools` 中。
   - 对应等待项接收后更新状态；若仍有待恢复项则继续 `suspended`（保留或更新 `resume_deadline`），否则按 `after_execution` 结果进入 `running` 或 `idle`。
   - `expecting_correlation_id` 一般不参与主流程匹配。
+  - 可重试失败通过 inbox 回写为 `deferred`（带 `retry_count/next_retry_at/defer_reason`），由后续 wakeup/看门狗继续领取。
 
 ### 3.5 Deliver（Worker）
 - 写 `task.deliverable`。
@@ -87,6 +90,7 @@
 - 若 `status=suspended` 且 `NOW() > resume_deadline`：
   - 由 **Worker 看门狗**按 `turn_waiting_tools` 发现超时项，构造 `message_type=timeout` 的 Report（`correlation_id`=超时的 `tool_call_id`），入 `state.agent_inbox`。
   - 同步清理/记录 `resume_deadline`，唤醒 worker；resume 流程继续处理。
+  - reconcile 只按 `turn_waiting_tools.tool_call_id` 关联领取 `agent_inbox` 到期项，不再经过 resume ledger 中转。
 > 更完整的兜底与超时机制说明见 `04_protocol_l0/watchdog_safety_net.md`。
 
 ## 4. 结果交付契约（L0）

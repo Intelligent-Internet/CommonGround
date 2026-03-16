@@ -1,10 +1,10 @@
-import json
 import inspect
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Iterable, Awaitable, Callable
 
 from psycopg_pool import AsyncConnectionPool
 
+from core.cg_context import CGContext
 from core.state import AgentStateHead, AgentStatePointers
 from .base import BaseStore
 from .turn_lease import (
@@ -13,6 +13,12 @@ from .turn_lease import (
 )
 
 _UNSET = object()
+
+
+@dataclass(frozen=True, slots=True)
+class TurnIdleTransition:
+    committed_ctx: CGContext
+    last_output_box_id: Optional[str]
 
 
 class StateStore(BaseStore):
@@ -28,25 +34,18 @@ class StateStore(BaseStore):
 
     async def init_if_absent(
         self,
-        project_id: str,
-        agent_id: str,
-        active_channel_id: Optional[str] = None,
+        *,
+        ctx: CGContext,
         profile_box_id: Optional[str] = None,
         context_box_id: Optional[str] = None,
         output_box_id: Optional[str] = None,
-        parent_step_id: Optional[str] = None,
-        trace_id: Optional[str] = None,
         conn: Any = None,
     ):
         """Insert a state row if missing (used by PMO when spawning agents)."""
         if conn is not None:
             await _ensure_agent_state_row_with_conn(
                 conn,
-                project_id=project_id,
-                agent_id=agent_id,
-                active_channel_id=active_channel_id,
-                parent_step_id=parent_step_id,
-                trace_id=trace_id,
+                ctx=ctx,
                 profile_box_id=profile_box_id,
                 context_box_id=context_box_id,
                 output_box_id=output_box_id,
@@ -55,11 +54,7 @@ class StateStore(BaseStore):
         async with self.pool.connection() as own_conn:
             await _ensure_agent_state_row_with_conn(
                 own_conn,
-                project_id=project_id,
-                agent_id=agent_id,
-                active_channel_id=active_channel_id,
-                parent_step_id=parent_step_id,
-                trace_id=trace_id,
+                ctx=ctx,
                 profile_box_id=profile_box_id,
                 context_box_id=context_box_id,
                 output_box_id=output_box_id,
@@ -67,8 +62,7 @@ class StateStore(BaseStore):
 
     async def fetch(
         self,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         *,
         conn: Any = None,
     ) -> Optional[AgentStateHead]:
@@ -81,7 +75,7 @@ class StateStore(BaseStore):
             FROM state.agent_state_head
             WHERE project_id=%s AND agent_id=%s
             """,
-            (project_id, agent_id),
+            (ctx.project_id, ctx.agent_id),
             conn=conn,
         )
         if not data:
@@ -90,8 +84,7 @@ class StateStore(BaseStore):
 
     async def fetch_pointers(
         self,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         *,
         conn: Any = None,
     ) -> Optional[AgentStatePointers]:
@@ -101,14 +94,14 @@ class StateStore(BaseStore):
             FROM state.agent_state_pointers
             WHERE project_id=%s AND agent_id=%s
             """,
-            (project_id, agent_id),
+            (ctx.project_id, ctx.agent_id),
             conn=conn,
         )
         if not data:
             return None
         return AgentStatePointers.from_row(data)
 
-    async def delete_agent_state(self, *, project_id: str, agent_id: str) -> None:
+    async def delete_agent_state(self, *, ctx: CGContext) -> None:
         async with self.pool.connection() as conn:
             async with conn.transaction():
                 await conn.execute(
@@ -116,14 +109,14 @@ class StateStore(BaseStore):
                     DELETE FROM state.agent_state_head
                     WHERE project_id=%s AND agent_id=%s
                     """,
-                    (project_id, agent_id),
+                    (ctx.project_id, ctx.agent_id),
                 )
                 await conn.execute(
                     """
                     DELETE FROM state.agent_state_pointers
                     WHERE project_id=%s AND agent_id=%s
                     """,
-                    (project_id, agent_id),
+                    (ctx.project_id, ctx.agent_id),
                 )
 
     async def list_agent_state_heads(
@@ -173,8 +166,7 @@ class StateStore(BaseStore):
     async def ensure_memory_context_box_id(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         ensure: bool = True,
         normalize_box_id: Optional[Callable[..., Awaitable[str]]] = None,
         create_box: Optional[Callable[..., Awaitable[str]]] = None,
@@ -219,20 +211,20 @@ class StateStore(BaseStore):
             WHERE project_id=%s AND agent_id=%s
         """
 
-        lock_key = f"memory_context_box:{agent_id}"
+        lock_key = f"memory_context_box:{ctx.agent_id}"
         async with self.pool.connection() as conn:
             async with conn.transaction():
-                await conn.execute(lock_sql, (project_id, lock_key))
+                await conn.execute(lock_sql, (ctx.project_id, lock_key))
                 if ensure:
-                    await conn.execute(ensure_row_sql, (project_id, agent_id))
-                row = await self.fetch_one(select_sql, (project_id, agent_id), conn=conn)
+                    await conn.execute(ensure_row_sql, (ctx.project_id, ctx.agent_id))
+                row = await self.fetch_one(select_sql, (ctx.project_id, ctx.agent_id), conn=conn)
                 current = row.get("memory_context_box_id") if row else None
                 if current:
                     box_id = str(current)
                     if normalize_box_id:
                         normalized = await _call_with_optional_conn(normalize_box_id, box_id, conn=conn)
                         if str(normalized) != box_id:
-                            await conn.execute(update_sql, (str(normalized), project_id, agent_id))
+                            await conn.execute(update_sql, (str(normalized), ctx.project_id, ctx.agent_id))
                             box_id = str(normalized)
                     return box_id
 
@@ -242,16 +234,13 @@ class StateStore(BaseStore):
                 new_box_id = await _call_with_optional_conn(create_box, conn=conn) if create_box else None
                 if not new_box_id:
                     return None
-                await conn.execute(update_sql, (str(new_box_id), project_id, agent_id))
+                await conn.execute(update_sql, (str(new_box_id), ctx.project_id, ctx.agent_id))
                 return str(new_box_id)
 
     async def finish_turn_idle(
         self,
         *,
-        project_id: str,
-        agent_id: str,
-        expect_turn_epoch: int,
-        expect_agent_turn_id: str,
+        ctx: CGContext,
         expect_status: Optional[str] = None,
         last_output_box_id: Optional[str] = None,
         bump_epoch: bool = False,
@@ -262,25 +251,37 @@ class StateStore(BaseStore):
         This clears active-turn fields in state.agent_state_head and updates state.agent_state_pointers
         in the same transaction.
         """
+        transition = await self.finish_turn_idle_transition(
+            ctx=ctx,
+            expect_status=expect_status,
+            last_output_box_id=last_output_box_id,
+            bump_epoch=bump_epoch,
+            conn=conn,
+        )
+        return transition is not None
+
+    async def finish_turn_idle_transition(
+        self,
+        *,
+        ctx: CGContext,
+        expect_status: Optional[str] = None,
+        last_output_box_id: Optional[str] = None,
+        bump_epoch: bool = False,
+        conn: Any = None,
+    ) -> Optional[TurnIdleTransition]:
         if conn is not None:
-            return await self.finish_turn_idle_with_conn(
+            return await self.finish_turn_idle_transition_with_conn(
                 conn,
-                project_id=project_id,
-                agent_id=agent_id,
-                expect_turn_epoch=expect_turn_epoch,
-                expect_agent_turn_id=expect_agent_turn_id,
+                ctx=ctx,
                 expect_status=expect_status,
                 last_output_box_id=last_output_box_id,
                 bump_epoch=bump_epoch,
             )
         async with self.pool.connection() as own_conn:
             async with own_conn.transaction():
-                return await self.finish_turn_idle_with_conn(
+                return await self.finish_turn_idle_transition_with_conn(
                     own_conn,
-                    project_id=project_id,
-                    agent_id=agent_id,
-                    expect_turn_epoch=expect_turn_epoch,
-                    expect_agent_turn_id=expect_agent_turn_id,
+                    ctx=ctx,
                     expect_status=expect_status,
                     last_output_box_id=last_output_box_id,
                     bump_epoch=bump_epoch,
@@ -290,14 +291,32 @@ class StateStore(BaseStore):
         self,
         conn: Any,
         *,
-        project_id: str,
-        agent_id: str,
-        expect_turn_epoch: int,
-        expect_agent_turn_id: str,
+        ctx: CGContext,
         expect_status: Optional[str] = None,
         last_output_box_id: Optional[str] = None,
         bump_epoch: bool = False,
     ) -> bool:
+        transition = await self.finish_turn_idle_transition_with_conn(
+            conn,
+            ctx=ctx,
+            expect_status=expect_status,
+            last_output_box_id=last_output_box_id,
+            bump_epoch=bump_epoch,
+        )
+        return transition is not None
+
+    async def finish_turn_idle_transition_with_conn(
+        self,
+        conn: Any,
+        *,
+        ctx: CGContext,
+        expect_status: Optional[str] = None,
+        last_output_box_id: Optional[str] = None,
+        bump_epoch: bool = False,
+    ) -> Optional[TurnIdleTransition]:
+        project_id, agent_id, expect_agent_turn_id, expect_turn_epoch = self._required_turn_ctx(
+            ctx, "finish_turn_idle"
+        )
         clauses = [
             "status='idle'",
             "active_agent_turn_id=NULL",
@@ -322,10 +341,10 @@ class StateStore(BaseStore):
               AND turn_epoch=%s
               AND active_agent_turn_id=%s
         """
-        params: List[Any] = [project_id, agent_id, int(expect_turn_epoch), str(expect_agent_turn_id)]
+        params: List[Any] = [project_id, agent_id, expect_turn_epoch, expect_agent_turn_id]
         if expect_status is not None:
             update_head_sql += " AND status=%s"
-            params.append(str(expect_status))
+            params.append(expect_status)
 
         upsert_pointer_sql = """
             INSERT INTO state.agent_state_pointers (project_id, agent_id, last_output_box_id, updated_at)
@@ -338,42 +357,32 @@ class StateStore(BaseStore):
             DELETE FROM state.turn_waiting_tools
             WHERE project_id=%s AND agent_id=%s AND agent_turn_id=%s AND turn_epoch=%s
         """
-        cleanup_resume_ledger_sql = """
-            DELETE FROM state.turn_resume_ledger
-            WHERE project_id=%s AND agent_id=%s AND agent_turn_id=%s AND turn_epoch=%s
-        """
 
         res = await conn.execute(update_head_sql, tuple(params))
         if res.rowcount != 1:
-            return False
+            return None
         await conn.execute(
             cleanup_waiting_sql,
-            (project_id, agent_id, str(expect_agent_turn_id), int(expect_turn_epoch)),
-        )
-        await conn.execute(
-            cleanup_resume_ledger_sql,
-            (project_id, agent_id, str(expect_agent_turn_id), int(expect_turn_epoch)),
+            (project_id, agent_id, expect_agent_turn_id, expect_turn_epoch),
         )
         if last_output_box_id:
             await conn.execute(
                 upsert_pointer_sql,
                 (project_id, agent_id, str(last_output_box_id)),
             )
-        return True
+        committed_epoch = int(expect_turn_epoch) + (1 if bump_epoch else 0)
+        return TurnIdleTransition(
+            committed_ctx=ctx.with_bumped_epoch(committed_epoch),
+            last_output_box_id=str(last_output_box_id) if last_output_box_id is not None else None,
+        )
 
     async def lease_agent_turn(
         self,
         *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        active_channel_id: Optional[str] = None,
+        ctx: CGContext,
         profile_box_id: Optional[str] = None,
         context_box_id: Optional[str] = None,
         output_box_id: Optional[str] = None,
-        parent_step_id: Optional[str] = None,
-        trace_id: Optional[str] = None,
-        active_recursion_depth: Optional[int] = None,
     ) -> Optional[int]:
         """Atomically lease an idle agent for a new turn.
 
@@ -382,54 +391,34 @@ class StateStore(BaseStore):
         async with self.pool.connection() as conn:
             return await self.lease_agent_turn_with_conn(
                 conn,
-                project_id=project_id,
-                agent_id=agent_id,
-                agent_turn_id=agent_turn_id,
-                active_channel_id=active_channel_id,
+                ctx=ctx,
                 profile_box_id=profile_box_id,
                 context_box_id=context_box_id,
                 output_box_id=output_box_id,
-                parent_step_id=parent_step_id,
-                trace_id=trace_id,
-                active_recursion_depth=active_recursion_depth,
             )
 
     async def lease_agent_turn_with_conn(
         self,
         conn: Any,
         *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        active_channel_id: Optional[str] = None,
+        ctx: CGContext,
         profile_box_id: Optional[str] = None,
         context_box_id: Optional[str] = None,
         output_box_id: Optional[str] = None,
-        parent_step_id: Optional[str] = None,
-        trace_id: Optional[str] = None,
-        active_recursion_depth: Optional[int] = None,
     ) -> Optional[int]:
+        _ = ctx.require_agent_turn_id
         return await _lease_agent_turn_with_conn(
             conn,
-            project_id=project_id,
-            agent_id=agent_id,
-            agent_turn_id=agent_turn_id,
-            active_channel_id=active_channel_id,
+            ctx=ctx,
             profile_box_id=profile_box_id,
             context_box_id=context_box_id,
             output_box_id=output_box_id,
-            parent_step_id=parent_step_id,
-            trace_id=trace_id,
-            active_recursion_depth=active_recursion_depth,
         )
 
     async def update(
         self,
         *,
-        project_id: str,
-        agent_id: str,
-        expect_turn_epoch: Optional[int],
-        expect_agent_turn_id: Optional[str],
+        ctx: CGContext,
         expect_status: Optional[str] = None,
         new_status: Optional[str] = None,
         active_agent_turn_id: Any = _UNSET,
@@ -438,8 +427,6 @@ class StateStore(BaseStore):
         profile_box_id: Optional[str] = None,
         context_box_id: Optional[str] = None,
         output_box_id: Optional[str] = None,
-        parent_step_id: Any = _UNSET,
-        trace_id: Any = _UNSET,
         expecting_correlation_id: Any = _UNSET,
         waiting_tool_count: Any = _UNSET,
         resume_deadline: Any = _UNSET,
@@ -450,10 +437,7 @@ class StateStore(BaseStore):
         if conn is not None:
             return await self.update_with_conn(
                 conn,
-                project_id=project_id,
-                agent_id=agent_id,
-                expect_turn_epoch=expect_turn_epoch,
-                expect_agent_turn_id=expect_agent_turn_id,
+                ctx=ctx,
                 expect_status=expect_status,
                 new_status=new_status,
                 active_agent_turn_id=active_agent_turn_id,
@@ -462,8 +446,6 @@ class StateStore(BaseStore):
                 profile_box_id=profile_box_id,
                 context_box_id=context_box_id,
                 output_box_id=output_box_id,
-                parent_step_id=parent_step_id,
-                trace_id=trace_id,
                 expecting_correlation_id=expecting_correlation_id,
                 waiting_tool_count=waiting_tool_count,
                 resume_deadline=resume_deadline,
@@ -472,10 +454,7 @@ class StateStore(BaseStore):
         async with self.pool.connection() as own_conn:
             return await self.update_with_conn(
                 own_conn,
-                project_id=project_id,
-                agent_id=agent_id,
-                expect_turn_epoch=expect_turn_epoch,
-                expect_agent_turn_id=expect_agent_turn_id,
+                ctx=ctx,
                 expect_status=expect_status,
                 new_status=new_status,
                 active_agent_turn_id=active_agent_turn_id,
@@ -484,8 +463,6 @@ class StateStore(BaseStore):
                 profile_box_id=profile_box_id,
                 context_box_id=context_box_id,
                 output_box_id=output_box_id,
-                parent_step_id=parent_step_id,
-                trace_id=trace_id,
                 expecting_correlation_id=expecting_correlation_id,
                 waiting_tool_count=waiting_tool_count,
                 resume_deadline=resume_deadline,
@@ -496,10 +473,7 @@ class StateStore(BaseStore):
         self,
         conn: Any,
         *,
-        project_id: str,
-        agent_id: str,
-        expect_turn_epoch: Optional[int],
-        expect_agent_turn_id: Optional[str],
+        ctx: CGContext,
         expect_status: Optional[str] = None,
         new_status: Optional[str] = None,
         active_agent_turn_id: Any = _UNSET,
@@ -508,13 +482,12 @@ class StateStore(BaseStore):
         profile_box_id: Optional[str] = None,
         context_box_id: Optional[str] = None,
         output_box_id: Optional[str] = None,
-        parent_step_id: Any = _UNSET,
-        trace_id: Any = _UNSET,
         expecting_correlation_id: Any = _UNSET,
         waiting_tool_count: Any = _UNSET,
         resume_deadline: Any = _UNSET,
         bump_epoch: bool = False,
     ) -> bool:
+        project_id, agent_id, expect_agent_turn_id, expect_turn_epoch = self._required_turn_ctx(ctx, "update")
         clauses = ["updated_at = NOW()"]
         params: List[Any] = []
 
@@ -530,12 +503,6 @@ class StateStore(BaseStore):
         if active_recursion_depth is not _UNSET:
             clauses.append("active_recursion_depth=%s")
             params.append(active_recursion_depth)
-        if parent_step_id is not _UNSET:
-            clauses.append("parent_step_id=%s")
-            params.append(parent_step_id)
-        if trace_id is not _UNSET:
-            clauses.append("trace_id=%s")
-            params.append(trace_id)
         if expecting_correlation_id is not _UNSET:
             clauses.append("expecting_correlation_id=%s")
             params.append(expecting_correlation_id)
@@ -563,18 +530,24 @@ class StateStore(BaseStore):
             WHERE project_id=%s AND agent_id=%s
         """
         params.extend([project_id, agent_id])
-        if expect_turn_epoch is not None:
-            sql += " AND turn_epoch=%s"
-            params.append(expect_turn_epoch)
-        if expect_agent_turn_id is not None:
-            sql += " AND active_agent_turn_id=%s"
-            params.append(expect_agent_turn_id)
+        sql += " AND turn_epoch=%s"
+        params.append(expect_turn_epoch)
+        sql += " AND active_agent_turn_id=%s"
+        params.append(expect_agent_turn_id)
         if expect_status is not None:
             sql += " AND status=%s"
             params.append(expect_status)
 
         res = await conn.execute(sql, tuple(params))
         return res.rowcount == 1
+
+    @staticmethod
+    def _required_turn_ctx(ctx: CGContext, _method_name: str) -> tuple[str, str, str, int]:
+        project_id = ctx.project_id
+        agent_id = ctx.agent_id
+        agent_turn_id = ctx.require_agent_turn_id
+        turn_epoch = ctx.turn_epoch
+        return project_id, agent_id, agent_turn_id, turn_epoch
 
     async def list_stuck_dispatched(
         self, *, older_than_seconds: float, limit: int = 100
@@ -637,13 +610,11 @@ class StateStore(BaseStore):
     async def replace_turn_waiting_tools(
         self,
         *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        turn_epoch: int,
+        ctx: CGContext,
         wait_items: List[Dict[str, Any]],
         conn: Any = None,
     ) -> None:
+        project_id, agent_id, agent_turn_id, turn_epoch = self._required_turn_ctx(ctx, "replace_turn_waiting_tools")
         delete_sql = """
             DELETE FROM state.turn_waiting_tools
             WHERE project_id=%s AND agent_id=%s AND agent_turn_id=%s AND turn_epoch=%s
@@ -694,10 +665,7 @@ class StateStore(BaseStore):
         async with self.pool.connection() as own_conn:
             async with own_conn.transaction():
                 await self.replace_turn_waiting_tools(
-                    project_id=project_id,
-                    agent_id=agent_id,
-                    agent_turn_id=agent_turn_id,
-                    turn_epoch=turn_epoch,
+                    ctx=ctx,
                     wait_items=wait_items,
                     conn=own_conn,
                 )
@@ -705,12 +673,10 @@ class StateStore(BaseStore):
     async def list_turn_waiting_tools(
         self,
         *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        turn_epoch: int,
+        ctx: CGContext,
         statuses: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
+        project_id, agent_id, agent_turn_id, turn_epoch = self._required_turn_ctx(ctx, "list_turn_waiting_tools")
         sql = """
             SELECT project_id, agent_id, agent_turn_id, turn_epoch, step_id, tool_call_id, tool_name,
                    wait_status, tool_result_card_id, received_at, applied_at, created_at, updated_at
@@ -729,12 +695,13 @@ class StateStore(BaseStore):
     async def get_turn_waiting_tool(
         self,
         *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        turn_epoch: int,
-        tool_call_id: str,
+        ctx: CGContext,
+        tool_call_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        project_id, agent_id, agent_turn_id, turn_epoch = self._required_turn_ctx(ctx, "get_turn_waiting_tool")
+        resolved_tool_call_id = str(tool_call_id).strip() if tool_call_id is not None else ctx.require_tool_call_id
+        if not resolved_tool_call_id:
+            raise ValueError("get_turn_waiting_tool requires tool_call_id (parameter or ctx.tool_call_id)")
         row = await self.fetch_one(
             """
             SELECT project_id, agent_id, agent_turn_id, turn_epoch, step_id, tool_call_id, tool_name,
@@ -742,23 +709,22 @@ class StateStore(BaseStore):
             FROM state.turn_waiting_tools
             WHERE project_id=%s AND agent_id=%s AND agent_turn_id=%s AND turn_epoch=%s AND tool_call_id=%s
             """,
-            (project_id, agent_id, agent_turn_id, int(turn_epoch), tool_call_id),
+            (project_id, agent_id, agent_turn_id, int(turn_epoch), resolved_tool_call_id),
         )
         return dict(row) if row else None
 
     async def mark_turn_waiting_tool_received(
         self,
         *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        turn_epoch: int,
-        tool_call_id: str,
+        ctx: CGContext,
         tool_result_card_id: str,
-        step_id: Optional[str] = None,
         tool_name: Optional[str] = None,
         conn: Any = None,
     ) -> bool:
+        project_id, agent_id, agent_turn_id, turn_epoch = self._required_turn_ctx(
+            ctx, "mark_turn_waiting_tool_received"
+        )
+        resolved_tool_call_id = ctx.require_tool_call_id
         sql = """
             UPDATE state.turn_waiting_tools
             SET wait_status='received',
@@ -776,13 +742,13 @@ class StateStore(BaseStore):
         """
         args = (
             tool_result_card_id,
-            step_id,
+            ctx.step_id,
             tool_name,
             project_id,
             agent_id,
             agent_turn_id,
             int(turn_epoch),
-            tool_call_id,
+            resolved_tool_call_id,
         )
         if conn is not None:
             res = await conn.execute(sql, args)
@@ -794,14 +760,14 @@ class StateStore(BaseStore):
     async def mark_turn_waiting_tool_applied(
         self,
         *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        turn_epoch: int,
-        tool_call_id: str,
+        ctx: CGContext,
         tool_result_card_id: Optional[str] = None,
         conn: Any = None,
     ) -> bool:
+        project_id, agent_id, agent_turn_id, turn_epoch = self._required_turn_ctx(
+            ctx, "mark_turn_waiting_tool_applied"
+        )
+        resolved_tool_call_id = ctx.require_tool_call_id
         sql = """
             UPDATE state.turn_waiting_tools
             SET wait_status='applied',
@@ -813,7 +779,7 @@ class StateStore(BaseStore):
               AND agent_turn_id=%s
               AND turn_epoch=%s
               AND tool_call_id=%s
-              AND wait_status IN ('waiting', 'received', 'applied')
+              AND wait_status IN ('waiting', 'received')
         """
         args = (
             tool_result_card_id,
@@ -821,7 +787,7 @@ class StateStore(BaseStore):
             agent_id,
             agent_turn_id,
             int(turn_epoch),
-            tool_call_id,
+            resolved_tool_call_id,
         )
         if conn is not None:
             res = await conn.execute(sql, args)
@@ -876,288 +842,14 @@ class StateStore(BaseStore):
         rows = await self.fetch_all(sql, (limit,))
         return [dict(row) for row in rows]
 
-    async def record_turn_resume_ledger(
-        self,
-        *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        turn_epoch: int,
-        tool_call_id: str,
-        tool_result_card_id: str,
-        payload: Optional[Dict[str, Any]] = None,
-        conn: Any = None,
-    ) -> bool:
-        sql = """
-            INSERT INTO state.turn_resume_ledger (
-                project_id, agent_id, agent_turn_id, turn_epoch,
-                tool_call_id, tool_result_card_id, status, attempt_count,
-                next_retry_at, lease_owner, lease_expires_at, last_error, payload, created_at, updated_at
-            ) VALUES (
-                %s, %s, %s, %s,
-                %s, %s, 'pending', 0,
-                NOW(), NULL, NULL, NULL, %s::jsonb, NOW(), NOW()
-            )
-            ON CONFLICT (project_id, agent_id, agent_turn_id, turn_epoch, tool_call_id, tool_result_card_id)
-            DO NOTHING
-        """
-        payload_json = json.dumps(payload or {}, ensure_ascii=False)
-        args = (
-            project_id,
-            agent_id,
-            agent_turn_id,
-            int(turn_epoch),
-            tool_call_id,
-            tool_result_card_id,
-            payload_json,
-        )
-        if conn is not None:
-            res = await conn.execute(sql, args)
-            return res.rowcount == 1
-        async with self.pool.connection() as own_conn:
-            res = await own_conn.execute(sql, args)
-            return res.rowcount == 1
-
-    async def claim_turn_resume_ledgers(
-        self,
-        *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        turn_epoch: int,
-        lease_owner: str,
-        lease_seconds: float = 30.0,
-        limit: int = 50,
-    ) -> List[Dict[str, Any]]:
-        lease_until = datetime.now(UTC) + timedelta(seconds=max(1.0, float(lease_seconds)))
-        sql = """
-            WITH candidates AS (
-                SELECT project_id, agent_id, agent_turn_id, turn_epoch, tool_call_id, tool_result_card_id
-                FROM state.turn_resume_ledger
-                WHERE project_id=%s
-                  AND agent_id=%s
-                  AND agent_turn_id=%s
-                  AND turn_epoch=%s
-                  AND status='pending'
-                  AND next_retry_at <= NOW()
-                ORDER BY next_retry_at ASC, created_at ASC
-                LIMIT %s
-                FOR UPDATE SKIP LOCKED
-            )
-            UPDATE state.turn_resume_ledger l
-            SET status='processing',
-                lease_owner=%s,
-                lease_expires_at=%s,
-                updated_at=NOW()
-            FROM candidates c
-            WHERE l.project_id=c.project_id
-              AND l.agent_id=c.agent_id
-              AND l.agent_turn_id=c.agent_turn_id
-              AND l.turn_epoch=c.turn_epoch
-              AND l.tool_call_id=c.tool_call_id
-              AND l.tool_result_card_id=c.tool_result_card_id
-            RETURNING l.project_id, l.agent_id, l.agent_turn_id, l.turn_epoch,
-                      l.tool_call_id, l.tool_result_card_id, l.status, l.attempt_count,
-                      l.next_retry_at, l.lease_owner, l.lease_expires_at, l.last_error,
-                      l.payload, l.created_at, l.updated_at
-        """
-        rows = await self.fetch_all(
-            sql,
-            (
-                project_id,
-                agent_id,
-                agent_turn_id,
-                int(turn_epoch),
-                int(max(1, limit)),
-                lease_owner,
-                lease_until,
-            ),
-        )
-        return [dict(row) for row in rows]
-
-    async def requeue_expired_resume_ledgers(
-        self,
-        *,
-        lease_owner: Optional[str] = None,
-        limit: int = 200,
-    ) -> int:
-        sql = """
-            WITH candidates AS (
-                SELECT project_id, agent_id, agent_turn_id, turn_epoch, tool_call_id, tool_result_card_id
-                FROM state.turn_resume_ledger
-                WHERE status='processing'
-                  AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at < NOW()
-                  {owner_filter}
-                ORDER BY lease_expires_at ASC
-                LIMIT %s
-                FOR UPDATE SKIP LOCKED
-            )
-            UPDATE state.turn_resume_ledger l
-            SET status='pending',
-                lease_owner=NULL,
-                lease_expires_at=NULL,
-                updated_at=NOW()
-            FROM candidates c
-            WHERE l.project_id=c.project_id
-              AND l.agent_id=c.agent_id
-              AND l.agent_turn_id=c.agent_turn_id
-              AND l.turn_epoch=c.turn_epoch
-              AND l.tool_call_id=c.tool_call_id
-              AND l.tool_result_card_id=c.tool_result_card_id
-            RETURNING l.tool_call_id
-        """
-        params: List[Any] = []
-        owner_filter = ""
-        if lease_owner:
-            owner_filter = "AND lease_owner=%s"
-            params.append(lease_owner)
-        final_sql = sql.format(owner_filter=owner_filter)
-        params.append(int(max(1, limit)))
-        rows = await self.fetch_all(final_sql, tuple(params))
-        return len(rows)
-
-    async def mark_turn_resume_ledger_applied(
-        self,
-        *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        turn_epoch: int,
-        tool_call_id: str,
-        tool_result_card_id: str,
-        conn: Any = None,
-    ) -> bool:
-        sql = """
-            UPDATE state.turn_resume_ledger
-            SET status='applied',
-                lease_owner=NULL,
-                lease_expires_at=NULL,
-                last_error=NULL,
-                updated_at=NOW()
-            WHERE project_id=%s
-              AND agent_id=%s
-              AND agent_turn_id=%s
-              AND turn_epoch=%s
-              AND tool_call_id=%s
-              AND tool_result_card_id=%s
-              AND status IN ('pending', 'processing', 'applied')
-        """
-        args = (
-            project_id,
-            agent_id,
-            agent_turn_id,
-            int(turn_epoch),
-            tool_call_id,
-            tool_result_card_id,
-        )
-        if conn is not None:
-            res = await conn.execute(sql, args)
-            return res.rowcount == 1
-        async with self.pool.connection() as own_conn:
-            res = await own_conn.execute(sql, args)
-            return res.rowcount == 1
-
-    async def mark_turn_resume_ledger_pending_with_backoff(
-        self,
-        *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        turn_epoch: int,
-        tool_call_id: str,
-        tool_result_card_id: str,
-        delay_seconds: float,
-        last_error: Optional[str] = None,
-        conn: Any = None,
-    ) -> bool:
-        next_retry = datetime.now(UTC) + timedelta(seconds=max(0.0, float(delay_seconds)))
-        sql = """
-            UPDATE state.turn_resume_ledger
-            SET status='pending',
-                attempt_count=attempt_count + 1,
-                next_retry_at=%s,
-                lease_owner=NULL,
-                lease_expires_at=NULL,
-                last_error=%s,
-                updated_at=NOW()
-            WHERE project_id=%s
-              AND agent_id=%s
-              AND agent_turn_id=%s
-              AND turn_epoch=%s
-              AND tool_call_id=%s
-              AND tool_result_card_id=%s
-              AND status IN ('pending', 'processing')
-        """
-        args = (
-            next_retry,
-            last_error,
-            project_id,
-            agent_id,
-            agent_turn_id,
-            int(turn_epoch),
-            tool_call_id,
-            tool_result_card_id,
-        )
-        if conn is not None:
-            res = await conn.execute(sql, args)
-            return res.rowcount == 1
-        async with self.pool.connection() as own_conn:
-            res = await own_conn.execute(sql, args)
-            return res.rowcount == 1
-
-    async def mark_turn_resume_ledger_dropped(
-        self,
-        *,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        turn_epoch: int,
-        tool_call_id: str,
-        tool_result_card_id: str,
-        reason: Optional[str] = None,
-        conn: Any = None,
-    ) -> bool:
-        sql = """
-            UPDATE state.turn_resume_ledger
-            SET status='dropped',
-                lease_owner=NULL,
-                lease_expires_at=NULL,
-                last_error=%s,
-                updated_at=NOW()
-            WHERE project_id=%s
-              AND agent_id=%s
-              AND agent_turn_id=%s
-              AND turn_epoch=%s
-              AND tool_call_id=%s
-              AND tool_result_card_id=%s
-              AND status IN ('pending', 'processing', 'dropped')
-        """
-        args = (
-            reason,
-            project_id,
-            agent_id,
-            agent_turn_id,
-            int(turn_epoch),
-            tool_call_id,
-            tool_result_card_id,
-        )
-        if conn is not None:
-            res = await conn.execute(sql, args)
-            return res.rowcount == 1
-        async with self.pool.connection() as own_conn:
-            res = await own_conn.execute(sql, args)
-            return res.rowcount == 1
-
     async def record_force_termination(
         self,
-        project_id: str,
-        agent_id: str,
-        agent_turn_id: str,
+        ctx: CGContext,
         reason: str,
         output_box_id: Optional[str] = None,
     ) -> None:
         """Insert a failed step record for a watchdog-reaped turn."""
+        agent_turn_id = ctx.require_agent_turn_id
         sql = """
             INSERT INTO state.agent_steps (
                 project_id, agent_id, step_id, agent_turn_id, status, 
@@ -1171,5 +863,5 @@ class StateStore(BaseStore):
         async with self.pool.connection() as conn:
             await conn.execute(
                 sql, 
-                (project_id, agent_id, fake_step_id, agent_turn_id, output_box_id, reason)
+                (ctx.project_id, ctx.agent_id, fake_step_id, agent_turn_id, output_box_id, reason)
             )

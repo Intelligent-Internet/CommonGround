@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-Test script for submit_result inbox guard.
+Integration script for submit_result behavior.
 
-Flow:
-1) Pick a profile that requires submit_result (must_end_with contains submit_result).
-2) Dispatch a turn for an agent using that profile.
-3) Insert multiple pending inbox rows (tool_result) without wakeup.
-4) Wait for submit_result to be blocked (tool.result error inbox_not_empty).
-5) Publish a wakeup to drain pending inbox.
-6) Wait for final evt.agent.*.task completion.
+Modes:
+- `blackbox`: Standard pipeline only (no direct inbox row injection).
+- `whitebox_guard`: Inject pending inbox rows to force submit_result guard behavior.
 """
 
 from __future__ import annotations
@@ -33,16 +29,17 @@ import pytest
 
 from core.app_config import config_to_dict, load_app_config
 from card_box_core.structures import FieldsSchemaContent
-from core.config import PROTOCOL_VERSION
+from core.cg_context import CGContext
 from core.errors import ProtocolViolationError
 from core.headers import ensure_recursion_depth
-from core.subject import evt_agent_task_subject, format_subject
+from core.message_source import MessageSource
+from core.subject import evt_agent_task_subject
 from core.trace import build_traceparent, ensure_trace_headers
 from core.utils import safe_str, set_loop_policy
 from core.utp_protocol import Card, JsonContent, TextContent, extract_json_object, extract_tool_result_payload
 from infra.agent_dispatcher import AgentDispatcher, DispatchRequest
-from infra.agent_routing import resolve_agent_target
 from infra.cardbox_client import CardBoxClient
+from infra.l0_engine import L0Engine
 from infra.nats_client import NATSClient
 from infra.stores import ExecutionStore, ResourceStore, StateStore
 from services.pmo.agent_lifecycle import CreateAgentSpec, ensure_agent_ready
@@ -302,29 +299,33 @@ async def _insert_pending_inbox(
     for _ in range(count):
         traceparent, resolved_trace_id = build_traceparent(trace_id)
         inbox_id = f"inbox_test_{uuid6.uuid7().hex}"
+        fake_turn_id = f"turn_fake_{uuid6.uuid7().hex}"
+        fake_tool_call_id = f"tc_fake_{uuid6.uuid7().hex}"
         payload = {
-            "agent_id": agent_id,
-            "agent_turn_id": f"turn_fake_{uuid6.uuid7().hex}",
-            "turn_epoch": 1,
-            "tool_call_id": f"tc_fake_{uuid6.uuid7().hex}",
             "status": "success",
             "after_execution": "suspend",
             "tool_result_card_id": "",
         }
         await execution_store.insert_inbox(
+            ctx=CGContext(
+                project_id=project_id,
+                channel_id="public",
+                agent_id=agent_id,
+                agent_turn_id=fake_turn_id,
+                turn_epoch=1,
+                tool_call_id=fake_tool_call_id,
+                recursion_depth=recursion_depth,
+                trace_id=resolved_trace_id,
+                parent_agent_id="test_script",
+                headers={
+                    "traceparent": traceparent,
+                },
+            ),
+            source=MessageSource(agent_id="test_script"),
             inbox_id=inbox_id,
-            project_id=project_id,
-            agent_id=agent_id,
             message_type="tool_result",
             enqueue_mode=None,
             correlation_id=None,
-            recursion_depth=recursion_depth,
-            traceparent=traceparent,
-            tracestate=None,
-            trace_id=resolved_trace_id,
-            parent_step_id=None,
-            source_agent_id="test_script",
-            source_step_id=None,
             payload=payload,
             status=status,
         )
@@ -350,12 +351,40 @@ async def _release_inbox(
             continue
 
 
+async def _wakeup_agent_via_l0(
+    *,
+    l0_engine: L0Engine,
+    project_id: str,
+    channel_id: str,
+    agent_id: str,
+    reason: str,
+) -> None:
+    result = await l0_engine.wakeup(
+        target_ctx=CGContext(
+            project_id=project_id,
+            channel_id=channel_id,
+            agent_id=agent_id,
+        ),
+        mode="default",
+        reason=reason,
+    )
+    status = safe_str(getattr(result, "status", None)).lower()
+    if not status:
+        status = safe_str(getattr(result, "ack_status", None)).lower()
+    assert status == "accepted", (
+        f"l0 wakeup failed: status={status or '<empty>'} "
+        f"error_code={safe_str(getattr(result, 'error_code', None)) or '<none>'}"
+    )
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     runtime = _runtime_defaults()
+    default_project = os.environ.get("PROJECT_ID") or f"proj_submit_result_guard_{uuid6.uuid7().hex[-8:]}"
+    default_agent = os.environ.get("AGENT_ID") or f"agent_submit_result_guard_{uuid6.uuid7().hex[-8:]}"
     parser = argparse.ArgumentParser(description="Test submit_result inbox guard.")
-    parser.add_argument("--project", default=os.environ.get("PROJECT_ID", "proj_submit_result_guard"))
+    parser.add_argument("--project", default=default_project)
     parser.add_argument("--channel", default=os.environ.get("CHANNEL_ID", "public"), help="Channel ID (default: public)")
-    parser.add_argument("--agent-id", default=os.environ.get("AGENT_ID", "agent_submit_result_guard"), help="Target agent ID")
+    parser.add_argument("--agent-id", default=default_agent, help="Target agent ID")
     parser.add_argument(
         "--no-ensure-agent",
         action="store_true",
@@ -379,26 +408,44 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1.5,
         help="Delay before inserting inbox rows (pre-dispatch)",
     )
-    parser.add_argument("--block-timeout", type=float, default=120.0, help="Wait for inbox block tool.result")
-    parser.add_argument("--timeout", type=float, default=240.0, help="Wait for final task completion")
+    parser.add_argument("--block-timeout", type=float, default=30.0, help="Wait for inbox block tool.result")
+    parser.add_argument("--timeout", type=float, default=60.0, help="Wait for final task completion")
     parser.add_argument("--nats-url", default=runtime["nats_url"])
     parser.add_argument("--dsn", default=runtime["dsn"])
+    parser.add_argument(
+        "--mode",
+        choices=("blackbox", "whitebox_guard"),
+        default=os.environ.get("SUBMIT_RESULT_MODE", "whitebox_guard"),
+        help="blackbox uses only standard pipeline; whitebox_guard injects pending inbox rows.",
+    )
     return parser.parse_args(argv)
 
 
 async def _run(args: argparse.Namespace) -> None:
+    mode = safe_str(getattr(args, "mode", None)) or "whitebox_guard"
+    whitebox_guard = mode == "whitebox_guard"
+
     nats = NATSClient(config={"servers": [args.nats_url]})
     cardbox = CardBoxClient(config={"postgres_dsn": args.dsn})
     dsn = args.dsn
     resource_store = ResourceStore(dsn)
     state_store = StateStore(dsn)
     execution_store = ExecutionStore(dsn)
+    l0_engine = L0Engine(
+        nats=nats,
+        execution_store=execution_store,
+        resource_store=resource_store,
+        state_store=state_store,
+    )
 
-    await nats.connect()
-    await cardbox.init()
-    await resource_store.open()
-    await state_store.open()
-    await execution_store.open()
+    try:
+        await asyncio.wait_for(nats.connect(), timeout=8.0)
+        await asyncio.wait_for(cardbox.init(), timeout=8.0)
+        await asyncio.wait_for(resource_store.open(), timeout=8.0)
+        await asyncio.wait_for(state_store.open(), timeout=8.0)
+        await asyncio.wait_for(execution_store.open(), timeout=8.0)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"integration dependencies not ready for submit_result_inbox_guard: {exc}")
 
     try:
         task_queue: asyncio.Queue = asyncio.Queue()
@@ -413,7 +460,9 @@ async def _run(args: argparse.Namespace) -> None:
 
         await nats.subscribe_core(task_subject, _on_task)
 
-        roster = await resource_store.fetch_roster(args.project, args.agent_id)
+        roster = await resource_store.fetch_roster(
+            CGContext(project_id=args.project, agent_id=args.agent_id, channel_id=args.channel)
+        )
         roster_profile_box_id = safe_str((roster or {}).get("profile_box_id"))
 
         selected_profile_box_id: Optional[str] = None
@@ -503,8 +552,11 @@ async def _run(args: argparse.Namespace) -> None:
             lifecycle_result = await ensure_agent_ready(
                 resource_store=resource_store,
                 state_store=state_store,
-                project_id=args.project,
-                agent_id=args.agent_id,
+                target_ctx=CGContext(
+                    project_id=args.project,
+                    channel_id=args.channel,
+                    agent_id=args.agent_id,
+                ),
                 spec=CreateAgentSpec(
                     profile_box_id=selected_profile_box_id,
                     worker_target=profile_worker_target,
@@ -525,8 +577,11 @@ async def _run(args: argparse.Namespace) -> None:
             lifecycle_result = await ensure_agent_ready(
                 resource_store=resource_store,
                 state_store=state_store,
-                project_id=args.project,
-                agent_id=args.agent_id,
+                target_ctx=CGContext(
+                    project_id=args.project,
+                    channel_id=args.channel,
+                    agent_id=args.agent_id,
+                ),
                 spec=CreateAgentSpec(
                     profile_box_id=selected_profile_box_id,
                     worker_target=profile_worker_target,
@@ -571,19 +626,21 @@ async def _run(args: argparse.Namespace) -> None:
             required_fields=required_fields,
         )
 
-        await asyncio.sleep(max(0.0, float(args.enqueue_delay)))
-        pending_inbox_ids = await _insert_pending_inbox(
-            execution_store,
-            project_id=args.project,
-            agent_id=args.agent_id,
-            count=max(1, int(args.inbox_items)),
-            recursion_depth=0,
-            trace_id=None,
-            status="processing",
-        )
-        print(
-            f"[OK] Inserted {args.inbox_items} pending inbox rows before dispatch (status=processing)."
-        )
+        pending_inbox_ids: List[str] = []
+        if whitebox_guard:
+            await asyncio.sleep(max(0.0, float(args.enqueue_delay)))
+            pending_inbox_ids = await _insert_pending_inbox(
+                execution_store,
+                project_id=args.project,
+                agent_id=args.agent_id,
+                count=max(1, int(args.inbox_items)),
+                recursion_depth=0,
+                trace_id=None,
+                status="processing",
+            )
+            print(
+                f"[OK] Inserted {args.inbox_items} pending inbox rows before dispatch (status=processing)."
+            )
 
         dispatcher = AgentDispatcher(
             resource_store=resource_store,
@@ -597,13 +654,17 @@ async def _run(args: argparse.Namespace) -> None:
 
         dispatch_result = await dispatcher.dispatch(
             DispatchRequest(
-                project_id=args.project,
-                channel_id=args.channel,
-                agent_id=args.agent_id,
+                source_ctx=CGContext(
+                    project_id=args.project,
+                    channel_id=args.channel,
+                    agent_id="sys.ground_control",
+                    trace_id=trace_id,
+                    headers=dict(headers or {}),
+                ),
+                target_agent_id=args.agent_id,
+                target_channel_id=args.channel,
                 profile_box_id=selected_profile_box_id,
                 context_box_id=context_box_id,
-                headers=headers,
-                trace_id=trace_id,
             )
         )
         assert dispatch_result.status in ("accepted", "pending"), (
@@ -613,49 +674,45 @@ async def _run(args: argparse.Namespace) -> None:
         output_box_id = safe_str(dispatch_result.output_box_id)
         assert output_box_id, "missing output_box_id from dispatch"
 
-        blocked = await _wait_for_inbox_block(
-            cardbox,
-            project_id=args.project,
-            output_box_id=output_box_id,
-            timeout_s=float(args.block_timeout),
-        )
-        if blocked:
-            print("[OK] Detected submit_result inbox_not_empty block.")
-        else:
-            print("[WARN] Did not observe inbox_not_empty; guard might not trigger.")
-
-        if pending_inbox_ids:
-            await _release_inbox(
-                execution_store,
+        if whitebox_guard:
+            blocked = await _wait_for_inbox_block(
+                cardbox,
                 project_id=args.project,
-                inbox_ids=pending_inbox_ids,
+                output_box_id=output_box_id,
+                timeout_s=float(args.block_timeout),
             )
-            print(f"[OK] Released {len(pending_inbox_ids)} inbox rows to pending.")
+            assert blocked, "expected submit_result guard block (inbox_not_empty/inbox_check_failed)"
+            print("[OK] Detected submit_result inbox_not_empty block.")
 
-        target = await resolve_agent_target(
-            resource_store=resource_store,
-            project_id=args.project,
-            agent_id=args.agent_id,
-            default_target="agent_worker",
-        )
-        assert target, "worker_target missing for agent"
-        wakeup_subject = format_subject(
-            args.project,
-            args.channel,
-            "cmd",
-            "agent",
-            target,
-            "wakeup",
-            protocol_version=PROTOCOL_VERSION,
-        )
-        await nats.publish_event(wakeup_subject, {"agent_id": args.agent_id})
-        print(f"[OK] Wakeup published to drain inbox (target={target}).")
+            if pending_inbox_ids:
+                await _release_inbox(
+                    execution_store,
+                    project_id=args.project,
+                    inbox_ids=pending_inbox_ids,
+                )
+                print(f"[OK] Released {len(pending_inbox_ids)} inbox rows to pending.")
+                await _wakeup_agent_via_l0(
+                    l0_engine=l0_engine,
+                    project_id=args.project,
+                    channel_id=args.channel,
+                    agent_id=args.agent_id,
+                    reason="integration_drain_pending",
+                )
+                print("[OK] Wakeup requested via L0 engine.")
 
-        task_payload = await wait_for_task_event(
-            task_queue,
-            agent_turn_id=safe_str(dispatch_result.agent_turn_id),
-            timeout_s=float(args.timeout),
-        )
+        try:
+            task_payload = await wait_for_task_event(
+                task_queue,
+                agent_turn_id=safe_str(dispatch_result.agent_turn_id),
+                timeout_s=float(args.timeout),
+            )
+        except asyncio.TimeoutError:
+            pytest.fail(
+                "submit_result flow timeout: "
+                f"mode={mode} project={args.project} agent={args.agent_id} "
+                f"turn={safe_str(dispatch_result.agent_turn_id)} output_box={output_box_id}",
+                pytrace=False,
+            )
         print("[DONE] Task completed:", json.dumps(task_payload, ensure_ascii=False))
     finally:
         await execution_store.close()
@@ -680,6 +737,13 @@ if __name__ == "__main__":
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_submit_result_blackbox():
+    args = _parse_args(["--mode", "blackbox"])
+    await _run(args)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_submit_result_inbox_guard():
-    args = _parse_args([])
+    args = _parse_args(["--mode", "whitebox_guard"])
     await _run(args)

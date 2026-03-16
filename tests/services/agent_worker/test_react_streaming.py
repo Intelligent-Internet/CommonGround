@@ -2,6 +2,8 @@ import json
 
 import pytest
 
+from core.config import PROTOCOL_VERSION
+from core.cg_context import CGContext
 from services.agent_worker.react_streaming import (
     build_stream_content_payload,
     build_stream_end_payload,
@@ -31,8 +33,10 @@ class _DummyLogger:
 
 
 def test_build_stream_subject_uses_agent_chunk_subject() -> None:
-    subject = build_stream_subject(project_id="proj_1", channel_id="public", agent_id="agent_1")
-    assert subject == "cg.v1r3.proj_1.public.str.agent.agent_1.chunk"
+    subject = build_stream_subject(
+        ctx=CGContext(project_id="proj_1", channel_id="public", agent_id="agent_1")
+    )
+    assert subject == f"cg.{PROTOCOL_VERSION}.proj_1.public.str.agent.agent_1.chunk"
 
 
 def test_build_stream_payload_helpers() -> None:
@@ -77,7 +81,7 @@ async def test_publish_stream_payload_serializes_and_publishes() -> None:
     )
     await publish_stream_payload(
         nats=nats,
-        subject="cg.v1r3.proj_1.public.str.agent.agent_1.chunk",
+        subject=f"cg.{PROTOCOL_VERSION}.proj_1.public.str.agent.agent_1.chunk",
         payload=payload,
         logger=logger,
     )
@@ -101,7 +105,7 @@ async def test_publish_stream_payload_logs_and_swallows_exceptions() -> None:
     )
     await publish_stream_payload(
         nats=nats,
-        subject="cg.v1r3.proj_1.public.str.agent.agent_1.chunk",
+        subject=f"cg.{PROTOCOL_VERSION}.proj_1.public.str.agent.agent_1.chunk",
         payload=payload,
         logger=logger,
     )

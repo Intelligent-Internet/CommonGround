@@ -351,43 +351,24 @@ def _normalize_content_for_schema(raw_content: Any) -> Any:
 class AgentTaskPayload(BaseModel):
     """Payload for L0 AgentTurn (delivered via Inbox + cmd.agent.*.wakeup)."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
-    agent_turn_id: str
-    agent_id: str
-    channel_id: str = "public"
     profile_box_id: Optional[str] = None
     context_box_id: Optional[str] = None
     output_box_id: Optional[str] = None
-    turn_epoch: int
-    parent_agent_turn_id: Optional[str] = None
-    parent_tool_call_id: Optional[str] = None
-    parent_step_id: Optional[str] = None
-    trace_id: Optional[str] = None
     display_name: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     runtime_config: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolCommandPayload(BaseModel):
-    """Subject: cmd.tool.* payload (tool execution requests)."""
+    """Subject: cmd.tool.* payload (business fields only; control identity comes from CG headers)."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
-    tool_call_id: str
-    agent_turn_id: str
-    turn_epoch: int
-    agent_id: str
     tool_call_card_id: Optional[str] = None
     tool_name: Optional[str] = None
     after_execution: Optional[str] = None
-
-    @field_validator("tool_call_id", "agent_turn_id", "agent_id")
-    @classmethod
-    def _require_non_empty(cls, value: str) -> str:
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError("must be a non-empty string")
-        return value
 
     @field_validator("tool_call_card_id", "tool_name", "after_execution", mode="before")
     @classmethod
@@ -430,11 +411,15 @@ class ToolCommandPayload(BaseModel):
 
     @staticmethod
     def missing_fields_from_error(error: ValidationError) -> List[str]:
-        required_fields = {"tool_call_id", "agent_turn_id", "turn_epoch", "agent_id"}
         missing: List[str] = []
         for item in error.errors():
+            error_type = str(item.get("type") or "")
+            if "missing" not in error_type:
+                continue
             loc = item.get("loc")
-            field = loc[0] if isinstance(loc, (list, tuple)) and loc else None
-            if field in required_fields:
-                missing.append(str(field))
+            if not isinstance(loc, (list, tuple)) or not loc:
+                continue
+            field = ".".join(str(part) for part in loc)
+            if field and field not in missing:
+                missing.append(field)
         return missing

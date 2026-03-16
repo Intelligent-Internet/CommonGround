@@ -5,21 +5,23 @@ This document is intended for tool implementers and explains how to integrate wi
 ## 1. Core Constraints
 - Tool execution endpoints must not write to `state.*`.
 - Tool parameters must be read from the `tool.call` card via the `tool_call_card_id` pointer; do not read `args/arguments` directly from the payload (the current backend rejects this by protocol).
-- Callbacks must include `agent_turn_id/turn_epoch/tool_call_id/after_execution` as received, unchanged.
+- Control/routing identity (`agent_id/agent_turn_id/turn_epoch/tool_call_id/step_id/...`) must come from `CG-*` headers / `CGContext`, not payload.
+- Callback payload should only contain business/result fields (for example: `status/after_execution/tool_result_card_id`).
 - To override a valid `after_execution`, write `suspend|terminate` to `tool.result.content.result.__cg_control.after_execution` (preserving the namespace); callback fields still need to be carried through unchanged (including `after_execution` from both command and writeback).
 - Callback tracing must create a child span using the inbound `traceparent` as the parent, and inject a new `traceparent` (`tracestate` is optional).
 - `tool.result` `metadata.trace_id/parent_step_id/step_id` must be copied **verbatim from the `tool.call` card metadata** (no payload-based backfilling).
 - **Content structure requirements**: `tool.call` content must be `ToolCallContent`, and `tool.result` content must be `ToolResultContent`; arbitrary dicts or text are no longer accepted as content.
-- Required fields for `ToolCommandPayload` on `cmd.tool.*` include: `tool_call_id/agent_turn_id/turn_epoch/agent_id`; for external tools, `tool_call_card_id/tool_name/after_execution` are commonly required too.
+- For `cmd.tool.*`, `CG-Tool-Call-Id` is a required control header. `ToolCommandPayload` carries business fields such as `tool_call_card_id/tool_name/after_execution`.
+- `publish_tool_result_report` now validates the result card pointer plus the `author_id/function_name/source_ctx` combination. A callback that only “knows the correlation id” is not sufficient.
 
 The authoritative protocol is: `04_protocol_l0/nats_protocol.md`.
 
 ## 2. Minimal Implementation Flow (Any Language)
 1) Subscribe to the `cmd.tool.*` subject (with `{project_id}/{channel_id}` expanded) from the tool's `target_subject` in `resource.tools`.
-2) Parse the command and validate `tool_call_id/agent_turn_id/turn_epoch/agent_id/tool_call_card_id`, typically also `tool_name/after_execution`.
+2) Parse the command and validate required `CG-*` control headers (especially `CG-Tool-Call-Id`) plus payload business fields (`tool_call_card_id`, usually also `tool_name/after_execution`).
 3) Read the `tool.call` card (`tool_call_card_id`) and fetch parameters from `ToolCallContent.arguments`.
 4) Execute business logic.
-5) Construct a `tool.result` card and callback payload (including `tool_call_id/agent_turn_id/agent_id/turn_epoch/after_execution/status/tool_result_card_id/step_id`).
+5) Construct a `tool.result` card and callback payload (business-only fields, usually `after_execution/status/tool_result_card_id`).
 6) Call `publish_tool_result_report` to write `tool_result` to the L0 Inbox; L0 will trigger `cmd.agent.{target}.wakeup` to the target `worker_target` of the target agent by `agent_id`.
 
 Note: The callback wakeup target is not fixed to `worker_generic`; it must be determined by the callee agent's current `worker_target` in roster.
@@ -29,27 +31,28 @@ Note: The callback wakeup target is not fixed to `worker_generic`; it must be de
 ```python
 import json
 
-from core.utp_protocol import ToolCallContent
 from core.subject import parse_subject
-from infra.l0.tool_reports import publish_tool_result_report
-from infra.tool_executor import ToolResultBuilder, ToolResultContext
+from core.utp_protocol import ToolCallContent
 from core.utils import safe_str
+from infra.l0.tool_reports import publish_tool_result_report
+from infra.messaging.ingress import build_nats_ingress_context
+from infra.tool_executor import ToolResultBuilder, ToolResultContext
 
 
 async def handle_tool_command(msg, *, cardbox, nats, execution_store, resource_store=None, state_store=None):
-    data = json.loads(msg.data)
+    raw = json.loads(msg.data)
     parts = parse_subject(msg.subject)
     if parts is None:
         raise RuntimeError("invalid subject")
 
-    tool_call_id = data["tool_call_id"]
-    agent_turn_id = data["agent_turn_id"]
-    turn_epoch = data["turn_epoch"]
-    after_exec = data.get("after_execution")
-    tool_call_card_id = data["tool_call_card_id"]
-    project_id = parts.project_id
+    ingress_ctx, cmd_data = build_nats_ingress_context(
+        dict(msg.headers or {}),
+        raw,
+        parts,
+    )
+    tool_call_card_id = str(cmd_data["tool_call_card_id"])
 
-    cards = await cardbox.get_cards([tool_call_card_id], project_id=project_id)
+    cards = await cardbox.get_cards([tool_call_card_id], project_id=ingress_ctx.project_id)
     if not cards:
         raise RuntimeError(f"tool_call_card not found: {tool_call_card_id}")
     tool_call_card = cards[0]
@@ -71,32 +74,40 @@ async def handle_tool_command(msg, *, cardbox, nats, execution_store, resource_s
         status = "failed"
 
     ctx = ToolResultContext.from_cmd_data(
-        project_id=project_id,
-        cmd_data=data,
+        ctx=ingress_ctx,
+        cmd_data=cmd_data,
         tool_call_meta=tool_call_meta,
     )
-    payload, result_card = (
-        ToolResultBuilder(ctx, author_id="tool.example", function_name=safe_str(data.get("tool_name")) or "unknown")
-        .build(status=status, result=result)
+    payload, result_card = ToolResultBuilder(
+        ctx,
+        author_id="tool.example",
+        function_name=safe_str(cmd_data.get("tool_name")) or "unknown",
+    ).build(
+        status=status,
+        result=result,
     )
     await cardbox.save_card(result_card)
 
+    source_ctx = ingress_ctx.evolve(
+        agent_id="tool.example",
+        agent_turn_id="",
+        step_id=None,
+        tool_call_id=None,
+    )
     await publish_tool_result_report(
         nats=nats,
         execution_store=execution_store,
+        cardbox=cardbox,
         resource_store=resource_store,
         state_store=state_store,
-        project_id=project_id,
-        channel_id=parts.channel_id,
+        source_ctx=source_ctx,
+        target_ctx=ingress_ctx,
         payload=payload,
-        headers={},
-        source_agent_id="tool.example",
     )
     return {
-        "tool_call_id": tool_call_id,
-        "agent_turn_id": agent_turn_id,
-        "turn_epoch": turn_epoch,
-        "after_execution": after_exec,
+        "tool_call_id": ingress_ctx.require_tool_call_id,
+        "agent_turn_id": ingress_ctx.require_agent_turn_id,
+        "turn_epoch": ingress_ctx.turn_epoch,
         "status": status,
     }
 ```
@@ -156,3 +167,5 @@ Recommendations:
 
 Template variables (temporarily supporting only ID fields): `{project_id}` / `{channel_id}` / `{agent_id}` / `{agent_turn_id}` /
 `{step_id}` / `{tool_call_id}` / `{parent_step_id}` / `{trace_id}` / `{turn_epoch}` / `{context_box_id}`.
+
+For tools that accept `session_id`, treat it as a caller-visible alias only. The runtime may scope the real execution identity by owner (`project_id + agent_id`) internally, so the same alias is not a cross-agent sharing contract.

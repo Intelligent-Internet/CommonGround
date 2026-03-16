@@ -15,7 +15,7 @@ class ProjectService:
         self.bootstrapper = bootstrapper
 
     async def create_project(self, data: ProjectCreate) -> Project:
-        project_id = data.project_id or f"proj_{uuid6.uuid7().hex[:12]}"
+        project_id = data.project_id or f"proj_{uuid6.uuid7().hex[-12:]}"
         row = await self.store.create_project(project_id=project_id, title=data.title, owner_id=data.owner_id)
         if data.bootstrap:
             await self.bootstrapper.bootstrap(project_id)

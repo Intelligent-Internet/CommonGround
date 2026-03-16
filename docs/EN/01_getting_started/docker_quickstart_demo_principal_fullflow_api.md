@@ -2,6 +2,8 @@
 
 This page covers the full flow: environment preparation → initialization → service startup → resource setup → run the demo. See the L0/L1 docs for additional protocol and implementation details.
 
+This Docker path is one of the validated `V1R4` release flows. If you are comparing the final release candidate against `main`, this is one of the primary end-to-end demos that was exercised before release.
+
 > Topology concepts and patterns are described in `architecture_intro.md` (architecture overview). For implementation and behavior, the L0 protocol document is authoritative.
 
 ## 1. Environment Preparation
@@ -12,7 +14,7 @@ This page covers the full flow: environment preparation → initialization → s
 > `git submodule update --init --recursive`
 
 ### Dependencies
-- Python 3.12+ (repo baseline is based on 3.12)
+- Python 3.13+ (repo baseline is based on 3.13)
 - `uv`
 - Postgres (recommended 15+)
 - NATS (2.10+, with JetStream enabled)
@@ -60,7 +62,7 @@ cp config.toml.sample config.toml
 ```
 Update `[nats]`, `[cardbox]`, DB DSN, and the default project in `config.toml` as needed.
 
-> Important: `[protocol].version` must be `v1r3` (and match deployed protocol). If missing or wrong, NATS subject matching may fail and Worker/PMO might not receive messages.
+> Important: `[protocol].version` must be `v1r4` (and match deployed protocol). If missing or wrong, NATS subject matching may fail and Worker/PMO might not receive messages.
 
 > Port note: docker-compose defaults are NATS 4222 and Postgres 5432; sample DSN in the repo may use 5433, so use your local `config.toml` as the source of truth.
 
@@ -80,6 +82,8 @@ docker compose exec api sh -lc 'uv run -m scripts.setup.seed --project proj_demo
 ```bash
 docker compose up -d --build
 ```
+
+> Note: Compose uses project-local virtualenv `.venv.docker` (`UV_PROJECT_ENVIRONMENT=/app/.venv.docker`).
 
 
 ## 4. Resource Preparation (recommended)
@@ -186,7 +190,7 @@ docker compose exec api sh -lc 'uv run -m examples.quickstarts.demo_ui_action \
 
 ### 6.1 Subscribe to streaming output
 ```bash
-nats sub "cg.v1r3.proj_demo_01.public.str.agent.*.chunk"
+nats sub "cg.v1r4.proj_demo_01.public.str.agent.*.chunk"
 ```
 
 ### 6.2 Observer (terminal UI)

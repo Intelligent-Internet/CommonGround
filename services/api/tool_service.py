@@ -23,7 +23,7 @@ class ToolService:
     @staticmethod
     def _is_external_target_subject(subject: str) -> bool:
         # External tool subjects must route to tool services, not sys.* services.
-        # Example: cg.v1r3.{project_id}.{channel_id}.cmd.tool.search.call
+        # Example: cg.v1r4.{project_id}.{channel_id}.cmd.tool.search.call
         s = subject or ""
         return ".cmd.tool." in s and ".cmd.sys." not in s
 

@@ -3,19 +3,18 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from core.cg_context import CGContext
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from core.config_defaults import DEFAULT_PMO_FORK_JOIN_MAX_TASKS
 from core.errors import BadRequestError, ProtocolViolationError
-from core.headers import require_recursion_depth
-from core.trace import trace_id_from_headers
 from core.utils import safe_str
 from infra.db.uow import UnitOfWork
 
 from ..l1_orchestrators.base import BatchCreateRequest
-from .base import InternalHandlerResult
-from .context import InternalHandlerContext
+from .base import InternalHandlerDeps, InternalHandlerResult
 from .orchestration_primitives import (
+    find_current_output_box_id,
     materialize_target,
     pack_context_with_instruction,
     preview_target,
@@ -146,7 +145,9 @@ class ForkJoinHandler:
     async def _build_task_specs(
         self,
         *,
-        ctx: InternalHandlerContext,
+        deps: InternalHandlerDeps,
+        cmd: Any,
+        ctx: CGContext,
         parsed_args: _ForkJoinArgs,
         conn: Any = None,
     ) -> List[Dict[str, Any]]:
@@ -156,6 +157,7 @@ class ForkJoinHandler:
 
         for idx, task in enumerate(parsed_args.tasks):
             preview = await preview_target(
+                deps=deps,
                 ctx=ctx,
                 target_strategy=task.target_strategy,
                 target_ref=task.target_ref,
@@ -163,6 +165,7 @@ class ForkJoinHandler:
             )
 
             inherit_box_ids: List[str] = []
+            extra_authorized_box_ids: List[str] = []
             if task.context_box_id:
                 inherit_box_ids.append(task.context_box_id)
             if task.target_strategy == "clone":
@@ -172,16 +175,17 @@ class ForkJoinHandler:
                     else task.target_ref
                 )
                 clone_output_box_id = await resolve_current_output_box_id(
-                    deps=ctx.deps,
-                    project_id=ctx.meta.project_id,
-                    agent_id=clone_source_agent_id,
+                    deps=deps,
+                    ctx=ctx.evolve(agent_id=clone_source_agent_id),
                     conn=conn,
                 )
                 inherit_box_ids.append(clone_output_box_id)
+                extra_authorized_box_ids.append(clone_output_box_id)
             inherit_box_ids = await validate_box_ids_exist(
-                deps=ctx.deps,
-                project_id=ctx.meta.project_id,
+                deps=deps,
+                ctx=ctx,
                 box_ids=inherit_box_ids,
+                authorized_box_ids=extra_authorized_box_ids,
                 conn=conn,
             )
 
@@ -208,16 +212,30 @@ class ForkJoinHandler:
             inherit_box_ids = item["inherit_box_ids"]
 
             context_box_id = await pack_context_with_instruction(
-                deps=ctx.deps,
-                project_id=ctx.meta.project_id,
-                source_agent_id=ctx.cmd.source_agent_id,
-                tool_suffix=ctx.meta.tool_suffix,
+                deps=deps,
+                ctx=ctx,
+                tool_suffix=safe_str(cmd.tool_name) or self.name,
                 profile_name=preview.profile_name,
                 instruction=task.instruction,
                 inherit_box_ids=inherit_box_ids,
                 conn=conn,
             )
-            resolved = await materialize_target(ctx=ctx, preview=preview, conn=conn)
+            resolved = await materialize_target(
+                deps=deps,
+                ctx=ctx,
+                preview=preview,
+                conn=conn,
+            )
+            reused_output_box_id: Optional[str] = None
+            if task.target_strategy == "reuse":
+                # `reuse` keeps target identity stable and reuses the current
+                # output when present; otherwise the batch dispatch path will
+                # allocate a new box for the reused agent.
+                reused_output_box_id = await find_current_output_box_id(
+                    deps=deps,
+                    ctx=ctx.evolve(agent_id=resolved.agent_id),
+                    conn=conn,
+                )
 
             task_specs.append(
                 {
@@ -225,6 +243,7 @@ class ForkJoinHandler:
                     "provision": False,
                     "profile_box_id": resolved.profile_box_id,
                     "context_box_id": context_box_id,
+                    "output_box_id": reused_output_box_id,
                     "task_args": {
                         "task_index": idx,
                         "label": f"task_{idx + 1}",
@@ -241,10 +260,11 @@ class ForkJoinHandler:
     async def handle(
         self,
         *,
-        ctx: InternalHandlerContext,
+        deps: InternalHandlerDeps,
+        ctx: CGContext,
+        cmd: Any,
         parent_after_execution: str,
     ) -> InternalHandlerResult:
-        cmd = ctx.cmd
         if cmd.tool_name != self.name:
             raise ProtocolViolationError(
                 f"tool_name mismatch: expected {self.name}, got {safe_str(cmd.tool_name)}"
@@ -264,46 +284,32 @@ class ForkJoinHandler:
         if effective_deadline is None:
             effective_deadline = self.default_deadline_seconds
 
-        try:
-            parent_depth = require_recursion_depth(ctx.headers)
-        except ProtocolViolationError as exc:
-            raise ProtocolViolationError(f"fork_join: {exc}") from exc
-
+        parent_ctx = ctx.with_recursion_depth(int(ctx.recursion_depth)).with_tool_call(
+            safe_str(cmd.tool_call_id) or None
+        )
         req = BatchCreateRequest(
-            project_id=ctx.meta.project_id,
-            channel_id=ctx.meta.channel_id,
-            source_agent_id=cmd.source_agent_id,
-            parent_agent_turn_id=safe_str(cmd.agent_turn_id),
-            parent_turn_epoch=int(cmd.turn_epoch),
-            parent_tool_call_id=safe_str(cmd.tool_call_id),
-            parent_step_id=safe_str(cmd.step_id),
+            parent_ctx=parent_ctx,
             lineage_parent_step_id=safe_str(getattr(cmd, "tool_call_parent_step_id", None)) or None,
             parent_after_execution=parent_after_execution,
-            tool_suffix=ctx.meta.tool_suffix,
+            tool_suffix=safe_str(cmd.tool_name) or self.name,
             task_specs=[],
             fail_fast=bool(parsed_args.fail_fast),
             deadline_seconds=effective_deadline,
             structured_output="digest",
-            trace_id=trace_id_from_headers(ctx.headers),
             parent_traceparent=ctx.headers.get("traceparent") if isinstance(ctx.headers, dict) else None,
-            recursion_depth=parent_depth,
         )
 
-        state_pool = ctx.deps.state_store.pool
+        state_pool = deps.state_store.pool
         async with UnitOfWork(state_pool).transaction() as tx:
             task_specs = await self._build_task_specs(
+                deps=deps,
+                cmd=cmd,
                 ctx=ctx,
                 parsed_args=parsed_args,
                 conn=tx.conn,
             )
             req = BatchCreateRequest(
-                project_id=req.project_id,
-                channel_id=req.channel_id,
-                source_agent_id=req.source_agent_id,
-                parent_agent_turn_id=req.parent_agent_turn_id,
-                parent_turn_epoch=req.parent_turn_epoch,
-                parent_tool_call_id=req.parent_tool_call_id,
-                parent_step_id=req.parent_step_id,
+                parent_ctx=req.parent_ctx,
                 lineage_parent_step_id=req.lineage_parent_step_id,
                 parent_after_execution=req.parent_after_execution,
                 tool_suffix=req.tool_suffix,
@@ -311,16 +317,14 @@ class ForkJoinHandler:
                 fail_fast=req.fail_fast,
                 deadline_seconds=req.deadline_seconds,
                 structured_output=req.structured_output,
-                trace_id=req.trace_id,
                 parent_traceparent=req.parent_traceparent,
-                recursion_depth=req.recursion_depth,
             )
-            batch_id = await ctx.deps.batch_manager.create_batch(
+            batch_id = await deps.batch_manager.create_batch(
                 req=req,
                 conn=tx.conn,
             )
 
-        await ctx.deps.batch_manager.activate_batch(
+        await deps.batch_manager.activate_batch(
             req=req,
             batch_id=batch_id,
             task_count=len(task_specs),

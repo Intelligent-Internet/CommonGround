@@ -89,6 +89,11 @@ Constraint: avoid placing keys with `CG-*` prefix in business payloads; current 
 
 ## 5. Key subject families and payloads
 
+Global command-path rule:
+- In-boundary `cmd.*` publication is centralized in L0 (`enqueue/report/join/command_intent/wakeup`); business services should not directly `publish_event` to `cmd.*`.
+- `cmd.agent.*.wakeup` must be emitted through L0 wakeup APIs only (not via `command_intent`).
+- This release uses a moderate payload reduction: `cmd.tool.* / cmd.sys.pmo.internal.*` may keep routing fields such as `tool_call_id/tool_call_card_id/tool_name/after_execution`.
+
 ### 5.1 `cmd.agent.{target}.wakeup`
 - Direction: PMO/ExecutionService -> Worker
 - Required: `agent_id`
@@ -116,6 +121,7 @@ Constraint: avoid placing keys with `CG-*` prefix in business payloads; current 
 - Required: `tool_call_id` / `agent_turn_id` / `turn_epoch` / `agent_id`
 - Common optional: `tool_name` / `after_execution` / `tool_call_card_id` / `context_box_id` / `dispatch_requested_at`
 - Constraint: Tool entry `ToolCommandPayload` forbids direct `args` by default; usually carries `tool_call_card_id` and let the card express exact parameters.
+- Dispatch path: Worker/ToolCaller/API should all go through L0 `command_intent` to produce signals, then publish after transaction commit.
 
 ### 5.5 `cmd.sys.pmo.internal.*`
 - Direction: Worker -> PMO
@@ -154,8 +160,9 @@ Constraint: avoid placing keys with `CG-*` prefix in business payloads; current 
 - Direction: UI Worker -> UI
 - Required: `action_id` / `agent_id` / `status`
 - Optional: `message_id` / `tool_result_card_id` / `error_code` / `error`
-- Meaning: accept/ack pending/reject/busy/complete
-  - `status` is typically `accepted|busy|rejected`; compatible implementations may also return other status strings.
+- Meaning: entry acknowledgment / rejection / busy / terminal completion
+  - Entry-stage acknowledgments are typically `accepted|busy|rejected`
+  - After tool execution, the terminal acknowledgment is typically `done`; failure cases use `rejected`
 
 ## 6. Consumer conventions and consumption modes (mandatory for L0)
 

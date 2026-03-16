@@ -29,7 +29,9 @@ import pytest
 from nats.errors import TimeoutError
 from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy
 
+from core.cg_context import CGContext
 from core.config import PROTOCOL_VERSION
+from core.message_source import MessageSource
 from core.subject import format_subject
 from core.status import STATUS_TIMEOUT
 from core.trace import ensure_trace_headers
@@ -38,6 +40,10 @@ from infra.nats_client import NATSClient
 from infra.stores import ExecutionStore, ResourceStore, StateStore
 from services.pmo.l0_guard import L0Guard
 DEFAULT_CARDBOX_DSN = "postgresql://postgres:postgres@localhost:5433/cardbox"
+
+
+def _random_suffix(n: int = 8) -> str:
+    return uuid6.uuid7().hex[-n:]
 
 def _nats_config(override: Optional[str]) -> Dict[str, Any]:
     if override:
@@ -91,22 +97,22 @@ async def _test_dispatched_timeout(
     channel_id: str,
     timeout_s: float,
 ) -> None:
-    suffix = uuid6.uuid7().hex[:8]
+    suffix = _random_suffix()
     agent_id = f"agent_watchdog_timeout_{suffix}"
     output_box_id = await cardbox.ensure_box_id(project_id=project_id, box_id=None)
     agent_turn_id = f"turn_{uuid6.uuid7().hex}"
 
     turn_epoch = await state_store.lease_agent_turn(
-        project_id=project_id,
-        agent_id=agent_id,
-        agent_turn_id=agent_turn_id,
-        active_channel_id=channel_id,
+        ctx=CGContext(
+            project_id=project_id,
+            agent_id=agent_id,
+            channel_id=channel_id,
+            agent_turn_id=agent_turn_id,
+            recursion_depth=0,
+        ),
         profile_box_id=None,
         context_box_id=None,
         output_box_id=output_box_id,
-        parent_step_id=None,
-        trace_id=None,
-        active_recursion_depth=0,
     )
     assert turn_epoch is not None, "failed to lease agent_run for dispatched timeout test"
 
@@ -132,7 +138,7 @@ async def _test_dispatched_timeout(
     assert payload.get("status") == STATUS_TIMEOUT, "evt.agent.*.task status mismatch"
     assert payload.get("error") == "dispatch_timeout", "evt.agent.*.task error mismatch"
 
-    state = await state_store.fetch(project_id, agent_id)
+    state = await state_store.fetch(CGContext(project_id=project_id, agent_id=agent_id, channel_id=channel_id))
     assert state and state.status == "idle", "state not reset to idle after dispatched timeout"
     assert state.active_agent_turn_id is None, "active_agent_turn_id not cleared after dispatched timeout"
     assert state.turn_epoch == int(turn_epoch) + 1, "turn_epoch not bumped after dispatched timeout"
@@ -142,6 +148,13 @@ async def _test_dispatched_timeout(
     box = await cardbox.get_box(output_box_id, project_id=project_id)
     assert box and box.card_ids, "deliverable not appended to output_box"
     assert deliverable_id in box.card_ids, "deliverable_card_id not found in output_box"
+    deliverable_cards = await cardbox.get_cards([str(deliverable_id)], project_id=project_id)
+    assert deliverable_cards, "deliverable card cannot be loaded"
+    deliverable_payload = getattr(deliverable_cards[0].content, "data", {})
+    assert isinstance(deliverable_payload, dict), "deliverable payload must be dict"
+    assert deliverable_payload.get("kind") == "fallback_deliverable", "timeout deliverable must be fallback card"
+    diagnostics = deliverable_payload.get("diagnostics") or {}
+    assert diagnostics.get("source") == "pmo.l0_guard.watchdog", "fallback deliverable source mismatch"
 
     print("[ok] dispatched timeout produces evt.agent.*.task + deliverable + state reset")
 
@@ -156,7 +169,7 @@ async def _test_pending_wakeup(
     channel_id: str,
     pending_age_s: float,
 ) -> None:
-    suffix = uuid6.uuid7().hex[:8]
+    suffix = _random_suffix()
     agent_id = f"agent_watchdog_wakeup_{suffix}"
     agent_turn_id = f"turn_{uuid6.uuid7().hex}"
     inbox_id = f"inbox_{uuid6.uuid7().hex}"
@@ -165,8 +178,7 @@ async def _test_pending_wakeup(
     _, traceparent, trace_id = ensure_trace_headers({})
 
     await resource_store.upsert_project_agent(
-        project_id=project_id,
-        agent_id=agent_id,
+        ctx=CGContext(project_id=project_id, agent_id=agent_id, channel_id=channel_id),
         profile_box_id=str(uuid6.uuid7()),
         worker_target="worker_generic",
         tags=["watchdog"],
@@ -176,19 +188,22 @@ async def _test_pending_wakeup(
     )
 
     await execution_store.insert_inbox(
+        ctx=CGContext(
+            project_id=project_id,
+            channel_id=channel_id,
+            agent_id=agent_id,
+            agent_turn_id=agent_turn_id,
+            recursion_depth=0,
+            trace_id=trace_id,
+            headers={
+                "traceparent": traceparent,
+            },
+        ),
+        source=MessageSource(agent_id="test.watchdog"),
         inbox_id=inbox_id,
-        project_id=project_id,
-        agent_id=agent_id,
         message_type="turn",
         enqueue_mode="call",
         correlation_id=correlation_id,
-        recursion_depth=0,
-        traceparent=traceparent,
-        tracestate=None,
-        trace_id=trace_id,
-        parent_step_id=None,
-        source_agent_id=None,
-        source_step_id=None,
         payload={
             "agent_id": agent_id,
             "agent_turn_id": agent_turn_id,
@@ -213,11 +228,23 @@ async def _test_pending_wakeup(
     msg = await _fetch_js_message(sub, timeout_s=5.0)
     await _cleanup_consumer(js=nats.js, stream=f"cg_cmd_{PROTOCOL_VERSION}", durable=durable)
 
-    assert msg is not None, "missing cmd.agent.*.wakeup for pending inbox"
-    payload = json.loads(msg.data.decode("utf-8"))
-    assert payload.get("agent_id") == agent_id, "wakeup payload agent_id mismatch"
+    assert msg is None, "invalid pending inbox should not emit wakeup under hard-fail policy"
+    row = await execution_store.fetch_one(
+        """
+        SELECT status, archived_at, payload
+        FROM state.agent_inbox
+        WHERE project_id=%s AND inbox_id=%s
+        """,
+        (project_id, inbox_id),
+    )
+    assert row is not None, "pending inbox row not found"
+    assert row.get("status") == "error", "invalid pending inbox should be marked error"
+    assert row.get("archived_at") is not None, "error inbox should be archived"
+    payload = row.get("payload") or {}
+    assert isinstance(payload, dict), "error payload must be dict"
+    assert payload.get("watchdog_error") == "invalid_replay_context"
 
-    print("[ok] pending inbox triggers wakeup emission")
+    print("[ok] invalid pending inbox is marked error and does not emit wakeup")
 
 
 async def _run_test(args: argparse.Namespace) -> int:
@@ -246,7 +273,6 @@ async def _run_test(args: argparse.Namespace) -> int:
         dispatched_timeout_seconds=float(args.dispatched_timeout),
         active_reap_seconds=3600.0,
         pending_wakeup_seconds=float(args.pending_wakeup),
-        pending_wakeup_skip_seconds=float(args.pending_wakeup_skip),
     )
 
     try:
@@ -281,15 +307,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Test PMO watchdog safety net behaviors")
     parser.add_argument("--dsn", default=os.environ.get("PG_DSN", DEFAULT_CARDBOX_DSN))
     parser.add_argument("--nats-url", default=os.environ.get("NATS_URL", "nats://localhost:4222"))
-    parser.add_argument("--project", default=os.environ.get("PROJECT_ID", f"proj_watchdog_{uuid6.uuid7().hex[:8]}"))
+    parser.add_argument("--project", default=os.environ.get("PROJECT_ID", f"proj_watchdog_{_random_suffix()}"))
     parser.add_argument("--channel", default=os.environ.get("CHANNEL_ID", "public"))
     parser.add_argument("--dispatched-timeout", type=float, default=1.0)
     parser.add_argument("--pending-wakeup", type=float, default=1.0)
-    parser.add_argument(
-        "--pending-wakeup-skip",
-        type=float,
-        default=float(os.environ.get("PENDING_WAKEUP_SKIP_SECONDS", "5.0")),
-    )
     return parser.parse_args(argv)
 
 

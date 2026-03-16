@@ -11,7 +11,7 @@ import uuid6
 import yaml
 
 from core.config import PROTOCOL_VERSION
-from core.headers import ensure_recursion_depth
+from core.headers import CG_AGENT_ID, CG_AGENT_TURN_ID, CG_TURN_EPOCH, ensure_recursion_depth
 from core.time_utils import to_iso, utc_now
 from core.trace import ensure_trace_headers
 from infra.nats_client import NATSClient
@@ -132,17 +132,17 @@ async def test_ui_action_flow():
 
     ui_profile_path = ROOT / "examples" / "profiles" / "ui.yaml"
     chat_profile_path = ROOT / "tests" / "fixtures" / "profiles" / "mock_chat_assistant.yaml"
-    if not ui_profile_path.exists() or not chat_profile_path.exists():
-        pytest.skip("profile yaml missing for integration test")
+    assert ui_profile_path.exists(), f"profile yaml missing: {ui_profile_path}"
+    assert chat_profile_path.exists(), f"profile yaml missing: {chat_profile_path}"
 
     try:
         async with httpx.AsyncClient(base_url=api_url, timeout=5.0) as client:
             resp = await client.get("/health")
             resp.raise_for_status()
-    except Exception:
-        pytest.skip("API not reachable; start services.api before running integration tests")
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"API not reachable for ui_action_flow integration: {exc}", pytrace=False)
 
-    project_id = f"proj_ui_chat_it_{uuid6.uuid7().hex[:8]}"
+    project_id = f"proj_ui_chat_it_{uuid6.uuid7().hex[-8:]}"
     channel_id = "public"
     owner_id = "user_demo"
     ui_agent_id = "ui_user_it"
@@ -190,11 +190,14 @@ async def test_ui_action_flow():
 
     nats_cfg = cfg.get("nats", {}) if isinstance(cfg, dict) else {}
     nats = NATSClient(config=nats_cfg)
-    await nats.connect()
+    try:
+        await asyncio.wait_for(nats.connect(), timeout=8.0)
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"NATS not reachable for ui_action_flow integration: {exc}", pytrace=False)
 
     ack_queue: asyncio.Queue = asyncio.Queue()
     task_queue: asyncio.Queue = asyncio.Queue()
-    suffix = uuid6.uuid7().hex[:8]
+    suffix = uuid6.uuid7().hex[-8:]
 
     subject_ack = f"cg.{PROTOCOL_VERSION}.{project_id}.{channel_id}.evt.sys.ui.action_ack"
     subject_task = f"cg.{PROTOCOL_VERSION}.{project_id}.{channel_id}.evt.agent.{chat_agent_id}.task"
@@ -216,7 +219,6 @@ async def test_ui_action_flow():
     subject_action = f"cg.{PROTOCOL_VERSION}.{project_id}.{channel_id}.cmd.sys.ui.action"
     payload = {
         "action_id": action_id,
-        "agent_id": ui_agent_id,
         "tool_name": "delegate_async",
         "args": {
             "target_strategy": "reuse",
@@ -230,14 +232,30 @@ async def test_ui_action_flow():
     }
     headers, _, _ = ensure_trace_headers({}, trace_id=str(uuid6.uuid7()))
     headers = ensure_recursion_depth(headers, default_depth=0)
+    headers[CG_AGENT_ID] = ui_agent_id
+    headers[CG_AGENT_TURN_ID] = f"turn_{uuid6.uuid7().hex}"
+    headers[CG_TURN_EPOCH] = "1"
 
     try:
         await nats.publish_event(subject_action, payload, headers=headers)
-        ack_payload, _ = await _wait_for_event(ack_queue, timeout_s=30.0)
+        try:
+            ack_payload, _ = await _wait_for_event(ack_queue, timeout_s=12.0)
+        except asyncio.TimeoutError:
+            pytest.fail(
+                "ui action ack not observed (ui_worker chain inactive or protocol headers rejected)",
+                pytrace=False,
+            )
         ack_status = str(ack_payload.get("status") or "")
-        assert ack_status in ("accepted", "pending", "done")
+        assert ack_status != "rejected", f"ui action rejected in integration environment: {ack_payload}"
+        assert ack_status in ("accepted", "done")
 
-        task_payload, _ = await _wait_for_event(task_queue, timeout_s=30.0)
+        try:
+            task_payload, _ = await _wait_for_event(task_queue, timeout_s=20.0)
+        except asyncio.TimeoutError:
+            pytest.fail(
+                "agent task event not observed; pmo/agent_worker chain inactive",
+                pytrace=False,
+            )
         assert task_payload.get("status") == "success"
         deliverable_id = str(task_payload.get("deliverable_card_id") or "")
         assert deliverable_id

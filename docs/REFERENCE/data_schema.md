@@ -267,33 +267,6 @@ Indexes:
 - `idx_turn_waiting_tools_turn` on `(project_id, agent_id, agent_turn_id, turn_epoch, wait_status, created_at ASC)`
 - `idx_turn_waiting_tools_timeout` on `(project_id, agent_id, wait_status, updated_at DESC)`
 
-### `state.turn_resume_ledger`
-Primary key:
-- `(project_id, agent_id, agent_turn_id, turn_epoch, tool_call_id, tool_result_card_id)`
-
-Columns:
-| Column | Type | Null | Default | Notes |
-| --- | --- | --- | --- | --- |
-| project_id | text | NO | - | - |
-| agent_id | text | NO | - | - |
-| agent_turn_id | text | NO | - | - |
-| turn_epoch | bigint | NO | - | - |
-| tool_call_id | text | NO | - | - |
-| tool_result_card_id | text | NO | - | - |
-| status | text | NO | `'pending'` | CHECK: `pending/processing/applied/dropped` |
-| attempt_count | int | NO | `0` | - |
-| next_retry_at | timestamptz | NO | `NOW()` | - |
-| lease_owner | text | YES | - | - |
-| lease_expires_at | timestamptz | YES | - | - |
-| last_error | text | YES | - | - |
-| payload | jsonb | NO | `'{}'::jsonb` | - |
-| created_at | timestamptz | NO | `NOW()` | - |
-| updated_at | timestamptz | NO | `NOW()` | - |
-
-Indexes:
-- `idx_turn_resume_ledger_claim` on `(project_id, agent_id, agent_turn_id, turn_epoch, status, next_retry_at ASC, created_at ASC)`
-- `idx_turn_resume_ledger_lease` on `(status, lease_expires_at ASC, updated_at DESC)`
-
 ### `state.agent_state_pointers`
 Primary key:
 - `(project_id, agent_id)`
@@ -355,6 +328,7 @@ Columns:
 | enqueue_mode | text | YES | - |
 | correlation_id | text | YES | - |
 | recursion_depth | int | NO | - |
+| parent_traceparent | text | YES | - |
 | traceparent | text | NO | - |
 | tracestate | text | YES | - |
 | trace_id | text | YES | - |

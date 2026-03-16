@@ -4,10 +4,9 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
+from core.cg_context import CGContext
 from core.errors import ProtocolViolationError
-
-from .headers import normalize_headers
-from .wakeup import build_wakeup_headers_from_inbox_row
+from infra.stores.context_hydration import build_replay_context
 
 
 @dataclass(frozen=True)
@@ -16,19 +15,16 @@ class InboxRowContext:
     inbox_id: str
     message_type: str
     payload: Dict[str, Any]
-    headers: Dict[str, str]
-    trace_id: Optional[str]
+    ctx: CGContext
 
     inbox_created_at: Any = None
     inbox_processed_at: Any = None
-    recursion_depth: int = 0
 
 
 @dataclass(frozen=True)
 class InboxRowResult:
     # If status is None, leave the inbox row in "processing" (caller may consume later).
     status: Optional[str]
-
 
 async def consume_inbox_rows(
     *,
@@ -39,7 +35,6 @@ async def consume_inbox_rows(
     handler: Callable[[InboxRowContext], Awaitable[InboxRowResult]],
     logger: logging.Logger,
     expected_status: str = "processing",
-    require_depth: bool = True,
     status_update_hook: Optional[Callable[[Dict[str, Any], str], Awaitable[None]]] = None,
 ) -> int:
     """Consume already-claimed inbox rows using a shared loop template.
@@ -69,13 +64,10 @@ async def consume_inbox_rows(
             processed += 1
             continue
 
-        wakeup_headers, row_trace_id = build_wakeup_headers_from_inbox_row(row=row, logger=logger)
         try:
-            wakeup_headers, normalized_trace_id, _ = normalize_headers(
-                nats=nats,
-                headers=wakeup_headers,
-                trace_id=row_trace_id,
-                require_depth=require_depth,
+            ingress_ctx, safe_payload = build_replay_context(
+                raw_payload=payload,
+                db_row=row,
             )
         except ProtocolViolationError as exc:
             logger.warning("Inbox row invalid headers inbox_id=%s: %s", inbox_id, exc)
@@ -94,12 +86,10 @@ async def consume_inbox_rows(
             row=row,
             inbox_id=str(inbox_id),
             message_type=message_type,
-            payload=payload,
-            headers=wakeup_headers,
-            trace_id=normalized_trace_id,
+            payload=safe_payload,
+            ctx=ingress_ctx,
             inbox_created_at=row.get("created_at"),
             inbox_processed_at=row.get("processed_at"),
-            recursion_depth=int(row.get("recursion_depth") or 0),
         )
 
         try:

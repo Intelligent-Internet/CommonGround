@@ -1,82 +1,55 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Literal
+
 from core.cg_context import CGContext
 from core.llm import LLMConfig
 from core.utp_protocol import Card
 
+
 @dataclass
 class AgentTurnWorkItem:
-    project_id: str
-    channel_id: str
-    agent_turn_id: str
-    agent_id: str
+    ctx: CGContext
     profile_box_id: Optional[str]
     context_box_id: Optional[str]
     output_box_id: Optional[str]
-    turn_epoch: Optional[int]
-    headers: Dict[str, str]
-    parent_step_id: Optional[str] = None
-    trace_id: Optional[str] = None
     step_count: int = 0
     resume_data: Optional[Dict[str, Any]] = None
     stop_data: Optional[Dict[str, Any]] = None
     is_continuation: bool = False
     inbox_id: Optional[str] = None
     guard_inbox_id: Optional[str] = None
+    inbox_retry_count: int = 0
     enqueued_at: Optional[datetime] = None
     inbox_created_at: Optional[datetime] = None
     inbox_processed_at: Optional[datetime] = None
     timing: Dict[str, Any] = field(default_factory=dict)
-
-    def to_cg_context(
-        self,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        agent_turn_id: Optional[str] = None,
-        trace_id: Optional[str] = None,
-        step_id: Optional[str] = None,
-        parent_step_id: Optional[str] = None,
-    ) -> CGContext:
-        resolved_headers = self.headers if headers is None else headers
-        resolved_agent_turn_id = self.agent_turn_id if agent_turn_id is None else agent_turn_id
-        resolved_trace_id = self.trace_id if trace_id is None else trace_id
-        resolved_parent_step_id = self.parent_step_id if parent_step_id is None else parent_step_id
-        return CGContext(
-            project_id=self.project_id,
-            channel_id=self.channel_id,
-            agent_id=self.agent_id,
-            agent_turn_id=resolved_agent_turn_id,
-            trace_id=resolved_trace_id,
-            headers=dict(resolved_headers or {}),
-            step_id=step_id,
-            parent_step_id=resolved_parent_step_id,
-        )
+    inbox_finalize_action: Literal["consume", "defer", "error"] = "consume"
+    retry_delay_seconds: float = 0.0
+    retry_reason: Optional[str] = None
 
     def next_step(self) -> "AgentTurnWorkItem":
         return AgentTurnWorkItem(
-            project_id=self.project_id,
-            channel_id=self.channel_id,
-            agent_turn_id=self.agent_turn_id,
-            agent_id=self.agent_id,
+            ctx=self.ctx.evolve(step_id=None, tool_call_id=None),
             profile_box_id=self.profile_box_id,
             context_box_id=self.context_box_id,
             output_box_id=self.output_box_id,
-            turn_epoch=self.turn_epoch,
-            headers=self.headers,
-            parent_step_id=self.parent_step_id,
-            trace_id=self.trace_id,
             step_count=self.step_count + 1,
             resume_data=None,
             stop_data=None,
             is_continuation=True,
             inbox_id=None,
             guard_inbox_id=self.guard_inbox_id or self.inbox_id,
+            inbox_retry_count=0,
             enqueued_at=None,
             inbox_created_at=None,
             inbox_processed_at=None,
             timing={},
+            inbox_finalize_action="consume",
+            retry_delay_seconds=0.0,
+            retry_reason=None,
         )
+
 
 @dataclass
 class ProfileData:
@@ -96,11 +69,13 @@ class ProfileData:
     tags: List[str] = field(default_factory=list)
     worker_target: Optional[str] = None
 
+
 class _SafeFormatDict(dict):
     """Keeps unknown placeholders intact when formatting system prompt."""
 
     def __missing__(self, key):
         return "{" + key + "}"
+
 
 @dataclass
 class ActionOutcome:

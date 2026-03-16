@@ -2,6 +2,8 @@
 
 本页提供完整路径：环境准备 → 初始化 → 启动服务 → 资源准备 → 跑通 Demo。更多协议与实现细节见 L0/L1 文档。
 
+这条 Docker 路径是 `V1R4` 最终发布前实际验证过的主链路之一。如果你在看最终 release candidate 相对 `main` 的行为，这就是发布前重点跑过的端到端 demo 之一。
+
 > 拓扑概念与模式见 `architecture_intro.md`（架构总览），实现与行为以 L0 协议为准。
 
 ## 1. 环境准备
@@ -12,7 +14,7 @@
 > `git submodule update --init --recursive`
 
 ### 依赖
-- Python 3.12+（仓库主干基于 3.12）
+- Python 3.13+（仓库主干基于 3.13）
 - `uv`
 - Postgres（建议 15+）
 - NATS（2.10+，启用 JetStream）
@@ -60,7 +62,7 @@ cp config.toml.sample config.toml
 ```
 按需修改 `config.toml` 中的 `[nats]`、`[cardbox]`、DB DSN 与默认 project。
 
-> 重要：`[protocol].version` 必须是 `v1r3`（且与部署协议一致）。若缺失或写错，NATS subject 会不匹配，Worker/PMO 可能收不到消息。
+> 重要：`[protocol].version` 必须是 `v1r4`（且与部署协议一致）。若缺失或写错，NATS subject 会不匹配，Worker/PMO 可能收不到消息。
 
 > 端口提示：docker-compose 默认 NATS 4222、Postgres 5432；仓库示例 DSN 可能使用 5433，请以本地 `config.toml` 为准。
 
@@ -80,6 +82,8 @@ docker compose exec api sh -lc 'uv run -m scripts.setup.seed --project proj_demo
 ```bash
 docker compose up -d --build
 ```
+
+> 说明：Compose 默认使用项目内虚拟环境 `.venv.docker`（`UV_PROJECT_ENVIRONMENT=/app/.venv.docker`）。
 
 
 ## 4. 资源准备（推荐）
@@ -186,7 +190,7 @@ docker compose exec api sh -lc 'uv run -m examples.quickstarts.demo_ui_action \
 
 ### 6.1 订阅流式输出
 ```bash
-nats sub "cg.v1r3.proj_demo_01.public.str.agent.*.chunk"
+nats sub "cg.v1r4.proj_demo_01.public.str.agent.*.chunk"
 ```
 
 ### 6.2 Observer（终端 UI）

@@ -2,15 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from core.cg_context import CGContext
 
 async def ensure_agent_state_row_with_conn(
     conn: Any,
     *,
-    project_id: str,
-    agent_id: str,
-    active_channel_id: Optional[str] = None,
-    parent_step_id: Optional[str] = None,
-    trace_id: Optional[str] = None,
+    ctx: CGContext,
     profile_box_id: Optional[str] = None,
     context_box_id: Optional[str] = None,
     output_box_id: Optional[str] = None,
@@ -28,11 +25,11 @@ async def ensure_agent_state_row_with_conn(
     await conn.execute(
         insert_sql,
         (
-            project_id,
-            agent_id,
-            active_channel_id,
-            parent_step_id,
-            trace_id,
+            ctx.project_id,
+            ctx.agent_id,
+            ctx.channel_id,
+            ctx.parent_step_id,
+            ctx.trace_id,
             profile_box_id,
             context_box_id,
             output_box_id,
@@ -43,25 +40,16 @@ async def ensure_agent_state_row_with_conn(
 async def lease_agent_turn_with_conn(
     conn: Any,
     *,
-    project_id: str,
-    agent_id: str,
-    agent_turn_id: str,
-    active_channel_id: Optional[str] = None,
+    ctx: CGContext,
     profile_box_id: Optional[str] = None,
     context_box_id: Optional[str] = None,
     output_box_id: Optional[str] = None,
-    parent_step_id: Optional[str] = None,
-    trace_id: Optional[str] = None,
-    active_recursion_depth: Optional[int] = None,
 ) -> Optional[int]:
     """Atomically lease an idle agent turn using an existing transaction/connection."""
+    _ = ctx.require_agent_turn_id
     await ensure_agent_state_row_with_conn(
         conn,
-        project_id=project_id,
-        agent_id=agent_id,
-        active_channel_id=active_channel_id,
-        parent_step_id=parent_step_id,
-        trace_id=trace_id,
+        ctx=ctx,
         profile_box_id=profile_box_id,
         context_box_id=context_box_id,
         output_box_id=output_box_id,
@@ -89,16 +77,16 @@ async def lease_agent_turn_with_conn(
     res = await conn.execute(
         lease_sql,
         (
-            agent_turn_id,
-            active_channel_id,
-            active_recursion_depth,
-            parent_step_id,
-            trace_id,
+            ctx.agent_turn_id,
+            ctx.channel_id,
+            ctx.recursion_depth,
+            ctx.parent_step_id,
+            ctx.trace_id,
             profile_box_id,
             context_box_id,
             output_box_id,
-            project_id,
-            agent_id,
+            ctx.project_id,
+            ctx.agent_id,
         ),
     )
     row = await res.fetchone()

@@ -28,8 +28,9 @@ This document is an L0/implementation reference that constrains the fallback sem
   - If the tool definition includes `options.suspend_timeout_seconds` or `options.timeout_seconds`, use `max` against the default value.
 
 ### 2.3 Worker: resume fallback replay (addendum)
-- Each tick runs `requeue_expired_resume_ledgers`: entries in `state.turn_resume_ledger` whose lease has expired are moved from `processing` back to `pending` (retryable).
-- `reconcile` rebuilds `resume_data` from resume ledger / received `tool.result`, and requeues resume messages back into the worker’s internal processing queue.
+- Runtime no longer depends on `turn_resume_ledger`.
+- `reconcile` first scans suspended waiting rows in `waiting/received` state, then claims due inbox rows by `turn_waiting_tools.tool_call_id` correlation (`status in (pending,deferred)` and `next_retry_at<=now()`), and requeues resume messages into worker processing.
+- Retryable failures are written back as inbox `deferred` rows with `retry_count/next_retry_at/defer_reason/last_error`, then reclaimed by later ticks.
 
 ### 2.4 PMO: replay undelivered `dispatched` items for retry
 - Condition: `status='dispatched'` and `updated_at < now - dispatched_retry_seconds`.
@@ -58,7 +59,6 @@ This document is an L0/implementation reference that constrains the fallback sem
 ### 2.7 PMO: `pending` inbox doorbell supplementation
 - Condition: `state.agent_inbox.status='pending'` and `created_at < now - pending_wakeup_seconds`.
 - Action: send `cmd.agent.<target>.wakeup` without changing inbox status; this is doorbell-only behavior.
-- Additional: if `channel_id` cannot be determined and waiting reaches `pending_wakeup_skip_seconds`, add `watchdog_error='missing_channel'`, `watchdog_at`, and mark the inbox as `skipped`.
 
 ## 3. Output Contract (must be satisfied)
 - PMO watchdog terminal convergence (`dispatch_timeout`, `timeout_reaped_by_watchdog`) must best-effort append `task.deliverable` (if `output_box_id` does not exist, persistence may fail).
@@ -72,7 +72,6 @@ This document is an L0/implementation reference that constrains the fallback sem
   - `pmo.dispatched_retry_seconds`
   - `pmo.dispatched_timeout_seconds`
   - `pmo.pending_wakeup_seconds`
-  - `pmo.pending_wakeup_skip_seconds`
   - `pmo.active_reap_seconds`
 - Worker (`services/agent_worker/loop.py`):
   - `worker.inbox_processing_timeout_seconds`

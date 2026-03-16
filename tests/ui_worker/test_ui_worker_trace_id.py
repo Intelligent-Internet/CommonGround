@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Tuple
 
 import pytest
 
+from core.cg_context import CGContext
 from core.config import PROTOCOL_VERSION
 from core.resource_models import ToolDefinition
 from core.trace import ensure_trace_headers
@@ -23,8 +24,8 @@ class DummyNats:
 
 
 class DummyResourceStore:
-    async def fetch_roster(self, project_id: str, agent_id: str) -> Dict[str, Any]:
-        _ = project_id, agent_id
+    async def fetch_roster(self, ctx: Any) -> Dict[str, Any]:
+        _ = ctx
         return {
             "worker_target": "ui_worker",
             "profile_box_id": "profile_box_1",
@@ -38,9 +39,15 @@ class DummyResourceStore:
         )
 
 
+class MissingToolResourceStore(DummyResourceStore):
+    async def fetch_tool_definition_model(self, project_id: str, tool_name: str) -> ToolDefinition | None:
+        _ = project_id, tool_name
+        return None
+
+
 class DummyStateStore:
-    async def fetch(self, project_id: str, agent_id: str) -> Any:
-        _ = project_id, agent_id
+    async def fetch(self, ctx: Any) -> Any:
+        _ = ctx
         return SimpleNamespace(
             status="idle",
             active_recursion_depth=0,
@@ -49,8 +56,8 @@ class DummyStateStore:
             output_box_id="output_box_1",
         )
 
-    async def fetch_pointers(self, project_id: str, agent_id: str) -> Any:
-        _ = project_id, agent_id
+    async def fetch_pointers(self, ctx: Any) -> Any:
+        _ = ctx
         return SimpleNamespace(
             memory_context_box_id="context_box_1",
             last_output_box_id="output_box_1",
@@ -70,8 +77,8 @@ class DummyStateStore:
 
 
 class BusyStateStore(DummyStateStore):
-    async def fetch(self, project_id: str, agent_id: str) -> Any:
-        _ = project_id, agent_id
+    async def fetch(self, ctx: Any) -> Any:
+        _ = ctx
         return SimpleNamespace(
             status="running",
             active_recursion_depth=0,
@@ -186,7 +193,7 @@ class DummyL0:
         self.enqueue_calls: List[Dict[str, Any]] = []
         self.published_wakeup_signals: List[Any] = []
 
-    async def enqueue(self, **kwargs: Any) -> Any:
+    async def enqueue_intent(self, **kwargs: Any) -> Any:
         self.enqueue_calls.append(dict(kwargs))
         return SimpleNamespace(
             ack_status=self.ack_status,
@@ -202,6 +209,14 @@ class DummyL0:
 async def test_ui_worker_process_action_uses_traceparent_trace_id() -> None:
     expected_trace_id = "11111111111111111111111111111111"
     headers, _, _ = ensure_trace_headers({}, trace_id=expected_trace_id)
+    headers.update(
+        {
+            "CG-Agent-Id": "agent_ui",
+            "CG-Turn-Id": "turn_ui_test",
+            "CG-Turn-Epoch": "1",
+            "CG-Recursion-Depth": "0",
+        }
+    )
 
     service = UIWorkerService.__new__(UIWorkerService)
     service.nats = DummyNats()
@@ -216,9 +231,6 @@ async def test_ui_worker_process_action_uses_traceparent_trace_id() -> None:
     parts = SimpleNamespace(project_id="proj_test", channel_id="public")
     payload = {
         "action_id": "act_1",
-        "agent_id": "agent_ui",
-        "agent_turn_id": "turn_ui_test",
-        "turn_epoch": 1,
         "tool_name": "delegate_async",
         "args": {
             "target_strategy": "reuse",
@@ -227,17 +239,35 @@ async def test_ui_worker_process_action_uses_traceparent_trace_id() -> None:
         },
     }
 
-    processed = await service._process_ui_action(parts=parts, payload=payload, headers=headers)
+    ingress_ctx = CGContext(
+        project_id=parts.project_id,
+        channel_id=parts.channel_id,
+        agent_id=headers.get("CG-Agent-Id", ""),
+        agent_turn_id=headers.get("CG-Turn-Id", ""),
+        turn_epoch=int(headers.get("CG-Turn-Epoch", "0")),
+        recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
+        trace_id=expected_trace_id,
+        headers=headers,
+    )
+    processed = await service._process_ui_action(parts=parts, payload=payload, ingress_ctx=ingress_ctx)
 
     assert processed is True
     assert service.step_store.records
-    assert service.step_store.records[0]["trace_id"] == expected_trace_id
+    assert service.step_store.records[0]["ctx"].trace_id == expected_trace_id
     assert service.dispatcher.calls == [expected_trace_id]
 
 
 @pytest.mark.asyncio
 async def test_handle_ui_action_busy_gate_rejects_without_enqueue() -> None:
     headers, _, _ = ensure_trace_headers({}, trace_id="22222222222222222222222222222222")
+    headers.update(
+        {
+            "CG-Agent-Id": "agent_ui",
+            "CG-Turn-Id": "turn_busy",
+            "CG-Turn-Epoch": "1",
+            "CG-Recursion-Depth": "0",
+        }
+    )
     service = UIWorkerService.__new__(UIWorkerService)
     service.nats = DummyNats()
     service.resource_store = DummyResourceStore()
@@ -248,7 +278,6 @@ async def test_handle_ui_action_busy_gate_rejects_without_enqueue() -> None:
     subject = f"cg.{PROTOCOL_VERSION}.proj_test.public.cmd.sys.ui.action"
     payload = {
         "action_id": "act_busy",
-        "agent_id": "agent_ui",
         "tool_name": "delegate_async",
         "args": {"target_strategy": "reuse", "target_ref": "agent_chat", "instruction": "hello"},
     }
@@ -266,6 +295,14 @@ async def test_handle_ui_action_busy_gate_rejects_without_enqueue() -> None:
 @pytest.mark.asyncio
 async def test_handle_ui_action_idle_path_enqueues_via_l0() -> None:
     headers, _, _ = ensure_trace_headers({}, trace_id="33333333333333333333333333333333")
+    headers.update(
+        {
+            "CG-Agent-Id": "agent_ui",
+            "CG-Turn-Id": "turn_idle",
+            "CG-Turn-Epoch": "1",
+            "CG-Recursion-Depth": "0",
+        }
+    )
     service = UIWorkerService.__new__(UIWorkerService)
     service.nats = DummyNats()
     service.resource_store = DummyResourceStore()
@@ -278,7 +315,6 @@ async def test_handle_ui_action_idle_path_enqueues_via_l0() -> None:
     subject = f"cg.{PROTOCOL_VERSION}.proj_test.public.cmd.sys.ui.action"
     payload = {
         "action_id": "act_idle",
-        "agent_id": "agent_ui",
         "tool_name": "delegate_async",
         "args": {"target_strategy": "reuse", "target_ref": "agent_chat", "instruction": "hello"},
     }
@@ -288,8 +324,79 @@ async def test_handle_ui_action_idle_path_enqueues_via_l0() -> None:
 
     assert len(service.l0.enqueue_calls) == 1
     call = service.l0.enqueue_calls[0]
-    assert call.get("message_type") == "ui_action"
-    assert "drop_if_busy" not in call
+    intent = call.get("intent")
+    assert getattr(intent, "message_type", None) == "ui_action"
     assert service.nats.events
     _, ack_payload, _ = service.nats.events[-1]
     assert ack_payload.get("status") == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_handle_ui_action_rejects_missing_tool_definition_without_enqueue() -> None:
+    headers, _, _ = ensure_trace_headers({}, trace_id="44444444444444444444444444444444")
+    headers.update(
+        {
+            "CG-Agent-Id": "agent_ui",
+            "CG-Turn-Id": "turn_missing_tool",
+            "CG-Turn-Epoch": "1",
+            "CG-Recursion-Depth": "0",
+        }
+    )
+    service = UIWorkerService.__new__(UIWorkerService)
+    service.nats = DummyNats()
+    service.resource_store = MissingToolResourceStore()
+    service.state_store = DummyStateStore()
+    service.worker_target = "ui_worker"
+    service.l0 = DummyL0()
+
+    subject = f"cg.{PROTOCOL_VERSION}.proj_test.public.cmd.sys.ui.action"
+    payload = {
+        "action_id": "act_missing_tool",
+        "tool_name": "delegate_async",
+        "args": {"target_strategy": "reuse", "target_ref": "agent_chat", "instruction": "hello"},
+    }
+    span = SimpleNamespace(set_attribute=lambda *args, **kwargs: None)
+
+    await service._handle_ui_action(subject, payload, headers, _span=span)
+
+    assert service.l0.enqueue_calls == []
+    assert service.nats.events
+    _, ack_payload, _ = service.nats.events[-1]
+    assert ack_payload.get("status") == "rejected"
+    assert ack_payload.get("error_code") == "tool_definition_missing"
+
+
+@pytest.mark.asyncio
+async def test_handle_ui_action_rejects_invalid_metadata_without_enqueue() -> None:
+    headers, _, _ = ensure_trace_headers({}, trace_id="55555555555555555555555555555555")
+    headers.update(
+        {
+            "CG-Agent-Id": "agent_ui",
+            "CG-Turn-Id": "turn_invalid_meta",
+            "CG-Turn-Epoch": "1",
+            "CG-Recursion-Depth": "0",
+        }
+    )
+    service = UIWorkerService.__new__(UIWorkerService)
+    service.nats = DummyNats()
+    service.resource_store = DummyResourceStore()
+    service.state_store = DummyStateStore()
+    service.worker_target = "ui_worker"
+    service.l0 = DummyL0()
+
+    subject = f"cg.{PROTOCOL_VERSION}.proj_test.public.cmd.sys.ui.action"
+    payload = {
+        "action_id": "act_invalid_meta",
+        "tool_name": "delegate_async",
+        "args": {"target_strategy": "reuse", "target_ref": "agent_chat", "instruction": "hello"},
+        "metadata": "not-a-dict",
+    }
+    span = SimpleNamespace(set_attribute=lambda *args, **kwargs: None)
+
+    await service._handle_ui_action(subject, payload, headers, _span=span)
+
+    assert service.l0.enqueue_calls == []
+    assert service.nats.events
+    _, ack_payload, _ = service.nats.events[-1]
+    assert ack_payload.get("status") == "rejected"
+    assert ack_payload.get("error_code") == "invalid_metadata"

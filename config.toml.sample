@@ -6,9 +6,9 @@
 # 3) Environment overrides: CG__SECTION__KEY (e.g. CG__PMO__FORK_JOIN_MAX_TASKS=64)
 
 [protocol]
-# Default: "v1r3"
+# Default: "v1r4"
 # Purpose: Subject/version prefix used in NATS topics.
-version = "v1r3"
+version = "v1r4"
 
 [nats]
 # Default: ["nats://localhost:4222"]
@@ -112,6 +112,10 @@ watchdog_interval_seconds = 5.0
 # Purpose: Requeue "processing" inbox rows older than this threshold (seconds).
 inbox_processing_timeout_seconds = 300.0
 
+# Default: 3
+# Purpose: Max deferred retries for resume inbox; when exceeded, worker emits failed tool.result and consumes inbox.
+max_resume_defer_retries = 3
+
 # Default: worker.default_timeout_seconds
 # Purpose: Suspend wait timeout for tool/result resume path (seconds).
 suspend_timeout_seconds = 30.0
@@ -148,10 +152,6 @@ dispatched_timeout_seconds = 30.0
 # Default: 5.0
 # Purpose: Re-emit wakeups for stale pending inbox rows (seconds).
 pending_wakeup_seconds = 5.0
-
-# Default: 300.0
-# Purpose: Skip stale pending rows with missing channel after this age (seconds; <=0 disables skip).
-pending_wakeup_skip_seconds = 300.0
 
 # Default: 300.0
 # Purpose: Reap stale running turns older than this threshold (seconds).

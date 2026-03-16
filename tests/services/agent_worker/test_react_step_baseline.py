@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.llm import LLMConfig
+from core.cg_context import CGContext
 from core.status import STATUS_FAILED, STATUS_SUCCESS
 from core.utp_protocol import TextContent
 from services.agent_worker.deliverable_utils import ensure_terminal_deliverable
@@ -27,7 +28,8 @@ class _DummyStateStore:
         self.finish_calls.append(kwargs)
         return self.update_result
 
-    async def fetch(self, project_id, agent_id):
+    async def fetch(self, ctx):
+        _ = ctx
         return SimpleNamespace(
             status="dispatched",
             active_agent_turn_id="turn_1",
@@ -38,33 +40,6 @@ class _DummyStateStore:
             parent_step_id="parent_1",
             trace_id="trace_1",
         )
-
-    async def claim_turn_resume_ledgers(
-        self,
-        *,
-        project_id,
-        agent_id,
-        agent_turn_id,
-        turn_epoch,
-        lease_owner,
-        lease_seconds=30.0,
-        limit=50,
-    ):
-        return []
-
-    async def record_turn_resume_ledger(
-        self,
-        *,
-        project_id,
-        agent_id,
-        agent_turn_id,
-        turn_epoch,
-        tool_call_id,
-        tool_result_card_id,
-        payload=None,
-        conn=None,
-    ):
-        return True
 
 
 class _DummyStepStore:
@@ -152,17 +127,19 @@ def _make_processor(*, cardbox=None, state_store=None, step_store=None, nats=Non
 
 def _make_item() -> AgentTurnWorkItem:
     return AgentTurnWorkItem(
-        project_id="proj_1",
-        channel_id="public",
-        agent_turn_id="turn_1",
-        agent_id="agent_1",
+        ctx=CGContext(
+            project_id="proj_1",
+            channel_id="public",
+            agent_turn_id="turn_1",
+            agent_id="agent_1",
+            turn_epoch=1,
+            headers={"CG-Recursion-Depth": "0"},
+            parent_step_id="parent_1",
+            trace_id="0123456789abcdef0123456789abcdef",
+        ),
         profile_box_id="profile_1",
         context_box_id="context_1",
         output_box_id="output_1",
-        turn_epoch=1,
-        headers={"CG-Recursion-Depth": "0"},
-        parent_step_id="parent_1",
-        trace_id="trace_1",
     )
 
 
@@ -222,7 +199,7 @@ def test_card_metadata_includes_lineage_and_extra() -> None:
     assert metadata["step_id"] == "step_1"
     assert metadata["role"] == "assistant"
     assert metadata["tool_call_id"] == "call_1"
-    assert metadata["trace_id"] == "trace_1"
+    assert metadata["trace_id"] == "0123456789abcdef0123456789abcdef"
     assert metadata["parent_step_id"] == "parent_1"
     assert metadata["k"] == "v"
 
@@ -233,12 +210,12 @@ async def test_persist_thought_card_writes_tool_call_ids_to_step() -> None:
     cardbox = _DummyCardBox()
     processor = _make_processor(cardbox=cardbox, step_store=step_store)
     item = _make_item()
-    ctx = react_step_module.TurnContext(
+    ctx = react_step_module.StepRuntime(
         item=item,
         start_ts=time.monotonic(),
         state=SimpleNamespace(),
     )
-    ctx.step_id = "step_1"
+    ctx.item.ctx = ctx.item.ctx.with_new_step("step_1")
     ctx.resp = {
         "content": "thinking",
         "tool_calls": [
@@ -251,9 +228,9 @@ async def test_persist_thought_card_writes_tool_call_ids_to_step() -> None:
 
     assert [tool_call.get("id") for tool_call in tool_calls] == ["tc_1", "tc_2"]
     assert any(
-        call.get("project_id") == "proj_1"
-        and call.get("agent_id") == "agent_1"
-        and call.get("step_id") == "step_1"
+        getattr(call.get("ctx"), "project_id", None) == "proj_1"
+        and getattr(call.get("ctx"), "agent_id", None) == "agent_1"
+        and getattr(call.get("ctx"), "step_id", None) == "step_1"
         and call.get("tool_call_ids") == ["tc_1", "tc_2"]
         for call in step_store.update_calls
     )
@@ -264,12 +241,12 @@ async def test_persist_thought_card_saves_reasoning_content_when_enabled() -> No
     cardbox = _DummyCardBox()
     processor = _make_processor(cardbox=cardbox)
     item = _make_item()
-    ctx = react_step_module.TurnContext(
+    ctx = react_step_module.StepRuntime(
         item=item,
         start_ts=time.monotonic(),
         state=SimpleNamespace(),
     )
-    ctx.step_id = "step_1"
+    ctx.item.ctx = ctx.item.ctx.with_new_step("step_1")
     ctx.profile = SimpleNamespace(llm_config=LLMConfig(model="gpt-4o-mini", save_reasoning_content=True))
     ctx.resp = {
         "content": "thinking",
@@ -289,12 +266,12 @@ async def test_persist_thought_card_saves_reasoning_content_by_default() -> None
     cardbox = _DummyCardBox()
     processor = _make_processor(cardbox=cardbox)
     item = _make_item()
-    ctx = react_step_module.TurnContext(
+    ctx = react_step_module.StepRuntime(
         item=item,
         start_ts=time.monotonic(),
         state=SimpleNamespace(),
     )
-    ctx.step_id = "step_1"
+    ctx.item.ctx = ctx.item.ctx.with_new_step("step_1")
     ctx.profile = SimpleNamespace(llm_config=LLMConfig(model="gpt-4o-mini"))
     ctx.resp = {
         "content": "thinking",
@@ -314,12 +291,12 @@ async def test_persist_thought_card_skips_reasoning_content_when_disabled() -> N
     cardbox = _DummyCardBox()
     processor = _make_processor(cardbox=cardbox)
     item = _make_item()
-    ctx = react_step_module.TurnContext(
+    ctx = react_step_module.StepRuntime(
         item=item,
         start_ts=time.monotonic(),
         state=SimpleNamespace(),
     )
-    ctx.step_id = "step_1"
+    ctx.item.ctx = ctx.item.ctx.with_new_step("step_1")
     ctx.profile = SimpleNamespace(llm_config=LLMConfig(model="gpt-4o-mini", save_reasoning_content=False))
     ctx.resp = {
         "content": "thinking",
@@ -477,7 +454,7 @@ async def test_complete_turn_emits_success_events_and_task(monkeypatch) -> None:
         deliverable_card_id="deliver_1",
         new_card_ids=[],
     )
-    assert state_store.finish_calls[0]["expect_agent_turn_id"] == "turn_1"
+    assert state_store.finish_calls[0]["ctx"].agent_turn_id == "turn_1"
     assert state_store.finish_calls[0]["last_output_box_id"] == "output_1"
     assert step_store.update_calls[0]["status"] == "completed"
     statuses = [payload.get("status") for _, payload, _ in nats.events if isinstance(payload, dict)]
@@ -511,7 +488,7 @@ async def test_fail_turn_emits_failure_events_and_task(monkeypatch) -> None:
         deliverable_card_id="deliver_1",
         new_card_ids=[],
     )
-    assert state_store.finish_calls[0]["expect_agent_turn_id"] == "turn_1"
+    assert state_store.finish_calls[0]["ctx"].agent_turn_id == "turn_1"
     assert state_store.finish_calls[0]["last_output_box_id"] == "output_1"
     assert step_store.update_calls[0]["status"] == STATUS_FAILED
     statuses = [payload.get("status") for _, payload, _ in nats.events if isinstance(payload, dict)]
@@ -547,7 +524,7 @@ async def test_process_step_must_end_with_submit_result_without_submit_tool_spec
         llm_config=LLMConfig(model="gpt-4o-mini", stream=False),
     )
 
-    async def _fake_load_profile(project_id, agent_id, profile_box_id):
+    async def _fake_load_profile(ctx, profile_box_id):
         return profile
 
     async def _fake_fetch_tools_for_project_model(project_id):

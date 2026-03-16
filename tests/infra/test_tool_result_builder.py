@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+from core.cg_context import CGContext
 from infra.tool_executor import ToolResultBuilder, ToolResultContext
 
 
 def _build_builder() -> ToolResultBuilder:
     ctx = ToolResultContext.from_cmd_data(
-        project_id="proj_1",
+        ctx=CGContext(
+            project_id="proj_1",
+            channel_id="public",
+            agent_id="agent_1",
+            agent_turn_id="turn_1",
+            turn_epoch=3,
+            tool_call_id="call_1",
+            step_id="step_1",
+        ),
         cmd_data={
             "tool_call_id": "call_1",
             "agent_turn_id": "turn_1",

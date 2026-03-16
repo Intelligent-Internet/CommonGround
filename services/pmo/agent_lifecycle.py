@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, List
 
+from core.cg_context import CGContext
 from core.utils import safe_str
 from core.trace import normalize_trace_id
 from infra.stores import IdentityStore, ResourceStore, StateStore
@@ -39,31 +40,51 @@ def _normalize_tags(raw: Optional[List[Any]]) -> List[str]:
     return tags
 
 
+def _validate_existing_agent_mutation(
+    *,
+    roster: Dict[str, Any],
+    requested_profile_box_id: Optional[str] = None,
+    requested_owner_agent_id: Optional[str] = None,
+    requested_worker_target: Optional[str] = None,
+    requested_tags: Optional[List[Any]] = None,
+) -> Optional[str]:
+    existing_profile_box_id = safe_str(roster.get("profile_box_id"))
+    if requested_profile_box_id is not None and safe_str(requested_profile_box_id) != existing_profile_box_id:
+        return "existing_agent_profile_mutation_forbidden"
+
+    existing_owner_agent_id = safe_str(roster.get("owner_agent_id"))
+    if requested_owner_agent_id is not None and safe_str(requested_owner_agent_id) != existing_owner_agent_id:
+        return "existing_agent_owner_mutation_forbidden"
+
+    existing_worker_target = safe_str(roster.get("worker_target"))
+    if requested_worker_target is not None and safe_str(requested_worker_target) != existing_worker_target:
+        return "existing_agent_worker_target_mutation_forbidden"
+
+    if requested_tags is not None:
+        existing_tags = _normalize_tags(roster.get("tags") if isinstance(roster.get("tags"), list) else [])
+        if _normalize_tags(requested_tags) != existing_tags:
+            return "existing_agent_tags_mutation_forbidden"
+    return None
+
+
 async def _provision_identity(
     *,
     identity_store: IdentityStore,
     resource_store: ResourceStore,
-    project_id: str,
-    channel_id: Optional[str],
+    target_ctx: CGContext,
     action: str,
-    target_agent_id: str,
     profile_box_id: str,
     worker_target: str,
     tags: List[str],
     display_name: Optional[str],
     owner_agent_id: Optional[str],
     metadata: Dict[str, Any],
-    source_agent_id: Optional[str] = None,
-    parent_step_id: Optional[str] = None,
-    trace_id: Optional[str] = None,
     conn: Any = None,
 ) -> None:
-    if trace_id:
-        trace_id = normalize_trace_id(trace_id)
+    trace_id = normalize_trace_id(target_ctx.trace_id) if target_ctx.trace_id else None
 
     await resource_store.upsert_project_agent(
-        project_id=project_id,
-        agent_id=target_agent_id,
+        ctx=target_ctx,
         profile_box_id=profile_box_id,
         worker_target=worker_target,
         tags=tags,
@@ -73,14 +94,11 @@ async def _provision_identity(
         conn=conn,
     )
 
+    identity_edge_ctx = target_ctx.evolve(trace_id=trace_id)
+
     await identity_store.insert_identity_edge(
-        project_id=project_id,
-        channel_id=channel_id,
+        ctx=identity_edge_ctx,
         action=action,
-        source_agent_id=source_agent_id,
-        target_agent_id=target_agent_id,
-        trace_id=trace_id,
-        parent_step_id=parent_step_id,
         metadata={
             "profile_box_id": profile_box_id,
             "worker_target": worker_target,
@@ -91,6 +109,98 @@ async def _provision_identity(
         },
         conn=conn,
     )
+
+
+def _roster_snapshot(roster: Optional[Dict[str, Any]]) -> tuple[Dict[str, Any], str, str, List[str], Optional[str], Optional[str]]:
+    existing_meta: Dict[str, Any] = dict(roster.get("metadata") or {}) if roster else {}
+    existing_profile_box_id = safe_str(roster.get("profile_box_id") if roster else None)
+    existing_worker_target = safe_str(roster.get("worker_target") if roster else None)
+    existing_tags = _normalize_tags(roster.get("tags") if roster and isinstance(roster.get("tags"), list) else [])
+    existing_display_name = safe_str(roster.get("display_name") if roster else None) or None
+    existing_owner_agent_id = safe_str(roster.get("owner_agent_id") if roster else None) or None
+    return (
+        existing_meta,
+        existing_profile_box_id,
+        existing_worker_target,
+        existing_tags,
+        existing_display_name,
+        existing_owner_agent_id,
+    )
+
+
+async def _persist_agent_ready(
+    *,
+    resource_store: ResourceStore,
+    state_store: StateStore,
+    identity_store: Optional[IdentityStore],
+    target_ctx: CGContext,
+    spec: AgentSpec,
+    roster: Optional[Dict[str, Any]],
+    existing_meta: Dict[str, Any],
+    merged_meta: Dict[str, Any],
+    profile_box_id_out: str,
+    worker_target_out: str,
+    tags_out: List[str],
+    display_name_out: Optional[str],
+    owner_agent_id_out: Optional[str],
+    explicit_owner: bool,
+    init_only_for_new_agent: bool,
+    conn: Any = None,
+) -> AgentLifecycleResult:
+    roster_updated = _should_update_roster(
+        roster=roster,
+        existing_meta=existing_meta,
+        merged_meta=merged_meta,
+        profile_box_id_out=profile_box_id_out,
+        worker_target=worker_target_out,
+        tags=tags_out,
+        display_name_out=display_name_out,
+        owner_agent_id_out=owner_agent_id_out,
+        explicit_display_name=spec.display_name is not None,
+        explicit_owner=explicit_owner,
+        explicit_profile=getattr(spec, "profile_box_id", None) is not None,
+    )
+
+    if roster_updated:
+        action = "provision" if not roster else "update"
+        if identity_store:
+            await _provision_identity(
+                identity_store=identity_store,
+                resource_store=resource_store,
+                target_ctx=target_ctx.evolve(channel_id=target_ctx.channel_id or spec.active_channel_id or "public"),
+                action=action,
+                profile_box_id=profile_box_id_out,
+                worker_target=worker_target_out,
+                tags=tags_out,
+                display_name=display_name_out,
+                owner_agent_id=owner_agent_id_out,
+                metadata=merged_meta,
+                conn=conn,
+            )
+        else:
+            await resource_store.upsert_project_agent(
+                ctx=target_ctx,
+                profile_box_id=profile_box_id_out,
+                worker_target=worker_target_out,
+                tags=tags_out,
+                display_name=display_name_out,
+                owner_agent_id=owner_agent_id_out,
+                metadata=merged_meta,
+                conn=conn,
+            )
+
+    if roster and not roster_updated and init_only_for_new_agent:
+        return AgentLifecycleResult(roster_updated=False)
+
+    init_channel_id = spec.active_channel_id if (init_only_for_new_agent and not roster) else target_ctx.channel_id
+    if not init_only_for_new_agent:
+        init_channel_id = spec.active_channel_id or target_ctx.channel_id
+    await state_store.init_if_absent(
+        ctx=target_ctx.evolve(channel_id=init_channel_id),
+        profile_box_id=profile_box_id_out,
+        conn=conn,
+    )
+    return AgentLifecycleResult(roster_updated=roster_updated)
 
 
 def _should_update_roster(
@@ -160,31 +270,24 @@ async def ensure_agent_ready(
     resource_store: ResourceStore,
     state_store: StateStore,
     identity_store: Optional[IdentityStore] = None,
-    project_id: str,
-    agent_id: str,
+    target_ctx: CGContext,
     spec: AgentSpec,
     existing_roster: Optional[Dict[str, Any]] = None,
-    source_agent_id: Optional[str] = None,
-    parent_step_id: Optional[str] = None,
-    trace_id: Optional[str] = None,
-    channel_id: Optional[str] = None,
     conn: Any = None,
 ) -> AgentLifecycleResult:
-    roster = existing_roster or await resource_store.fetch_roster(project_id, agent_id, conn=conn)
+    roster = existing_roster or await resource_store.fetch_roster(
+        target_ctx,
+        conn=conn,
+    )
 
     if isinstance(spec, CreateAgentSpec):
         return await _ensure_create_agent(
             resource_store=resource_store,
             state_store=state_store,
             identity_store=identity_store,
-            project_id=project_id,
-            agent_id=agent_id,
+            target_ctx=target_ctx,
             spec=spec,
             roster=roster,
-            source_agent_id=source_agent_id,
-            parent_step_id=parent_step_id,
-            trace_id=trace_id,
-            channel_id=channel_id,
             conn=conn,
         )
     if isinstance(spec, DerivedAgentSpec):
@@ -192,14 +295,9 @@ async def ensure_agent_ready(
             resource_store=resource_store,
             state_store=state_store,
             identity_store=identity_store,
-            project_id=project_id,
-            agent_id=agent_id,
+            target_ctx=target_ctx,
             spec=spec,
             roster=roster,
-            source_agent_id=source_agent_id,
-            parent_step_id=parent_step_id,
-            trace_id=trace_id,
-            channel_id=channel_id,
             conn=conn,
         )
     raise TypeError("spec must be CreateAgentSpec or DerivedAgentSpec")
@@ -210,28 +308,42 @@ async def _ensure_create_agent(
     resource_store: ResourceStore,
     state_store: StateStore,
     identity_store: Optional[IdentityStore],
-    project_id: str,
-    agent_id: str,
+    target_ctx: CGContext,
     spec: CreateAgentSpec,
     roster: Optional[Dict[str, Any]],
-    source_agent_id: Optional[str],
-    parent_step_id: Optional[str],
-    trace_id: Optional[str],
-    channel_id: Optional[str],
     conn: Any = None,
 ) -> AgentLifecycleResult:
     if not roster and not safe_str(spec.profile_box_id):
         return AgentLifecycleResult(roster_updated=False, error_code="missing_profile_name")
 
-    profile_box_id_out = safe_str(spec.profile_box_id) or safe_str(roster.get("profile_box_id") if roster else None)
+    (
+        existing_meta,
+        existing_profile_box_id,
+        existing_worker_target,
+        existing_tags,
+        existing_display_name,
+        existing_owner_agent_id,
+    ) = _roster_snapshot(roster)
+
+    if roster:
+        mutation_error = _validate_existing_agent_mutation(
+            roster=roster,
+            requested_profile_box_id=spec.profile_box_id,
+            requested_owner_agent_id=spec.owner_agent_id,
+            requested_worker_target=spec.worker_target,
+            requested_tags=spec.tags,
+        )
+        if mutation_error:
+            return AgentLifecycleResult(roster_updated=False, error_code=mutation_error)
+
+    profile_box_id_out = existing_profile_box_id if roster else safe_str(spec.profile_box_id)
     if not profile_box_id_out:
         return AgentLifecycleResult(roster_updated=False, error_code="profile_box_missing")
 
-    existing_meta: Dict[str, Any] = dict(roster.get("metadata") or {}) if roster else {}
     merged_meta = dict(existing_meta)
     merged_meta.update(spec.metadata or {})
 
-    cached_profile = await resource_store.fetch_profile(project_id, profile_box_id_out, conn=conn)
+    cached_profile = await resource_store.fetch_profile(target_ctx.project_id, profile_box_id_out, conn=conn)
     cached_profile_name = safe_str((cached_profile or {}).get("name"))
     if cached_profile_name:
         merged_meta["profile_name"] = cached_profile_name
@@ -239,91 +351,43 @@ async def _ensure_create_agent(
     profile_tags_raw = (cached_profile or {}).get("tags") if isinstance(cached_profile, dict) else None
     profile_tags = _normalize_tags(profile_tags_raw if isinstance(profile_tags_raw, list) else [])
 
-    worker_target_out = (
+    worker_target_out = existing_worker_target if roster else (
         safe_str(spec.worker_target)
         or profile_worker_target
-        or safe_str(roster.get("worker_target") if roster else None)
     )
     if not worker_target_out:
         return AgentLifecycleResult(roster_updated=False, error_code="worker_target_missing")
 
-    if spec.tags is not None:
+    if roster:
+        tags_out = list(existing_tags)
+    elif spec.tags is not None:
         tags_out = _normalize_tags(spec.tags)
     elif cached_profile is not None:
         tags_out = list(profile_tags or [])
-    elif roster and isinstance(roster.get("tags"), list):
-        tags_out = _normalize_tags(roster.get("tags") or [])
     else:
         tags_out = []
 
-    display_name_out = (
-        spec.display_name
-        if spec.display_name is not None
-        else safe_str(roster.get("display_name") if roster else None)
-    )
-    owner_agent_id_out = (
-        spec.owner_agent_id
-        if spec.owner_agent_id is not None
-        else safe_str(roster.get("owner_agent_id") if roster else None)
-    )
+    display_name_out = spec.display_name if spec.display_name is not None else existing_display_name
+    owner_agent_id_out = existing_owner_agent_id if roster else spec.owner_agent_id
 
-    roster_updated = _should_update_roster(
+    return await _persist_agent_ready(
+        resource_store=resource_store,
+        state_store=state_store,
+        identity_store=identity_store,
+        target_ctx=target_ctx,
+        spec=spec,
         roster=roster,
         existing_meta=existing_meta,
         merged_meta=merged_meta,
         profile_box_id_out=profile_box_id_out,
-        worker_target=worker_target_out,
-        tags=tags_out,
+        worker_target_out=worker_target_out,
+        tags_out=tags_out,
         display_name_out=display_name_out,
         owner_agent_id_out=owner_agent_id_out,
-        explicit_display_name=spec.display_name is not None,
         explicit_owner=spec.owner_agent_id is not None,
-        explicit_profile=spec.profile_box_id is not None,
-    )
-
-    if roster_updated:
-        action = "provision" if not roster else "update"
-        if identity_store:
-            await _provision_identity(
-                identity_store=identity_store,
-                resource_store=resource_store,
-                project_id=project_id,
-                channel_id=channel_id or spec.active_channel_id,
-                action=action,
-                target_agent_id=agent_id,
-                profile_box_id=profile_box_id_out,
-                worker_target=worker_target_out,
-                tags=tags_out,
-                display_name=display_name_out,
-                owner_agent_id=owner_agent_id_out,
-                metadata=merged_meta,
-                source_agent_id=source_agent_id,
-                parent_step_id=parent_step_id,
-                trace_id=trace_id,
-                conn=conn,
-            )
-        else:
-            await resource_store.upsert_project_agent(
-                project_id=project_id,
-                agent_id=agent_id,
-                profile_box_id=profile_box_id_out,
-                worker_target=worker_target_out,
-                tags=tags_out,
-                display_name=display_name_out,
-                owner_agent_id=owner_agent_id_out,
-                metadata=merged_meta,
-                conn=conn,
-            )
-
-    await state_store.init_if_absent(
-        project_id=project_id,
-        agent_id=agent_id,
-        active_channel_id=spec.active_channel_id,
-        profile_box_id=profile_box_id_out,
+        init_only_for_new_agent=False,
         conn=conn,
     )
-
-    return AgentLifecycleResult(roster_updated=roster_updated)
 
 
 async def _ensure_derived_agent(
@@ -331,19 +395,14 @@ async def _ensure_derived_agent(
     resource_store: ResourceStore,
     state_store: StateStore,
     identity_store: Optional[IdentityStore],
-    project_id: str,
-    agent_id: str,
+    target_ctx: CGContext,
     spec: DerivedAgentSpec,
     roster: Optional[Dict[str, Any]],
-    source_agent_id: Optional[str],
-    parent_step_id: Optional[str],
-    trace_id: Optional[str],
-    channel_id: Optional[str],
     conn: Any = None,
 ) -> AgentLifecycleResult:
     derived_profile_box_id, derived_profile_worker_target, derived_profile_tags, profile_err = await _resolve_profile_from_name(
         resource_store=resource_store,
-        project_id=project_id,
+        project_id=target_ctx.project_id,
         profile_name=spec.profile_name,
         conn=conn,
     )
@@ -353,15 +412,31 @@ async def _ensure_derived_agent(
     if not roster and not (safe_str(spec.profile_box_id) or derived_profile_box_id):
         return AgentLifecycleResult(roster_updated=False, error_code="missing_derived_profile_name")
 
-    existing_meta: Dict[str, Any] = dict(roster.get("metadata") or {}) if roster else {}
+    (
+        existing_meta,
+        existing_profile_box_id,
+        existing_worker_target,
+        existing_tags,
+        existing_display_name,
+        existing_owner_agent_id,
+    ) = _roster_snapshot(roster)
 
     if roster and derived_profile_box_id:
-        existing_profile = safe_str(roster.get("profile_box_id"))
-        if existing_profile and existing_profile != derived_profile_box_id:
+        if existing_profile_box_id and existing_profile_box_id != derived_profile_box_id:
             return AgentLifecycleResult(roster_updated=False, error_code="profile_mismatch")
 
-    profile_box_id_out = safe_str(spec.profile_box_id) or derived_profile_box_id or safe_str(
-        roster.get("profile_box_id") if roster else None
+    if roster:
+        mutation_error = _validate_existing_agent_mutation(
+            roster=roster,
+            requested_profile_box_id=spec.profile_box_id,
+            requested_worker_target=spec.worker_target,
+            requested_tags=spec.tags,
+        )
+        if mutation_error:
+            return AgentLifecycleResult(roster_updated=False, error_code=mutation_error)
+
+    profile_box_id_out = existing_profile_box_id if roster else (
+        safe_str(spec.profile_box_id) or derived_profile_box_id
     )
     if not profile_box_id_out:
         return AgentLifecycleResult(roster_updated=False, error_code="profile_box_missing")
@@ -378,7 +453,7 @@ async def _ensure_derived_agent(
 
     cached_profile = None
     if not derived_profile_worker_target or not derived_profile_tags:
-        cached_profile = await resource_store.fetch_profile(project_id, profile_box_id_out, conn=conn)
+        cached_profile = await resource_store.fetch_profile(target_ctx.project_id, profile_box_id_out, conn=conn)
 
     cached_profile_name = safe_str((cached_profile or {}).get("name"))
     resolved_profile_name = cached_profile_name or safe_str(spec.profile_name)
@@ -393,88 +468,44 @@ async def _ensure_derived_agent(
         profile_tags_raw = cached_profile.get("tags")
     profile_tags = _normalize_tags(profile_tags_raw if isinstance(profile_tags_raw, list) else [])
 
-    worker_target_out = (
+    worker_target_out = existing_worker_target if roster else (
         safe_str(spec.worker_target)
         or profile_worker_target
-        or safe_str(roster.get("worker_target") if roster else None)
     )
     if not worker_target_out:
         return AgentLifecycleResult(roster_updated=False, error_code="worker_target_missing")
 
-    if spec.tags is not None:
+    if roster:
+        tags_out = list(existing_tags)
+    elif spec.tags is not None:
         tags_out = _normalize_tags(spec.tags)
     elif cached_profile is not None or derived_profile_tags:
         tags_out = list(profile_tags or [])
-    elif roster and isinstance(roster.get("tags"), list):
-        tags_out = _normalize_tags(roster.get("tags") or [])
     else:
         tags_out = []
 
     if roster:
-        display_name_out = safe_str(roster.get("display_name"))
-        owner_agent_id_out = safe_str(roster.get("owner_agent_id")) or safe_str(spec.derived_from)
+        display_name_out = existing_display_name
+        owner_agent_id_out = existing_owner_agent_id
     else:
         display_name_out = spec.display_name or spec.profile_name
         owner_agent_id_out = safe_str(spec.derived_from)
 
-    roster_updated = _should_update_roster(
+    return await _persist_agent_ready(
+        resource_store=resource_store,
+        state_store=state_store,
+        identity_store=identity_store,
+        target_ctx=target_ctx,
+        spec=spec,
         roster=roster,
         existing_meta=existing_meta,
         merged_meta=merged_meta,
         profile_box_id_out=profile_box_id_out,
-        worker_target=worker_target_out,
-        tags=tags_out,
+        worker_target_out=worker_target_out,
+        tags_out=tags_out,
         display_name_out=display_name_out,
         owner_agent_id_out=owner_agent_id_out,
-        explicit_display_name=spec.display_name is not None,
         explicit_owner=False,
-        explicit_profile=spec.profile_box_id is not None,
-    )
-
-    if roster_updated:
-        action = "provision" if not roster else "update"
-        if identity_store:
-            await _provision_identity(
-                identity_store=identity_store,
-                resource_store=resource_store,
-                project_id=project_id,
-                channel_id=channel_id or spec.active_channel_id,
-                action=action,
-                target_agent_id=agent_id,
-                profile_box_id=profile_box_id_out,
-                worker_target=worker_target_out,
-                tags=tags_out,
-                display_name=display_name_out,
-                owner_agent_id=owner_agent_id_out,
-                metadata=merged_meta,
-                source_agent_id=source_agent_id,
-                parent_step_id=parent_step_id,
-                trace_id=trace_id,
-                conn=conn,
-            )
-        else:
-            await resource_store.upsert_project_agent(
-                project_id=project_id,
-                agent_id=agent_id,
-                profile_box_id=profile_box_id_out,
-                worker_target=worker_target_out,
-                tags=tags_out,
-                display_name=display_name_out,
-                owner_agent_id=owner_agent_id_out,
-                metadata=merged_meta,
-                conn=conn,
-            )
-
-    if roster and not roster_updated:
-        return AgentLifecycleResult(roster_updated=False)
-
-    init_channel_id = spec.active_channel_id if not roster else None
-    await state_store.init_if_absent(
-        project_id=project_id,
-        agent_id=agent_id,
-        active_channel_id=init_channel_id,
-        profile_box_id=profile_box_id_out,
+        init_only_for_new_agent=True,
         conn=conn,
     )
-
-    return AgentLifecycleResult(roster_updated=roster_updated)

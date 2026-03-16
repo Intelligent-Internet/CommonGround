@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
-from datetime import UTC, datetime
 from typing import Any, Dict, Optional
 
 import uuid6
@@ -18,23 +18,25 @@ from core.config_defaults import (
 )
 from core.errors import ProtocolViolationError
 from core.cg_context import CGContext
+from core.headers import CG_AGENT_ID
 from core.status import STATUS_FAILED
-from core.subject import format_subject, parse_subject, subject_pattern
+from core.subject import parse_subject, subject_pattern
 from core.utils import safe_str, set_loop_policy, safe_target_label
-from core.utp_protocol import extract_tool_result_payload
+from infra.messaging.ingress import build_nats_ingress_context
 from infra.idempotency import NatsKvIdempotencyStore, build_idempotency_key
-from infra.l0_engine import L0Engine
+from infra.l0_engine import DepthPolicy, L0Engine, SpawnIntent
+from infra.l1_helpers import finish_turn_idle_and_emit
 from infra.observability.otel import get_tracer, set_span_attrs, traced
 from infra.service_runtime import ServiceBase
 from infra.worker_helpers import (
     InboxRowContext,
     InboxRowResult,
     consume_inbox_rows,
-    normalize_headers,
     publish_idle_wakeup,
 )
 from services.agent_worker.utp_dispatcher import UTPDispatcher
 from infra.event_emitter import emit_agent_state
+from infra.tool_executor import fetch_and_parse_tool_result
 
 set_loop_policy()
 
@@ -51,8 +53,17 @@ _TRACER = get_tracer("services.ui_worker.loop")
 ACK_STATUS_SET = {"accepted", "busy", "rejected", "done"}
 
 
-def _subject_span_attrs(args: Dict[str, Any]) -> Dict[str, Any]:
-    return {"cg.subject": str(args.get("subject"))}
+@dataclass(frozen=True)
+class UIActionAdmission:
+    action_id: str
+    agent_id: str
+    tool_name: str
+    args: Dict[str, Any]
+    message_id: str
+    headers: Dict[str, str]
+    transport_ctx: CGContext
+    state: Any
+    roster: Dict[str, Any]
 
 
 class UIWorkerService(ServiceBase):
@@ -101,6 +112,7 @@ class UIWorkerService(ServiceBase):
             self.nats,
             self.resource_store,
             execution_store=self.execution_store,
+            l0_engine=self.l0,
         )
         self.idem = NatsKvIdempotencyStore(
             self.nats,
@@ -171,14 +183,11 @@ class UIWorkerService(ServiceBase):
         error_code: Optional[str] = None,
         error: Optional[str] = None,
     ) -> None:
-        subject_ack = format_subject(
-            parts.project_id,
-            parts.channel_id,
-            "evt",
-            "sys",
-            "ui",
-            "action_ack",
-        )
+        subject_ack = CGContext(
+            project_id=parts.project_id,
+            channel_id=parts.channel_id,
+            agent_id=agent_id,
+        ).subject("evt", "sys", "ui", "action_ack")
         payload: Dict[str, Any] = {
             "action_id": action_id,
             "agent_id": agent_id,
@@ -197,20 +206,19 @@ class UIWorkerService(ServiceBase):
     async def _fetch_ui_roster(
         self,
         *,
+        ctx: CGContext,
         parts: Any,
         action_id: str,
-        agent_id: str,
-        headers: Dict[str, str],
         message_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        roster = await self.resource_store.fetch_roster(parts.project_id, agent_id)
+        roster = await self.resource_store.fetch_roster(ctx)
         if not roster:
             await self._publish_action_ack(
                 parts=parts,
                 action_id=action_id,
-                agent_id=agent_id,
+                agent_id=ctx.agent_id,
                 status="rejected",
-                headers=headers,
+                headers=ctx.to_nats_headers(),
                 message_id=message_id,
                 error_code="agent_not_found",
             )
@@ -219,9 +227,9 @@ class UIWorkerService(ServiceBase):
             await self._publish_action_ack(
                 parts=parts,
                 action_id=action_id,
-                agent_id=agent_id,
+                agent_id=ctx.agent_id,
                 status="rejected",
-                headers=headers,
+                headers=ctx.to_nats_headers(),
                 message_id=message_id,
                 error_code="invalid_worker_target",
             )
@@ -239,30 +247,157 @@ class UIWorkerService(ServiceBase):
     async def _emit_state_event(
         self,
         *,
-        project_id: str,
-        channel_id: str,
-        agent_id: str,
-        agent_turn_id: str,
-        turn_epoch: int,
+        ctx: CGContext,
         status: str,
         output_box_id: Optional[str],
-        headers: Dict[str, str],
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        ctx = CGContext(
-            project_id=project_id,
-            channel_id=channel_id,
-            agent_id=agent_id,
-            agent_turn_id=agent_turn_id,
-            headers=dict(headers or {}),
-        )
         await emit_agent_state(
             nats=self.nats,
-            turn_epoch=turn_epoch,
             status=status,
             output_box_id=output_box_id,
             ctx=ctx,
             metadata=metadata,
+        )
+
+    async def _admit_ui_action(
+        self,
+        *,
+        parts: Any,
+        payload: Dict[str, Any],
+        ingress_ctx: CGContext,
+    ) -> Optional[UIActionAdmission]:
+        headers = ingress_ctx.to_nats_headers()
+        action_id = safe_str(payload.get("action_id"))
+        agent_id = ingress_ctx.agent_id
+        tool_name = safe_str(payload.get("tool_name"))
+        args = payload.get("args")
+
+        if not action_id or not agent_id or not tool_name:
+            if action_id and agent_id:
+                await self._publish_action_ack(
+                    parts=parts,
+                    action_id=action_id,
+                    agent_id=agent_id,
+                    status="rejected",
+                    headers=headers,
+                    error_code="missing_required_fields",
+                )
+            return None
+        if not isinstance(args, dict):
+            await self._publish_action_ack(
+                parts=parts,
+                action_id=action_id,
+                agent_id=agent_id,
+                status="rejected",
+                headers=headers,
+                error_code="invalid_args",
+            )
+            return None
+        if not ingress_ctx.agent_turn_id:
+            await self._publish_action_ack(
+                parts=parts,
+                action_id=action_id,
+                agent_id=agent_id,
+                status="rejected",
+                headers=headers,
+                error_code="missing_agent_turn_id",
+            )
+            return None
+
+        state = await self.state_store.fetch(ingress_ctx)
+        default_depth = int(getattr(state, "active_recursion_depth", 0) or 0) if state else 0
+        transport_ctx = ingress_ctx.with_recursion_depth(default_depth)
+        headers = transport_ctx.to_nats_headers()
+
+        ui_metadata = payload.get("metadata")
+        if ui_metadata is not None and not isinstance(ui_metadata, dict):
+            await self._publish_action_ack(
+                parts=parts,
+                action_id=action_id,
+                agent_id=agent_id,
+                status="rejected",
+                headers=headers,
+                error_code="invalid_metadata",
+            )
+            return None
+        message_id = safe_str(payload.get("message_id")) or safe_str(args.get("message_id"))
+        if ui_metadata:
+            args = dict(args)
+            args_meta = args.get("metadata")
+            if args_meta is not None and not isinstance(args_meta, dict):
+                await self._publish_action_ack(
+                    parts=parts,
+                    action_id=action_id,
+                    agent_id=agent_id,
+                    status="rejected",
+                    headers=headers,
+                    message_id=message_id,
+                    error_code="invalid_metadata",
+                )
+                return None
+            merged_meta = dict(ui_metadata)
+            if isinstance(args_meta, dict):
+                merged_meta.update(args_meta)
+            args["metadata"] = merged_meta
+
+        roster = await self._fetch_ui_roster(
+            ctx=transport_ctx,
+            parts=parts,
+            action_id=action_id,
+            message_id=message_id,
+        )
+        if not roster:
+            return None
+
+        tool_def = await self.resource_store.fetch_tool_definition_model(parts.project_id, tool_name)
+        if not tool_def:
+            await self._publish_action_ack(
+                parts=parts,
+                action_id=action_id,
+                agent_id=agent_id,
+                status="rejected",
+                headers=headers,
+                message_id=message_id,
+                error_code="tool_definition_missing",
+            )
+            return None
+        if not bool((tool_def.options or {}).get("ui_allowed")):
+            await self._publish_action_ack(
+                parts=parts,
+                action_id=action_id,
+                agent_id=agent_id,
+                status="rejected",
+                headers=headers,
+                message_id=message_id,
+                error_code="ui_not_allowed",
+            )
+            return None
+
+        if state and safe_str(state.status) != "idle":
+            active_turn_id = safe_str(state, "active_agent_turn_id")
+            if not active_turn_id or active_turn_id != ingress_ctx.agent_turn_id:
+                await self._publish_action_ack(
+                    parts=parts,
+                    action_id=action_id,
+                    agent_id=agent_id,
+                    status="busy",
+                    headers=headers,
+                    message_id=message_id,
+                    error_code="agent_busy",
+                )
+                return None
+
+        return UIActionAdmission(
+            action_id=action_id,
+            agent_id=agent_id,
+            tool_name=tool_name,
+            args=dict(args),
+            message_id=message_id,
+            headers=headers,
+            transport_ctx=transport_ctx,
+            state=state,
+            roster=roster,
         )
 
     @traced(
@@ -270,7 +405,6 @@ class UIWorkerService(ServiceBase):
         "ui.handle_action_cmd",
         headers_arg="headers",
         span_arg="_span",
-        attributes_getter=_subject_span_attrs,
     )
     async def _handle_ui_action(
         self,
@@ -286,94 +420,39 @@ class UIWorkerService(ServiceBase):
             return
 
         payload = data or {}
+        raw_headers = dict(headers or {})
         try:
-            headers, _, _ = normalize_headers(nats=self.nats, headers=headers)
-        except ProtocolViolationError as exc:
-            logger.warning("UI action invalid trace headers: %s", exc)
-            return
-
-        action_id = safe_str(payload.get("action_id"))
-        agent_id = safe_str(payload.get("agent_id"))
-        tool_name = safe_str(payload.get("tool_name"))
-        if span is not None:
-            span.set_attribute("cg.project_id", str(parts.project_id))
-            span.set_attribute("cg.channel_id", str(parts.channel_id))
-            span.set_attribute("cg.action_id", str(action_id))
-            span.set_attribute("cg.agent_id", str(agent_id))
-            span.set_attribute("cg.tool_name", str(tool_name))
-        args = payload.get("args")
-        parent_step_id = safe_str(payload.get("parent_step_id"))
-
-        if not action_id or not agent_id or not tool_name:
-            if action_id and agent_id:
-                await self._publish_action_ack(
-                    parts=parts,
-                    action_id=action_id,
-                    agent_id=agent_id,
-                    status="rejected",
-                    headers=headers,
-                    error_code="missing_required_fields",
-                )
-            return
-        if not isinstance(args, dict):
-            await self._publish_action_ack(
-                parts=parts,
-                action_id=action_id,
-                agent_id=agent_id,
-                status="rejected",
-                headers=headers,
-                error_code="invalid_args",
-            )
-            return
-        state = await self.state_store.fetch(parts.project_id, agent_id)
-        default_depth = int(getattr(state, "active_recursion_depth", 0) or 0) if state else 0
-        try:
-            headers, _, _ = normalize_headers(
-                nats=self.nats,
-                headers=headers,
-                default_depth=default_depth,
+            ingress_ctx, safe_payload = build_nats_ingress_context(
+                headers=raw_headers,
+                raw_payload=payload,
+                subject_parts=parts,
             )
         except ProtocolViolationError as exc:
-            await self._publish_action_ack(
-                parts=parts,
-                action_id=action_id,
-                agent_id=agent_id,
-                status="rejected",
-                headers=headers,
-                error_code="protocol_violation",
-                error=str(exc),
-            )
+            logger.warning("UI action invalid ingress context: %s", exc)
             return
+        headers = ingress_ctx.to_nats_headers()
+        payload = safe_payload
 
-        message_id = safe_str(payload.get("message_id")) or safe_str(args.get("message_id"))
-
-        if not await self._fetch_ui_roster(
+        parent_step_id = ingress_ctx.parent_step_id or ""
+        admission = await self._admit_ui_action(
             parts=parts,
-            action_id=action_id,
-            agent_id=agent_id,
-            headers=headers,
-            message_id=message_id,
-        ):
+            payload=payload,
+            ingress_ctx=ingress_ctx,
+        )
+        if admission is None:
             return
-
-        if state and safe_str(state.status) != "idle":
-            await self._publish_action_ack(
-                parts=parts,
-                action_id=action_id,
-                agent_id=agent_id,
-                status="busy",
-                headers=headers,
-                message_id=message_id,
-                error_code="agent_busy",
-            )
-            return
+        action_id = admission.action_id
+        agent_id = admission.agent_id
+        tool_name = admission.tool_name
+        args = admission.args
+        message_id = admission.message_id
+        headers = admission.headers
+        transport_ctx = admission.transport_ctx
 
         inbox_payload: Dict[str, Any] = {
             "action_id": action_id,
-            "agent_id": agent_id,
             "tool_name": tool_name,
             "args": args,
-            "parent_step_id": parent_step_id,
         }
         if message_id:
             inbox_payload["message_id"] = message_id
@@ -386,22 +465,22 @@ class UIWorkerService(ServiceBase):
         # Use action_id for L0 correlation to match tool_call_id in tool_result.
         correlation_id = action_id
         wakeup_signals = []
+        source_ctx = transport_ctx.with_restored_state(parent_step_id=parent_step_id or None)
+        actor_ctx = source_ctx.evolve(agent_id="sys.ui_worker", agent_turn_id="", step_id=None)
         async with self.execution_store.pool.connection() as conn:
             async with conn.transaction():
-                publish_result = await self.l0.enqueue(
-                    project_id=parts.project_id,
-                    channel_id=parts.channel_id,
-                    target_agent_id=agent_id,
-                    message_type="ui_action",
-                    payload=inbox_payload,
-                    enqueue_mode="call",
-                    correlation_id=correlation_id,
-                    recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
-                    parent_step_id=parent_step_id,
-                    source_agent_id=None,
-                    headers=headers,
-                    wakeup=True,
+                publish_result = await self.l0.enqueue_intent(
+                    source_ctx=actor_ctx,
+                    intent=SpawnIntent(
+                        target_agent_id=agent_id,
+                        message_type="ui_action",
+                        payload=inbox_payload,
+                        correlation_id=correlation_id,
+                        depth_policy=DepthPolicy.ROOT,
+                        lineage_ctx=source_ctx,
+                    ),
                     conn=conn,
+                    wakeup=True,
                 )
                 wakeup_signals = list(publish_result.wakeup_signals or ())
         if wakeup_signals:
@@ -476,189 +555,49 @@ class UIWorkerService(ServiceBase):
         *,
         parts: Any,
         payload: Dict[str, Any],
-        headers: Dict[str, str],
+        ingress_ctx: CGContext,
         inbox_id: Optional[str] = None,
         _span: Any = None,
     ) -> bool:
         payload = payload or {}
-        try:
-            headers, trace_id, _ = normalize_headers(
-                nats=self.nats,
-                headers=headers,
-            )
-        except ProtocolViolationError as exc:
-            logger.warning("UI action invalid trace headers: %s", exc)
+        parent_step_id = ingress_ctx.parent_step_id or ""
+        agent_turn_id = ingress_ctx.agent_turn_id
+        turn_epoch = ingress_ctx.turn_epoch
+
+        admission = await self._admit_ui_action(
+            parts=parts,
+            payload=payload,
+            ingress_ctx=ingress_ctx,
+        )
+        if admission is None:
             return True
+        action_id = admission.action_id
+        agent_id = admission.agent_id
+        tool_name = admission.tool_name
+        args = admission.args
+        headers = admission.headers
+        transport_ctx = admission.transport_ctx
+        state = admission.state
+        roster = admission.roster
+        message_id = admission.message_id
+        depth = int(transport_ctx.recursion_depth or 0)
 
-        action_id = safe_str(payload.get("action_id"))
-        agent_id = safe_str(payload.get("agent_id"))
-        tool_name = safe_str(payload.get("tool_name"))
-        args = payload.get("args")
-        parent_step_id = safe_str(payload.get("parent_step_id"))
-        agent_turn_id = safe_str(payload.get("agent_turn_id"))
-        turn_epoch_raw = payload.get("turn_epoch")
-        try:
-            turn_epoch = int(turn_epoch_raw) if turn_epoch_raw is not None else 0
-        except (TypeError, ValueError):
-            turn_epoch = 0
-
-        # Backward compatibility: older clients may omit agent_turn_id.
-        # Derive a stable value from action_id so callers can reconcile by action_id.
-        if not agent_turn_id and action_id:
-            logger.warning(
-                "UI action missing agent_turn_id; deriving from action_id action_id=%s agent_id=%s",
-                action_id,
-                agent_id,
-            )
-            agent_turn_id = f"turn_{action_id}"
-
-        span_attrs: Dict[str, Any] = {
-            "cg.project_id": str(parts.project_id),
-            "cg.channel_id": str(parts.channel_id),
-            "cg.action_id": str(action_id),
-            "cg.agent_id": str(agent_id),
-            "cg.tool_name": str(tool_name),
-            "cg.agent_turn_id": str(agent_turn_id),
-            "cg.turn_epoch": int(turn_epoch),
-        }
+        span_attrs: Dict[str, Any] = dict(transport_ctx.to_otel_attributes())
+        span_attrs["cg.action_id"] = str(action_id)
+        span_attrs["cg.tool_name"] = str(tool_name)
+        span_attrs["cg.agent_turn_id"] = str(agent_turn_id)
+        span_attrs["cg.turn_epoch"] = int(turn_epoch)
         if inbox_id:
             span_attrs["cg.inbox_id"] = str(inbox_id)
         span = _span
+        if span is None:
+            class _NoopSpan:
+                def set_attribute(self, *args: Any, **kwargs: Any) -> None:
+                    _ = args, kwargs
+                    return None
+            span = _NoopSpan()
         if span is not None:
             set_span_attrs(span, span_attrs)
-
-            if not action_id or not agent_id or not tool_name:
-                if action_id and agent_id:
-                    await self._publish_action_ack(
-                        parts=parts,
-                        action_id=action_id,
-                        agent_id=agent_id,
-                        status="rejected",
-                        headers=headers,
-                        error_code="missing_required_fields",
-                    )
-                return True
-            if not isinstance(args, dict):
-                await self._publish_action_ack(
-                    parts=parts,
-                    action_id=action_id,
-                    agent_id=agent_id,
-                    status="rejected",
-                    headers=headers,
-                    error_code="invalid_args",
-                )
-                return True
-
-            if not agent_turn_id:
-                await self._publish_action_ack(
-                    parts=parts,
-                    action_id=action_id,
-                    agent_id=agent_id,
-                    status="rejected",
-                    headers=headers,
-                    error_code="missing_agent_turn_id",
-                )
-                return True
-
-            ui_metadata = payload.get("metadata")
-            if ui_metadata is not None and not isinstance(ui_metadata, dict):
-                await self._publish_action_ack(
-                    parts=parts,
-                    action_id=action_id,
-                    agent_id=agent_id,
-                    status="rejected",
-                    headers=headers,
-                    error_code="invalid_metadata",
-                )
-                return True
-            if ui_metadata:
-                args = dict(args)
-                args_meta = args.get("metadata")
-                if args_meta is not None and not isinstance(args_meta, dict):
-                    await self._publish_action_ack(
-                        parts=parts,
-                        action_id=action_id,
-                        agent_id=agent_id,
-                        status="rejected",
-                        headers=headers,
-                        error_code="invalid_metadata",
-                    )
-                    return True
-                merged_meta = dict(ui_metadata)
-                if isinstance(args_meta, dict):
-                    merged_meta.update(args_meta)
-                args["metadata"] = merged_meta
-
-            state = await self.state_store.fetch(parts.project_id, agent_id)
-            default_depth = int(getattr(state, "active_recursion_depth", 0) or 0) if state else 0
-            try:
-                headers, _, depth = normalize_headers(
-                    nats=self.nats,
-                    headers=headers,
-                    default_depth=default_depth,
-                )
-            except ProtocolViolationError as exc:
-                await self._publish_action_ack(
-                    parts=parts,
-                    action_id=action_id,
-                    agent_id=agent_id,
-                    status="rejected",
-                    headers=headers,
-                    error_code="protocol_violation",
-                    error=str(exc),
-                )
-                return True
-            depth = int(depth or 0)
-
-            roster = await self._fetch_ui_roster(
-                parts=parts,
-                action_id=action_id,
-                agent_id=agent_id,
-                headers=headers,
-            )
-            if not roster:
-                return True
-
-            tool_def = await self.resource_store.fetch_tool_definition_model(parts.project_id, tool_name)
-            if not tool_def:
-                await self._publish_action_ack(
-                    parts=parts,
-                    action_id=action_id,
-                    agent_id=agent_id,
-                    status="rejected",
-                    headers=headers,
-                    error_code="tool_definition_missing",
-                )
-                return True
-            if not bool((tool_def.options or {}).get("ui_allowed")):
-                await self._publish_action_ack(
-                    parts=parts,
-                    action_id=action_id,
-                    agent_id=agent_id,
-                    status="rejected",
-                    headers=headers,
-                    error_code="ui_not_allowed",
-                )
-                return True
-
-            message_id = safe_str(payload.get("message_id")) or safe_str(args.get("message_id"))
-
-            if state and safe_str(state.status) != "idle":
-                active_turn_id = safe_str(state, "active_agent_turn_id")
-                if active_turn_id and active_turn_id == agent_turn_id:
-                    pass
-                else:
-                    logger.info("UI action rejected (agent busy) agent=%s status=%s", agent_id, state.status)
-                    await self._publish_action_ack(
-                        parts=parts,
-                        action_id=action_id,
-                        agent_id=agent_id,
-                        status="busy",
-                        headers=headers,
-                        message_id=message_id,
-                        error_code="agent_busy",
-                    )
-                    return True
 
             idem_identity = message_id or action_id
             idem_key = build_idempotency_key("ui_action", parts.project_id, tool_name, idem_identity)
@@ -691,11 +630,12 @@ class UIWorkerService(ServiceBase):
                 return True
 
             output_box_id: Optional[str] = None
+            turn_ctx: Optional[CGContext] = None
             try:
                 profile_box_id = self._resolve_profile_box_id(state=state, roster=roster)
                 pointers = None
                 try:
-                    pointers = await self.state_store.fetch_pointers(parts.project_id, agent_id)
+                    pointers = await self.state_store.fetch_pointers(transport_ctx)
                 except Exception:
                     pointers = None
 
@@ -709,8 +649,7 @@ class UIWorkerService(ServiceBase):
                     async def _create_box(conn: Any = None) -> str:
                         return await self.cardbox.save_box([], project_id=parts.project_id, conn=conn)
                     context_box_id = await self.state_store.ensure_memory_context_box_id(
-                        project_id=parts.project_id,
-                        agent_id=agent_id,
+                        ctx=transport_ctx,
                         ensure=True,
                         create_box=_create_box,
                     )
@@ -748,13 +687,13 @@ class UIWorkerService(ServiceBase):
                     return True
                 if not output_box_id:
                     raise RuntimeError("ui action missing turn metadata")
+                turn_ctx = transport_ctx.with_turn(agent_turn_id, int(turn_epoch)).with_restored_state(
+                    parent_step_id=parent_step_id or None
+                )
                 updated = False
                 try:
                     updated = await self.state_store.update(
-                        project_id=parts.project_id,
-                        agent_id=agent_id,
-                        expect_turn_epoch=turn_epoch,
-                        expect_agent_turn_id=agent_turn_id,
+                        ctx=turn_ctx,
                         active_recursion_depth=depth,
                         context_box_id=context_box_id,
                         output_box_id=output_box_id,
@@ -794,13 +733,7 @@ class UIWorkerService(ServiceBase):
 
                 step_id = f"step_ui_{uuid6.uuid7().hex}"
                 await self.step_store.insert_step(
-                    project_id=parts.project_id,
-                    agent_id=agent_id,
-                    step_id=step_id,
-                    agent_turn_id=agent_turn_id,
-                    channel_id=parts.channel_id,
-                    parent_step_id=parent_step_id or None,
-                    trace_id=trace_id,
+                    ctx=turn_ctx.with_new_step(step_id),
                     status="tool_dispatched",
                     profile_box_id=profile_box_id,
                     context_box_id=context_box_id,
@@ -815,20 +748,10 @@ class UIWorkerService(ServiceBase):
                     },
                 }
 
-                dispatch_ctx = CGContext(
-                    project_id=parts.project_id,
-                    channel_id=parts.channel_id,
-                    agent_id=agent_id,
-                    agent_turn_id=agent_turn_id,
-                    trace_id=trace_id,
-                    headers=dict(headers or {}),
-                    step_id=step_id,
-                    parent_step_id=parent_step_id or None,
-                )
+                dispatch_ctx = turn_ctx.with_new_step(step_id)
                 outcome = await self.dispatcher.execute(
                     tool_call=tool_call,
                     ctx=dispatch_ctx,
-                    turn_epoch=int(turn_epoch),
                     context_box_id=context_box_id,
                 )
 
@@ -838,10 +761,7 @@ class UIWorkerService(ServiceBase):
 
                 if outcome.suspend:
                     updated = await self.state_store.update(
-                        project_id=parts.project_id,
-                        agent_id=agent_id,
-                        expect_turn_epoch=int(turn_epoch),
-                        expect_agent_turn_id=agent_turn_id,
+                        ctx=turn_ctx,
                         new_status="suspended",
                         active_recursion_depth=depth,
                         output_box_id=output_box_id,
@@ -849,14 +769,9 @@ class UIWorkerService(ServiceBase):
                     )
                     if updated:
                         await self._emit_state_event(
-                            project_id=parts.project_id,
-                            channel_id=parts.channel_id,
-                            agent_id=agent_id,
-                            agent_turn_id=agent_turn_id,
-                            turn_epoch=int(turn_epoch),
+                            ctx=turn_ctx,
                             status="suspended",
                             output_box_id=output_box_id,
-                            headers=headers,
                             metadata={
                                 "activity": "awaiting_tool_result",
                                 "current_tool": tool_name,
@@ -866,22 +781,11 @@ class UIWorkerService(ServiceBase):
                     return True
 
                 # Dispatch failed immediately; mark idle and ack rejected.
-                await self.state_store.finish_turn_idle(
-                    project_id=parts.project_id,
-                    agent_id=agent_id,
-                    expect_turn_epoch=int(turn_epoch),
-                    expect_agent_turn_id=agent_turn_id,
+                await finish_turn_idle_and_emit(
+                    state_store=self.state_store,
+                    nats=self.nats,
+                    ctx=turn_ctx,
                     last_output_box_id=output_box_id,
-                )
-                await self._emit_state_event(
-                    project_id=parts.project_id,
-                    channel_id=parts.channel_id,
-                    agent_id=agent_id,
-                    agent_turn_id=agent_turn_id,
-                    turn_epoch=int(turn_epoch),
-                    status="idle",
-                    output_box_id=output_box_id,
-                    headers=headers,
                 )
                 await self.idem.set_result(
                     idem_key,
@@ -901,7 +805,7 @@ class UIWorkerService(ServiceBase):
                     tool_result_card_id=None,
                     error_code="dispatch_failed",
                 )
-                await self._publish_idle_wakeup(parts=parts, agent_id=agent_id, headers=headers)
+                await self._publish_idle_wakeup(turn_ctx)
                 return True
             except Exception as exc:  # noqa: BLE001
                 logger.error("UI action handling failed: %s", exc, exc_info=True)
@@ -910,7 +814,7 @@ class UIWorkerService(ServiceBase):
                 except Exception:
                     pass
                 try:
-                    current_state = await self.state_store.fetch(parts.project_id, agent_id)
+                    current_state = await self.state_store.fetch(transport_ctx)
                     if current_state and current_state.status in ("running", "suspended", "dispatched"):
                         same_turn = (
                             current_state.active_agent_turn_id == agent_turn_id
@@ -921,11 +825,19 @@ class UIWorkerService(ServiceBase):
                                 output_box_id
                                 or safe_str(current_state, "output_box_id")
                             )
+                            fallback_ctx = (
+                                turn_ctx.with_turn(
+                                    current_state.active_agent_turn_id,
+                                    current_state.turn_epoch,
+                                )
+                                if turn_ctx is not None
+                                else transport_ctx.with_turn(
+                                    current_state.active_agent_turn_id,
+                                    int(current_state.turn_epoch),
+                                )
+                            )
                             await self.state_store.finish_turn_idle(
-                                project_id=parts.project_id,
-                                agent_id=agent_id,
-                                expect_turn_epoch=current_state.turn_epoch,
-                                expect_agent_turn_id=current_state.active_agent_turn_id,
+                                ctx=fallback_ctx,
                                 last_output_box_id=fallback_output_box_id,
                             )
                 except Exception as reset_exc:  # noqa: BLE001
@@ -956,38 +868,31 @@ class UIWorkerService(ServiceBase):
         *,
         parts: Any,
         data: Dict[str, Any],
-        headers: Dict[str, str],
+        ingress_ctx: CGContext,
         _span: Any = None,
     ) -> None:
         payload = data or {}
-        try:
-            headers, _, _ = normalize_headers(
-                nats=self.nats,
-                headers=headers,
-            )
-        except ProtocolViolationError as exc:
-            logger.warning("UI tool_result invalid trace headers: %s", exc)
-            return
-
-        action_id = safe_str(payload.get("tool_call_id"))
-        agent_id = safe_str(payload.get("agent_id"))
-        agent_turn_id = safe_str(payload.get("agent_turn_id"))
-        turn_epoch = payload.get("turn_epoch")
-        tool_result_card_id = safe_str(payload.get("tool_result_card_id"))
-        span_attrs: Dict[str, Any] = {
-            "cg.project_id": str(parts.project_id),
-            "cg.channel_id": str(parts.channel_id),
-            "cg.action_id": str(action_id),
-            "cg.agent_id": str(agent_id),
-            "cg.agent_turn_id": str(agent_turn_id),
-            "cg.tool_result_card_id": str(tool_result_card_id),
-            "cg.turn_epoch": int(turn_epoch) if turn_epoch is not None else None,
-        }
+        safe_payload = payload
+        headers = ingress_ctx.to_nats_headers()
+        result_ctx = ingress_ctx
+        action_id = safe_str(result_ctx.tool_call_id)
+        agent_id = result_ctx.agent_id
+        agent_turn_id = result_ctx.agent_turn_id
+        tool_result_card_id = safe_str(safe_payload.get("tool_result_card_id"))
+        span_attrs: Dict[str, Any] = dict(result_ctx.to_otel_attributes())
+        span_attrs["cg.action_id"] = str(action_id)
+        span_attrs["cg.tool_result_card_id"] = str(tool_result_card_id)
         span = _span
+        if span is None:
+            class _NoopSpan:
+                def set_attribute(self, *args: Any, **kwargs: Any) -> None:
+                    _ = args, kwargs
+                    return None
+            span = _NoopSpan()
         if span is not None:
             set_span_attrs(span, span_attrs)
 
-            if not action_id or not agent_id or not agent_turn_id or turn_epoch is None:
+            if not action_id or not agent_id or not agent_turn_id:
                 logger.warning("UI tool_result missing required fields: %s", payload)
                 return
 
@@ -1002,9 +907,12 @@ class UIWorkerService(ServiceBase):
                 )
                 return
 
-            cards = await self.cardbox.get_cards([tool_result_card_id], project_id=parts.project_id)
-            tool_result = cards[0] if cards else None
-            if not tool_result:
+            tool_result_read = await fetch_and_parse_tool_result(
+                cardbox=self.cardbox,
+                project_id=parts.project_id,
+                card_id=tool_result_card_id,
+            )
+            if tool_result_read.error_code == "card_not_found":
                 await self._publish_action_ack(
                     parts=parts,
                     action_id=action_id,
@@ -1014,20 +922,29 @@ class UIWorkerService(ServiceBase):
                     error_code="tool_result_not_found",
                 )
                 return
+            if tool_result_read.error_code == "card_fetch_failed":
+                raise RuntimeError(tool_result_read.error_message or "tool_result_fetch_failed")
+            tool_result = tool_result_read.card
+            if tool_result is None:
+                raise RuntimeError(tool_result_read.error_message or "tool_result_missing")
+
+        if tool_result_read is None or tool_result is None:
+            raise RuntimeError("tool_result_read_not_initialized")
 
         tool_meta = getattr(tool_result, "metadata", {}) or {}
         tool_name = safe_str(tool_meta.get("function_name")) or "unknown"
         dispatch_step_id = safe_str(tool_meta.get("step_id"))
-        try:
-            result_payload = extract_tool_result_payload(tool_result)
+        if tool_result_read.ok and isinstance(tool_result_read.payload, dict):
+            result_payload = tool_result_read.payload
             tool_status = safe_str(result_payload.get("status"))
-        except ProtocolViolationError as exc:
-            logger.warning("UI tool_result protocol violation: %s", exc)
+        else:
+            protocol_msg = tool_result_read.error_message or "tool.result payload invalid"
+            logger.warning("UI tool_result protocol violation: %s", protocol_msg)
             result_payload = {
                 "status": STATUS_FAILED,
                 "after_execution": "terminate",
                 "result": None,
-                "error": {"code": "protocol_violation", "message": str(exc), "source": "worker"},
+                "error": {"code": "protocol_violation", "message": protocol_msg, "source": "worker"},
             }
             tool_status = STATUS_FAILED
         result_obj = result_payload.get("result")
@@ -1058,10 +975,10 @@ class UIWorkerService(ServiceBase):
                 error_code = error_code or safe_str(err_any.get("code"))
                 error_msg = error_msg or safe_str(err_any.get("message"))
 
-        state = await self.state_store.fetch(parts.project_id, agent_id)
+        state = await self.state_store.fetch(result_ctx)
         output_box_id_src = safe_str(state, "output_box_id") if state else None
         if not output_box_id_src:
-            pointers = await self.state_store.fetch_pointers(parts.project_id, agent_id)
+            pointers = await self.state_store.fetch_pointers(result_ctx)
             output_box_id_src = safe_str(pointers, "last_output_box_id") if pointers else None
         output_box_id = await self.cardbox.ensure_box_id(
             project_id=parts.project_id,
@@ -1072,30 +989,17 @@ class UIWorkerService(ServiceBase):
 
         if dispatch_step_id:
             await self.step_store.update_step(
-                project_id=parts.project_id,
-                agent_id=agent_id,
-                step_id=dispatch_step_id,
+                ctx=result_ctx.with_new_step(dispatch_step_id),
                 status="completed",
                 ended=True,
                 error=error_msg,
             )
 
-        await self.state_store.finish_turn_idle(
-            project_id=parts.project_id,
-            agent_id=agent_id,
-            expect_turn_epoch=int(turn_epoch),
-            expect_agent_turn_id=agent_turn_id,
+        await finish_turn_idle_and_emit(
+            state_store=self.state_store,
+            nats=self.nats,
+            ctx=result_ctx,
             last_output_box_id=output_box_id,
-        )
-        await self._emit_state_event(
-            project_id=parts.project_id,
-            channel_id=parts.channel_id,
-            agent_id=agent_id,
-            agent_turn_id=agent_turn_id,
-            turn_epoch=int(turn_epoch),
-            status="idle",
-            output_box_id=output_box_id,
-            headers=headers,
         )
 
         idem_identity = message_id or action_id
@@ -1124,26 +1028,17 @@ class UIWorkerService(ServiceBase):
             error_code=error_code,
             error=error_msg,
         )
-        await self._publish_idle_wakeup(parts=parts, agent_id=agent_id, headers=headers)
+        await self._publish_idle_wakeup(result_ctx)
 
-    async def _publish_idle_wakeup(
-        self,
-        *,
-        parts: Any,
-        agent_id: str,
-        headers: Dict[str, str],
-    ) -> None:
+    async def _publish_idle_wakeup(self, ctx: CGContext) -> None:
         await publish_idle_wakeup(
             nats=self.nats,
             resource_store=self.resource_store,
             state_store=self.state_store,
-            project_id=parts.project_id,
-            channel_id=parts.channel_id,
-            agent_id=agent_id,
-            headers=headers,
+            ctx=ctx,
+            logger=logger,
             retry_count=0,
             retry_delay=0.0,
-            logger=logger,
             warn_prefix="UI idle wakeup",
         )
 
@@ -1152,7 +1047,6 @@ class UIWorkerService(ServiceBase):
         "ui.handle_wakeup",
         headers_arg="headers",
         span_arg="_span",
-        attributes_getter=_subject_span_attrs,
     )
     async def _enqueue_wakeup(
         self,
@@ -1166,34 +1060,35 @@ class UIWorkerService(ServiceBase):
         if not parts:
             logger.warning("Invalid UI wakeup subject: %s", subject)
             return
-        agent_id = data.get("agent_id")
+        agent_id = safe_str((headers or {}).get(CG_AGENT_ID))
         if not agent_id:
-            logger.warning("UI wakeup missing agent_id: %s", data)
+            logger.warning("UI wakeup missing %s header: %s", CG_AGENT_ID, headers)
             return
 
-        rows = await self.execution_store.claim_pending_inbox(
-            project_id=parts.project_id,
-            agent_id=agent_id,
-            limit=20,
-        )
+        wakeup_ctx = CGContext(project_id=parts.project_id, agent_id=agent_id, channel_id=parts.channel_id)
+        rows = await self.execution_store.claim_pending_inbox(ctx=wakeup_ctx, limit=20)
         if span is not None:
             span.set_attribute("cg.inbox_rows", int(len(rows or [])))
         if not rows:
             return
 
-        async def _handle_row(ctx: InboxRowContext) -> InboxRowResult:
-            if ctx.message_type not in ("tool_result", "ui_action"):
+        async def _handle_row(row_ctx: InboxRowContext) -> InboxRowResult:
+            if row_ctx.message_type not in ("tool_result", "ui_action"):
                 return InboxRowResult(status="skipped")
 
-            if ctx.message_type == "tool_result":
-                await self._handle_tool_result(parts=parts, data=ctx.payload, headers=ctx.headers)
+            if row_ctx.message_type == "tool_result":
+                await self._handle_tool_result(
+                    parts=parts,
+                    data=row_ctx.payload,
+                    ingress_ctx=row_ctx.ctx,
+                )
                 return InboxRowResult(status="consumed")
 
             processed = await self._process_ui_action(
                 parts=parts,
-                payload=ctx.payload,
-                headers=ctx.headers,
-                inbox_id=ctx.inbox_id,
+                payload=row_ctx.payload,
+                ingress_ctx=row_ctx.ctx,
+                inbox_id=row_ctx.inbox_id,
             )
             return InboxRowResult(status="consumed" if processed else "pending")
 
@@ -1205,7 +1100,6 @@ class UIWorkerService(ServiceBase):
             handler=_handle_row,
             logger=logger,
             expected_status="processing",
-            require_depth=True,
         )
 
 

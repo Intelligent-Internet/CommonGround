@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from core.cg_context import CGContext
 from infra.stores import ResourceStore
 
 def _target_from_row(row: Any) -> Optional[str]:
@@ -18,14 +19,16 @@ def _target_from_row(row: Any) -> Optional[str]:
 async def resolve_agent_target(
     *,
     resource_store: ResourceStore,
-    project_id: str,
-    agent_id: str,
+    ctx: CGContext,
     default_target: Optional[str] = None,
     conn: Any = None,
 ) -> Optional[str]:
     """Resolve NATS subject target for cmd.agent.* based on roster metadata."""
     try:
-        row = await resource_store.fetch_roster(project_id, agent_id, conn=conn)
+        row = await resource_store.fetch_roster(
+            ctx,
+            conn=conn,
+        )
     except Exception:
         row = None
 

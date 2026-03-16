@@ -4,8 +4,8 @@ Demo: minimal principal streaming example.
 Goals:
 - No external tools (no web_search / openapi / etc).
 - Demonstrate Inbox + Wakeup flow.
-- Print core NATS streaming chunks: cg.v1r3.{project}.{channel}.str.agent.{agent_id}.chunk
-- Wait for completion event: cg.v1r3.{project}.{channel}.evt.agent.{agent_id}.task
+- Print core NATS streaming chunks: cg.v1r4.{project}.{channel}.str.agent.{agent_id}.chunk
+- Wait for completion event: cg.v1r4.{project}.{channel}.evt.agent.{agent_id}.task
 
 Notes:
 - Worker only emits streaming chunks for LLM delta.content (chunk_type="content").
@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional
 
 import uuid6
 
+from core.cg_context import CGContext
 from core.utp_protocol import Card, FieldsSchemaContent, JsonContent, TextContent
 from core.headers import ensure_recursion_depth
 from core.trace import ensure_trace_headers
@@ -231,11 +232,16 @@ async def _run_demo(
     headers = ensure_recursion_depth(headers, default_depth=0)
 
     # Ensure this agent exists in roster with worker_target to avoid worker_target_missing.
+    agent_ctx = CGContext(
+        project_id=project_id,
+        channel_id=channel_id,
+        agent_id=agent_id,
+    ).with_normalized_transport(headers, trace_id=trace_id, default_depth=0)
+
     await ensure_agent_ready(
         resource_store=resource_store,
         state_store=state,
-        project_id=project_id,
-        agent_id=agent_id,
+        target_ctx=agent_ctx,
         spec=CreateAgentSpec(
             profile_box_id=profile_box_id,
             worker_target="worker_generic",
@@ -245,8 +251,6 @@ async def _run_demo(
             tags=["principal"],
             metadata={"source": "demo_simple_principal_stream"},
         ),
-        channel_id=channel_id,
-        trace_id=trace_id,
     )
 
     dispatcher = AgentDispatcher(
@@ -259,9 +263,9 @@ async def _run_demo(
     print(f"[demo] trace_id={trace_id} traceparent={headers.get('traceparent')}")
 
     done = asyncio.Event()
-    stream_subject = f"cg.v1r3.{project_id}.{channel_id}.str.agent.{agent_id}.chunk"
-    task_subject = f"cg.v1r3.{project_id}.{channel_id}.evt.agent.{agent_id}.task"
-    step_subject = f"cg.v1r3.{project_id}.{channel_id}.evt.agent.{agent_id}.step"
+    stream_subject = f"cg.v1r4.{project_id}.{channel_id}.str.agent.{agent_id}.chunk"
+    task_subject = f"cg.v1r4.{project_id}.{channel_id}.evt.agent.{agent_id}.task"
+    step_subject = f"cg.v1r4.{project_id}.{channel_id}.evt.agent.{agent_id}.step"
 
     async def on_chunk(msg) -> None:
         try:
@@ -307,16 +311,19 @@ async def _run_demo(
         nonlocal current_turn_id
         context_box = await cardbox.get_box(context_box_id, project_id=project_id)
         context_count = len(context_box.card_ids or []) if context_box else 0
+        source_ctx = CGContext(
+            project_id=project_id,
+            channel_id=channel_id,
+            agent_id="sys.ground_control",
+        ).with_normalized_transport(headers, trace_id=trace_id, default_depth=0)
         dispatch_result = await dispatcher.dispatch(
             DispatchRequest(
-                project_id=project_id,
-                channel_id=channel_id,
-                agent_id=agent_id,
+                source_ctx=source_ctx,
+                target_agent_id=agent_id,
+                target_channel_id=channel_id,
                 profile_box_id=profile_box_id,
                 context_box_id=context_box_id,
                 output_box_id=str(output_box_id),
-                trace_id=trace_id,
-                headers=headers,
             )
         )
         if dispatch_result.status not in ("accepted", "pending") or not dispatch_result.agent_turn_id:

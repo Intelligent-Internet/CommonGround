@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional
 
+from core.cg_context import CGContext
 from core.events import LLMStreamPayload
-from core.subject import format_subject
 
 
-def build_stream_subject(*, project_id: str, channel_id: str, agent_id: str) -> str:
-    return format_subject(project_id, channel_id, "str", "agent", agent_id, "chunk")
+def build_stream_subject(*, ctx: CGContext) -> str:
+    return ctx.subject("str", "agent", ctx.agent_id, "chunk")
 
 
 def build_stream_start_payload(

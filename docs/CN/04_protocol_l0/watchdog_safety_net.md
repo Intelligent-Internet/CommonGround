@@ -29,8 +29,9 @@
   - 若工具定义含 `options.suspend_timeout_seconds` 或 `options.timeout_seconds`，该值与默认值取 `max`。
 
 ### 2.3 Worker：resume 兜底重放（补充）
-- 每个 tick 会 `requeue_expired_resume_ledgers`：将 lease 过期的 `state.turn_resume_ledger` 条目从 `processing` 回退为 `pending`（可重试）。
-- `reconcile` 会基于 resume ledger / 已收 `tool.result` 重建 `resume_data`，把恢复消息继续推入 worker 内部处理队列。
+- 运行时不再依赖 `turn_resume_ledger`。
+- `reconcile` 会先扫描 `turn_waiting_tools(waiting/received)` 的挂起等待项，再按 `turn_waiting_tools.tool_call_id` 关联领取 `state.agent_inbox` 的到期项（`status in (pending,deferred)` 且 `next_retry_at<=now()`），继续推入 worker 处理队列。
+- 可重试失败通过 inbox 回写 `deferred`（带 `retry_count/next_retry_at/defer_reason/last_error`），由后续 tick 继续领取。
 
 ### 2.4 PMO：`dispatched` 长期未处理重试
 - 条件：`status='dispatched'` 且 `updated_at < now - dispatched_retry_seconds`。
@@ -59,7 +60,6 @@
 ### 2.7 PMO：`pending` inbox 门铃补齐
 - 条件：`state.agent_inbox.status='pending'` 且 `created_at < now - pending_wakeup_seconds`。
 - 动作：发 `cmd.agent.<target>.wakeup`，不改 inbox 状态；仅起门铃作用。
-- 额外：若无法确定 `channel_id` 且等待时间达到 `pending_wakeup_skip_seconds`，会打上 `watchdog_error='missing_channel'`、`watchdog_at`，并将该 inbox 标记为 `skipped`。
 
 ## 3. 产出契约（必须满足）
 - PMO 侧 watchdog 终态收敛（`dispatch_timeout`、`timeout_reaped_by_watchdog`）需 best-effort 追加 `task.deliverable`（若 `output_box_id` 不存在则可能无法落盘）。
@@ -73,7 +73,6 @@
   - `pmo.dispatched_retry_seconds`
   - `pmo.dispatched_timeout_seconds`
   - `pmo.pending_wakeup_seconds`
-  - `pmo.pending_wakeup_skip_seconds`
   - `pmo.active_reap_seconds`
 - Worker（`services/agent_worker/loop.py`）：
   - `worker.inbox_processing_timeout_seconds`

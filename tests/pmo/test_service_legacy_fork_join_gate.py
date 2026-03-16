@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.cg_context import CGContext
 from services.pmo.service import PMOService
 
 
@@ -32,7 +33,7 @@ async def test_resolve_internal_handler_rejects_removed_fork_join_route() -> Non
         service,
         meta=meta,
         cmd=cmd,
-        headers={},
+        ctx=CGContext(project_id="proj_1", channel_id="public", agent_id="agent_1"),
     )
 
     assert db_after == "suspend"
@@ -65,7 +66,7 @@ async def test_resolve_internal_handler_allows_fork_join() -> None:
         service,
         meta=meta,
         cmd=cmd,
-        headers={},
+        ctx=CGContext(project_id="proj_1", channel_id="public", agent_id="agent_1"),
     )
 
     assert db_after == "suspend"

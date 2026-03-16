@@ -27,153 +27,61 @@ import httpx
 from scripts.utils.config import api_base_url, load_toml_config, require_cardbox_dsn
 import uuid6
 
-from core.config import PROTOCOL_VERSION
+from core.cg_context import CGContext
 from core.subject import format_subject
 from core.headers import ensure_recursion_depth
-from core.trace import ensure_trace_headers, next_traceparent
+from core.trace import ensure_trace_headers
 from core.errors import ProtocolViolationError
-from core.utp_protocol import Card, JsonContent, TextContent, ToolCallContent, ToolResultContent, extract_json_object
+from core.utp_protocol import Card, JsonContent, TextContent, ToolResultContent, extract_json_object
 from core.utils import safe_str
 from infra.agent_dispatcher import AgentDispatcher, DispatchRequest
 from infra.cardbox_client import CardBoxClient
 from infra.nats_client import NATSClient
 from infra.stores import ExecutionStore, ResourceStore, StateStore
 from infra.project_bootstrap import ensure_project
+from services.tools.tool_caller import ToolCaller
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-async def _wait_for_tool_result_inbox(
-    *,
-    execution_store: ExecutionStore,
-    project_id: str,
-    agent_id: str,
-    tool_call_id: str,
-    timeout_s: float,
-) -> Dict[str, Any]:
-    deadline = asyncio.get_event_loop().time() + timeout_s
-    while True:
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            raise TimeoutError("timeout waiting for tool_result inbox")
-        rows = await execution_store.list_inbox_by_correlation(
-            project_id=project_id,
-            agent_id=agent_id,
-            correlation_id=tool_call_id,
-            limit=20,
-        )
-        for row in rows:
-            if row.get("message_type") != "tool_result":
-                continue
-            inbox_id = row.get("inbox_id")
-            if inbox_id:
-                await execution_store.update_inbox_status(
-                    inbox_id=inbox_id,
-                    project_id=project_id,
-                    status="consumed",
-                )
-            payload = row.get("payload") or {}
-            if isinstance(payload, dict):
-                return payload
-        await asyncio.sleep(min(0.5, remaining))
-
-
 async def _call_pmo_internal_tool(
     *,
+    tool_caller: ToolCaller,
     cardbox: CardBoxClient,
-    execution_store: ExecutionStore,
-    nats: NATSClient,
     project_id: str,
     channel_id: str,
     caller_agent_id: str,
     tool_name: str,
     tool_args: Dict[str, Any],
-    after_execution: str = "suspend",
     trace_id: Optional[str] = None,
 ) -> Tuple[str, str, Dict[str, Any], Optional[str]]:
-    tool_call_id = f"call_{uuid6.uuid7().hex}"
-    step_id = f"step_demo_{uuid6.uuid7().hex}"
-    agent_turn_id = f"turn_sys_{uuid6.uuid7().hex}"
-    trace_id = trace_id or str(uuid6.uuid7())
-
-    pmo_subject = (
-        f"cg.{PROTOCOL_VERSION}.{project_id}.{channel_id}.cmd.sys.pmo.internal.{tool_name}"
-    )
-    tool_call_card = Card(
-        card_id=uuid6.uuid7().hex,
-        project_id=project_id,
-        type="tool.call",
-        content=ToolCallContent(
-            tool_name=tool_name,
-            arguments=tool_args,
-            status="called",
-            target_subject=pmo_subject,
-        ),
-        created_at=datetime.now(UTC),
-        author_id=caller_agent_id,
-        metadata={
-            "agent_turn_id": agent_turn_id,
-            "step_id": step_id,
-            "tool_call_id": tool_call_id,
-            "role": "assistant",
-            "trace_id": trace_id,
-        },
-        tool_call_id=tool_call_id,
-    )
-    await cardbox.save_card(tool_call_card)
-
-    payload: Dict[str, Any] = {
-        "agent_id": caller_agent_id,
-        "agent_turn_id": agent_turn_id,
-        "turn_epoch": 1,
-        "tool_call_id": tool_call_id,
-        "tool_name": tool_name,
-        "after_execution": after_execution,
-        "tool_call_card_id": tool_call_card.card_id,
-        "step_id": step_id,
-    }
-    headers, _, trace_id = ensure_trace_headers({}, trace_id=trace_id)
+    headers, _, resolved_trace_id = ensure_trace_headers({}, trace_id=trace_id)
     headers = ensure_recursion_depth(headers, default_depth=0)
-    traceparent, trace_id = next_traceparent(headers.get("traceparent"), trace_id)
-    headers = dict(headers)
-    headers["traceparent"] = traceparent
-
-    await execution_store.insert_execution_edge(
-        edge_id=f"edge_{uuid6.uuid7().hex}",
+    caller_ctx = CGContext(
         project_id=project_id,
         channel_id=channel_id,
-        primitive="enqueue",
-        edge_phase="request",
-        source_agent_id=caller_agent_id,
-        source_agent_turn_id=agent_turn_id,
-        source_step_id=step_id,
-        target_agent_id="sys.pmo",
-        target_agent_turn_id=None,
-        correlation_id=tool_call_id,
-        enqueue_mode="call",
-        recursion_depth=int(headers.get("CG-Recursion-Depth", "0")),
-        trace_id=trace_id,
-        parent_step_id=step_id,
-        metadata={
-            "message_type": "tool_call",
-            "enqueue_mode": "call",
-            "inbox_id": tool_call_id,
-            "recursion_depth": int(headers.get("CG-Recursion-Depth", "0")),
-        },
-    )
-    await nats.publish_event(pmo_subject, payload, headers=headers)
-
-    inbox_payload = await _wait_for_tool_result_inbox(
-        execution_store=execution_store,
-        project_id=project_id,
         agent_id=caller_agent_id,
-        tool_call_id=tool_call_id,
+    ).with_normalized_transport(
+        headers,
+        trace_id=resolved_trace_id,
+        default_depth=0,
+    )
+    call_result = await tool_caller.call(
+        caller_ctx=caller_ctx,
+        tool_name=tool_name,
+        args=tool_args,
+        await_result=True,
+        ack_result=True,
         timeout_s=300.0,
     )
 
+    inbox_payload = call_result.payload if isinstance(call_result.payload, dict) else {}
+    tool_result_card_id = safe_str(call_result.tool_result_card_id)
+
     tool_result: Dict[str, Any] = {}
-    tool_result_card_id = inbox_payload.get("tool_result_card_id")
-    if isinstance(tool_result_card_id, str) and tool_result_card_id:
+    if inbox_payload:
+        tool_result = dict(inbox_payload)
+    if tool_result_card_id:
         cards = await cardbox.get_cards([tool_result_card_id], project_id=project_id)
         tr = cards[0] if cards else None
         if tr:
@@ -190,7 +98,7 @@ async def _call_pmo_internal_tool(
             else:
                 tool_result = {"status": "failed", "result": {"error_message": "tool.result content not dict"}}
 
-    return tool_call_id, step_id, tool_result, str(tool_result_card_id) if tool_result_card_id else None
+    return call_result.tool_call_id, call_result.step_id, tool_result, tool_result_card_id or None
 
 
 async def _resolve_profile_box_id(*, api_url: str, project_id: str, profile_name: str) -> str:
@@ -365,19 +273,51 @@ def _normalize_trace_id(value: Optional[str]) -> Optional[str]:
     return str(value).lower().replace("-", "")
 
 
+def _resolve_child_trace_id(
+    *,
+    parent_trace_id: str,
+    head_trace_id: Optional[str],
+    turns: List[Dict[str, Any]],
+) -> str:
+    normalized_head_trace = _normalize_trace_id(safe_str(head_trace_id))
+    first_turn_trace = safe_str((turns[0] or {}).get("trace_id")) if turns else ""
+    normalized_first_turn_trace = _normalize_trace_id(first_turn_trace)
+    if (
+        normalized_head_trace
+        and normalized_first_turn_trace
+        and normalized_head_trace != normalized_first_turn_trace
+    ):
+        raise RuntimeError(
+            "lineage check failed: child trace source mismatch "
+            f"(parent_trace={parent_trace_id} head_trace={head_trace_id} "
+            f"first_turn_trace={first_turn_trace})"
+        )
+    child_trace_id = normalized_head_trace or normalized_first_turn_trace
+    if not child_trace_id:
+        raise RuntimeError(
+            "lineage check failed: child trace_id missing "
+            f"(parent_trace={parent_trace_id} head_trace={head_trace_id} "
+            f"first_turn_trace={first_turn_trace})"
+        )
+    return child_trace_id
+
+
 async def _verify_lineage(
     *,
     cardbox: CardBoxClient,
     state_store: StateStore,
     project_id: str,
+    channel_id: str,
     child_agent_id: str,
     child_agent_turn_id: str,
     parent_step_id: str,
-    trace_id: str,
+    parent_trace_id: str,
     output_box_id: Optional[str],
 ) -> None:
     # 1) state head (active-turn lineage fields are transient and may be cleared when idle)
-    head = await state_store.fetch(project_id, child_agent_id)
+    head = await state_store.fetch(
+        CGContext(project_id=project_id, channel_id=channel_id, agent_id=child_agent_id)
+    )
     if not head:
         raise RuntimeError("lineage check failed: state head missing")
 
@@ -391,22 +331,12 @@ async def _verify_lineage(
                 f"lineage check failed: state_head.parent_step_id mismatch "
                 f"(expected={parent_step_id} actual={head.parent_step_id})"
             )
-        if _normalize_trace_id(head_trace_id) != _normalize_trace_id(trace_id):
-            raise RuntimeError(
-                f"lineage check failed: state_head.trace_id mismatch "
-                f"(expected={trace_id} actual={head.trace_id})"
-            )
     else:
         # After turn completion, finish_turn_idle() clears these fields by design.
         if head_parent_step_id and head_parent_step_id != parent_step_id:
             raise RuntimeError(
                 f"lineage check failed: state_head.parent_step_id mismatch after idle "
                 f"(expected={parent_step_id} actual={head.parent_step_id})"
-            )
-        if head_trace_id and _normalize_trace_id(head_trace_id) != _normalize_trace_id(trace_id):
-            raise RuntimeError(
-                f"lineage check failed: state_head.trace_id mismatch after idle "
-                f"(expected={trace_id} actual={head.trace_id})"
             )
 
     # 2) turn rows (retry briefly to allow async writes)
@@ -422,13 +352,21 @@ async def _verify_lineage(
     missing_trace = [t for t in turns if not safe_str(t.get("trace_id"))]
     if missing_trace:
         raise RuntimeError("lineage check failed: some turns missing trace_id")
+    child_trace_id = _resolve_child_trace_id(
+        parent_trace_id=parent_trace_id,
+        head_trace_id=head_trace_id,
+        turns=turns,
+    )
     mismatch_trace = [
         t
         for t in turns
-        if _normalize_trace_id(safe_str(t.get("trace_id"))) != _normalize_trace_id(trace_id)
+        if _normalize_trace_id(safe_str(t.get("trace_id"))) != child_trace_id
     ]
     if mismatch_trace:
-        raise RuntimeError("lineage check failed: some turns have mismatched trace_id")
+        raise RuntimeError(
+            "lineage check failed: some turns have mismatched trace_id "
+            f"(parent_trace={parent_trace_id} child_trace={child_trace_id})"
+        )
     mismatch_parent = [t for t in turns if safe_str(t.get("parent_step_id")) != parent_step_id]
     if mismatch_parent:
         raise RuntimeError("lineage check failed: some turns have mismatched parent_step_id")
@@ -458,9 +396,10 @@ async def _verify_lineage(
         if getattr(c, "type", "") not in required_types:
             continue
         meta = getattr(c, "metadata", {}) or {}
-        if _normalize_trace_id(meta.get("trace_id")) != _normalize_trace_id(trace_id):
+        if _normalize_trace_id(meta.get("trace_id")) != child_trace_id:
             raise RuntimeError(
-                f"lineage check failed: card {c.card_id} missing/mismatched trace_id"
+                f"lineage check failed: card {c.card_id} missing/mismatched trace_id "
+                f"(parent_trace={parent_trace_id} child_trace={child_trace_id})"
             )
         if meta.get("parent_step_id") != parent_step_id:
             raise RuntimeError(
@@ -547,6 +486,12 @@ async def main() -> None:
 
     nats = NATSClient(config=cfg.get("nats", {}))
     await nats.connect()
+    tool_caller = ToolCaller(
+        cardbox=cardbox,
+        nats=nats,
+        resource_store=resource_store,
+        execution_store=execution_store,
+    )
 
     done = asyncio.Event()
 
@@ -667,7 +612,7 @@ async def main() -> None:
 
     # Start modes
     if args.start == "launch_principal":
-        launcher_agent_id = str(args.launcher_agent) if args.launcher_agent else f"demo_launcher_{uuid6.uuid7().hex[:12]}"
+        launcher_agent_id = str(args.launcher_agent) if args.launcher_agent else f"demo_launcher_{uuid6.uuid7().hex[-12:]}"
         trace_id = str(uuid6.uuid7())
 
         # Create a minimal launcher profile with delegation_policy and register in roster.
@@ -675,8 +620,11 @@ async def main() -> None:
             cardbox, project_id=project_id, target_principal_profile_name=profile_name
         )
         await resource_store.upsert_project_agent(
-            project_id=project_id,
-            agent_id=launcher_agent_id,
+            ctx=CGContext(
+                project_id=project_id,
+                channel_id=channel_id,
+                agent_id=launcher_agent_id,
+            ),
             profile_box_id=str(launcher_profile_box_id),
             worker_target="worker_generic",
             tags=["partner"],
@@ -686,7 +634,7 @@ async def main() -> None:
         )
         print(f"[demo] launcher agent_id: {launcher_agent_id} (roster ok)")
 
-        principal_agent_id = f"principal_{uuid6.uuid7().hex[:12]}"
+        principal_agent_id = f"principal_{uuid6.uuid7().hex[-12:]}"
         provision_args = {
             "action": "create",
             "agent_id": principal_agent_id,
@@ -694,9 +642,8 @@ async def main() -> None:
             "display_name": f"Principal ({profile_name})",
         }
         _, _provision_step_id, provision_result, _ = await _call_pmo_internal_tool(
+            tool_caller=tool_caller,
             cardbox=cardbox,
-            execution_store=execution_store,
-            nats=nats,
             project_id=project_id,
             channel_id=channel_id,
             caller_agent_id=launcher_agent_id,
@@ -715,9 +662,8 @@ async def main() -> None:
             "instruction": str(args.instruction),
         }
         _, dispatch_step_id, dispatch_result, dispatch_tool_result_card_id = await _call_pmo_internal_tool(
+            tool_caller=tool_caller,
             cardbox=cardbox,
-            execution_store=execution_store,
-            nats=nats,
             project_id=project_id,
             channel_id=channel_id,
             caller_agent_id=launcher_agent_id,
@@ -752,13 +698,16 @@ async def main() -> None:
 
     else:
         # Direct worker dispatch mode (bypasses PMO).
-        agent_id = str(args.agent) if args.agent else f"demo_principal_{uuid6.uuid7().hex[:12]}"
+        agent_id = str(args.agent) if args.agent else f"demo_principal_{uuid6.uuid7().hex[-12:]}"
         print(f"[demo] direct mode principal agent_id: {agent_id}")
 
         # Ensure principal is registered in roster (required for delegation_policy enforcement in PMO tools like fork_join).
         await resource_store.upsert_project_agent(
-            project_id=project_id,
-            agent_id=agent_id,
+            ctx=CGContext(
+                project_id=project_id,
+                channel_id=channel_id,
+                agent_id=agent_id,
+            ),
             profile_box_id=str(profile_box_id),
             worker_target="worker_generic",
             tags=["principal"],
@@ -780,16 +729,19 @@ async def main() -> None:
             cardbox=cardbox,
             nats=nats,
         )
+        source_ctx = CGContext(
+            project_id=project_id,
+            channel_id=channel_id,
+            agent_id="sys.ground_control",
+        ).with_normalized_transport(headers, trace_id=trace_id, default_depth=0)
         dispatch_result = await dispatcher.dispatch(
             DispatchRequest(
-                project_id=project_id,
-                channel_id=channel_id,
-                agent_id=agent_id,
+                source_ctx=source_ctx,
+                target_agent_id=agent_id,
+                target_channel_id=channel_id,
                 profile_box_id=str(profile_box_id),
                 context_box_id=str(ctx_box_id),
                 output_box_id=str(output_box_id),
-                trace_id=trace_id,
-                headers=headers,
             )
         )
         if dispatch_result.status not in ("accepted", "pending"):
@@ -838,10 +790,11 @@ async def main() -> None:
                 cardbox=cardbox,
                 state_store=state_store,
                 project_id=project_id,
+                channel_id=channel_id,
                 child_agent_id=str(child_agent_id),
                 child_agent_turn_id=str(child_agent_turn_id),
                 parent_step_id=str(parent_step_id),
-                trace_id=str(trace_id),
+                parent_trace_id=str(trace_id),
                 output_box_id=output_box_id if isinstance(output_box_id, str) else None,
             )
             print("[demo] ✅ lineage check passed")

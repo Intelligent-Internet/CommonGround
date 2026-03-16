@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from core.cg_context import CGContext
 from core.delegation_policy import describe_policy, extract_delegation_policy, is_delegation_allowed
 from core.utp_protocol import extract_json_object
 from core.utils import safe_str
@@ -30,8 +31,7 @@ async def _load_sys_profile_content(
 async def assert_can_delegate_to_profile_name(
     *,
     deps: Any,
-    project_id: str,
-    caller_agent_id: str,
+    ctx: CGContext,
     target_profile_name: str,
     conn: Any = None,
 ) -> Dict[str, Any]:
@@ -42,10 +42,13 @@ async def assert_can_delegate_to_profile_name(
     Raises ValueError on denial or bad config.
     """
 
-    roster = await deps.resource_store.fetch_roster(project_id, caller_agent_id, conn=conn)
+    roster = await deps.resource_store.fetch_roster(
+        ctx,
+        conn=conn,
+    )
     if not roster:
         raise NotFoundError(
-            f"caller agent_id not registered in roster: {caller_agent_id} (project_id={project_id})"
+            f"caller agent_id not registered in roster: {ctx.agent_id} (project_id={ctx.project_id})"
         )
     caller_profile_box_id = safe_str(roster.get("profile_box_id"))
     if not caller_profile_box_id:
@@ -53,7 +56,7 @@ async def assert_can_delegate_to_profile_name(
 
     caller_profile_content = await _load_sys_profile_content(
         deps=deps,
-        project_id=project_id,
+        project_id=ctx.project_id,
         profile_box_id=caller_profile_box_id,
         conn=conn,
     )
@@ -65,7 +68,11 @@ async def assert_can_delegate_to_profile_name(
     if not target_name:
         raise BadRequestError("delegation denied: target profile_name is required")
 
-    found = await deps.resource_store.find_profile_by_name(project_id, target_name, conn=conn)
+    found = await deps.resource_store.find_profile_by_name(
+        ctx.project_id,
+        target_name,
+        conn=conn,
+    )
     if not found:
         raise NotFoundError(f"delegation denied: target profile not found: {target_name!r}")
 

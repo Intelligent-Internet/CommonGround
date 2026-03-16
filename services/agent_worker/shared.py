@@ -34,11 +34,10 @@ async def emit_step_event(
     new_card_ids: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    ctx = item.to_cg_context(step_id=step_id)
+    ctx = item.ctx.with_new_step(step_id)
     await emit_agent_step(
         nats=nats,
         ctx=ctx,
-        step_id=step_id,
         phase=phase,
         metadata=metadata,
         new_card_ids=new_card_ids,

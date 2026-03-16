@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 import uuid6
 
 from card_box_core.structures import Card as CoreCard, CardBox as CoreBox, ToolContent as CoreToolContent
+from core.cg_context import CGContext
 from core.delegation_policy import extract_delegation_policy
 from core.errors import ProtocolViolationError
 from core.llm import LLMConfig
@@ -23,11 +24,12 @@ class ResourceLoader:
 
     async def load_profile(
         self,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         profile_box_id: Optional[str],
     ) -> Optional[ProfileData]:
-        roster = await self.resource_store.fetch_roster_model(project_id, agent_id)
+        roster = await self.resource_store.fetch_roster_model(
+            ctx
+        )
         profile_card_ids: List[str] = []
         display_name = None
         tags: List[str] = []
@@ -41,7 +43,7 @@ class ResourceLoader:
 
         # Command-level override box_id wins
         if box_id is not None:
-            box = await self.cardbox.get_box(box_id, project_id=project_id)
+            box = await self.cardbox.get_box(box_id, project_id=ctx.project_id)
             if box:
                 profile_card_ids = list(box.card_ids or [])
 
@@ -49,11 +51,11 @@ class ResourceLoader:
             roster_box = safe_str(roster.profile_box_id) if roster else None
             print(
                 "[ResourceLoader] Missing profile_box_id/card_ids "
-                f"agent_id={agent_id} box_id={box_id} roster_box_id={roster_box}"
+                f"agent_id={ctx.agent_id} box_id={box_id} roster_box_id={roster_box}"
             )
             return None
 
-        profile_cards = await self.cardbox.get_cards(profile_card_ids, project_id=project_id)
+        profile_cards = await self.cardbox.get_cards(profile_card_ids, project_id=ctx.project_id)
         if not profile_cards:
             print(f"[ResourceLoader] Profile cards {profile_card_ids} not found")
             return None
@@ -66,13 +68,13 @@ class ResourceLoader:
             print(f"[ResourceLoader] Invalid sys.profile content: {exc}")
             return None
 
-        name = content.get("name") or content.get("profile_id") or profile_card.metadata.get("name") or agent_id
+        name = content.get("name") or content.get("profile_id") or profile_card.metadata.get("name") or ctx.agent_id
         system_prompt_template = content.get("system_prompt_template") or content.get("system_prompt") or ""
         policy = extract_delegation_policy(content)
         allowed_downstream: List[Any] = []
         if policy:
             if policy.target_profiles is None:
-                rows = await self.resource_store.list_profiles(project_id, limit=500, offset=0)
+                rows = await self.resource_store.list_profiles(ctx.project_id, limit=500, offset=0)
                 tags_filter = set(policy.target_tags or [])
                 for row in rows or []:
                     row_name = safe_str((row or {}).get("name")).strip()
@@ -117,7 +119,7 @@ class ResourceLoader:
         else:
             must_end_with = []
 
-        downstream_desc = await self._build_downstream_desc(project_id, allowed_downstream)
+        downstream_desc = await self._build_downstream_desc(ctx.project_id, allowed_downstream)
         cleaned_allowed_downstream = []
         for item in (allowed_downstream or []):
             val = safe_str(item)

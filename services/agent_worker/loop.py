@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, UTC
+from datetime import datetime
 import asyncio
 import json
 import logging
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Awaitable, Dict, Iterable, Optional
 
 
 from core.config import PROTOCOL_VERSION, MAX_STEPS, MAX_RECURSION_DEPTH, DEFAULT_TIMEOUT
@@ -18,23 +18,26 @@ from core.config_defaults import (
     DEFAULT_WORKER_INBOX_FETCH_LIMIT,
     DEFAULT_WORKER_WATCHDOG_INTERVAL_SECONDS,
     DEFAULT_WORKER_INBOX_PROCESSING_TIMEOUT_SECONDS,
+    DEFAULT_WORKER_MAX_RESUME_DEFER_RETRIES,
     DEFAULT_WORKER_TARGETS,
 )
+from core.cg_context import CGContext
 from core.errors import ProtocolViolationError
-from core.headers import RECURSION_DEPTH_HEADER, ensure_recursion_depth
-from core.status import STATUS_FAILED, STATUS_TIMEOUT, TOOL_RESULT_STATUS_SET
-from core.subject import format_subject, parse_subject, subject_pattern
-from core.trace import ensure_trace_headers
+from core.headers import CG_AGENT_ID
+from core.status import STATUS_TIMEOUT
+from core.subject import parse_subject, subject_pattern
 from core.utils import safe_str, set_loop_policy, safe_target_label
-from core.utp_protocol import AgentTaskPayload, extract_tool_result_payload
-from infra.agent_routing import resolve_agent_target
+from core.utp_protocol import AgentTaskPayload
+from infra.stores.context_hydration import (
+    build_replay_context,
+    build_state_head_context,
+)
+from infra.l0_engine import L0Engine, ReportIntent, TurnRef
 from infra.llm_gateway import LLMService, LLMWrapper
 from infra.mock_llm_handler import mock_chat
 from infra.observability.otel import get_tracer, traced
-from infra.primitives import report as report_primitive
 from infra.service_runtime import ServiceBase
 from infra.worker_helpers import InboxRowContext, InboxRowResult, consume_inbox_rows
-from infra.worker_helpers import normalize_headers
 from infra.tool_executor import ToolResultBuilder, ToolResultContext
 
 from .context_loader import ContextAssembler, ResourceLoader
@@ -75,29 +78,6 @@ def _build_inbox_timing(
     return timing
 
 
-def _worker_item_span_attrs(args: Dict[str, Any]) -> Dict[str, Any]:
-    item = args.get("item")
-    if item is None:
-        return {}
-    attrs: Dict[str, Any] = {
-        "cg.project_id": str(getattr(item, "project_id", "")),
-        "cg.channel_id": str(getattr(item, "channel_id", "")),
-        "cg.agent_id": str(getattr(item, "agent_id", "")),
-        "cg.agent_turn_id": str(getattr(item, "agent_turn_id", "")),
-        "cg.turn_epoch": int(getattr(item, "turn_epoch", 0) or 0),
-        "cg.kind": str(args.get("kind") or "turn"),
-    }
-    inbox_id = getattr(item, "inbox_id", None)
-    if inbox_id:
-        attrs["cg.inbox_id"] = str(inbox_id)
-    parent_step_id = getattr(item, "parent_step_id", None)
-    if parent_step_id:
-        attrs["cg.parent_step_id"] = str(parent_step_id)
-    trace_id = getattr(item, "trace_id", None)
-    if trace_id:
-        attrs["cg.trace_id"] = str(trace_id)
-    return attrs
-
 
 def _normalize_worker_targets(raw: Any) -> list[str]:
     if raw is None:
@@ -116,21 +96,12 @@ def _normalize_worker_targets(raw: Any) -> list[str]:
     return []
 
 
-def _is_watch_heartbeat_payload(*, function_name: Optional[str], payload: Dict[str, Any]) -> bool:
-    if function_name not in ("skills.task_watch", "skills.job_watch"):
-        return False
-    result = payload.get("result")
-    if not isinstance(result, dict):
-        return False
-    if result.get("task_watch") == "running":
-        return True
-    if result.get("job_watch") == "running":
-        return True
-    status = result.get("status")
-    if isinstance(status, dict):
-        if status.get("task_watch") == "running" or status.get("job_watch") == "running":
-            return True
-    return False
+def _coerce_non_negative_int(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return int(default)
+    return parsed if parsed >= 0 else int(default)
 
 
 @dataclass(frozen=True)
@@ -145,6 +116,7 @@ class AgentWorkerSettings:
     suspend_timeout_seconds: float
     watchdog_interval_seconds: float
     inbox_processing_timeout_seconds: float
+    max_resume_defer_retries: int
     worker_targets: list[str]
 
     @classmethod
@@ -181,6 +153,15 @@ class AgentWorkerSettings:
                 DEFAULT_WORKER_INBOX_PROCESSING_TIMEOUT_SECONDS,
             )
         )
+        max_resume_defer_retries = max(
+            0,
+            int(
+                worker_cfg.get(
+                    "max_resume_defer_retries",
+                    DEFAULT_WORKER_MAX_RESUME_DEFER_RETRIES,
+                )
+            ),
+        )
         raw_targets = worker_cfg.get("worker_targets")
         worker_targets = _normalize_worker_targets(raw_targets)
         if not worker_targets:
@@ -197,6 +178,7 @@ class AgentWorkerSettings:
             suspend_timeout_seconds=suspend_timeout_seconds,
             watchdog_interval_seconds=watchdog_interval_seconds,
             inbox_processing_timeout_seconds=inbox_processing_timeout_seconds,
+            max_resume_defer_retries=max_resume_defer_retries,
             worker_targets=list(dict.fromkeys(worker_targets)),
         )
 
@@ -278,6 +260,7 @@ class AgentWorker(ServiceBase):
         self.inbox_fetch_limit = settings.inbox_fetch_limit
         self.watchdog_interval_seconds = settings.watchdog_interval_seconds
         self.inbox_processing_timeout_seconds = settings.inbox_processing_timeout_seconds
+        self.max_resume_defer_retries = settings.max_resume_defer_retries
         self.worker_targets = settings.worker_targets
         self.observability = observability
 
@@ -286,6 +269,13 @@ class AgentWorker(ServiceBase):
         self.resource_store = self.register_store(self.ctx.stores.resource_store())
         self.execution_store = self.register_store(self.ctx.stores.execution_store())
         self.skill_store = self.register_store(self.ctx.stores.skill_store())
+        self.l0 = L0Engine(
+            nats=self.nats,
+            execution_store=self.execution_store,
+            resource_store=self.resource_store,
+            state_store=self.state_store,
+            cardbox=self.cardbox,
+        )
         self.resource_loader = ResourceLoader(self.cardbox, self.resource_store)
         self.assembler = ContextAssembler()
         self.llm_wrapper = LLMWrapper(LLMService(), mock_chat=mock_chat)
@@ -294,6 +284,7 @@ class AgentWorker(ServiceBase):
             self.nats,
             self.resource_store,
             execution_store=self.execution_store,
+            l0_engine=self.l0,
             timing_tool_dispatch=observability.timing_tool_dispatch,
         )
         self.queue: asyncio.Queue[AgentTurnWorkItem] = asyncio.Queue(maxsize=settings.queue_maxsize)
@@ -304,7 +295,6 @@ class AgentWorker(ServiceBase):
         )
         self._wakeup_tasks: set[asyncio.Task] = set()
         self._wakeup_slots: dict[WakeupKey, WakeupSlot] = {}
-        self._resume_reconcile_lease_owner = f"agent-worker:{id(self)}"
 
         self.react_processor = ReactStepProcessor(
             state_store=self.state_store,
@@ -412,9 +402,10 @@ class AgentWorker(ServiceBase):
             self._wakeup_queue.maxsize,
         )
         for idx in range(self.wakeup_concurrency):
-            task = asyncio.create_task(self._wakeup_worker(idx + 1), name=f"wakeup_worker:{idx + 1}")
-            self._wakeup_tasks.add(task)
-            task.add_done_callback(self._wakeup_tasks.discard)
+            self._spawn_background_task(
+                self._wakeup_worker(idx + 1),
+                name=f"wakeup_worker:{idx + 1}",
+            )
 
     async def _wakeup_worker(self, worker_id: int) -> None:
         logger.info("Wakeup worker %s ready", worker_id)
@@ -465,59 +456,64 @@ class AgentWorker(ServiceBase):
             self._wakeup_slots.pop(key, None)
 
     def _start_watchdog(self) -> None:
-        asyncio.create_task(self._watchdog_loop())
+        self._spawn_background_task(self._watchdog_loop(), name="worker_watchdog")
 
     async def close(self) -> None:
+        wakeup_tasks = list(self._wakeup_tasks)
+        for task in wakeup_tasks:
+            task.cancel()
+        if wakeup_tasks:
+            await asyncio.gather(*wakeup_tasks, return_exceptions=True)
         await super().close()
+
+    def _spawn_background_task(self, coro: Awaitable[Any], *, name: str) -> None:
+        try:
+            task = asyncio.create_task(coro, name=name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to spawn background task %s: %s", name, exc)
+            return
+        self._wakeup_tasks.add(task)
+        task.add_done_callback(self._wakeup_tasks.discard)
 
     async def _enqueue_cmd(
         self,
-        subject: str,
         data: dict,
-        headers: dict,
         *,
+        ingress_ctx: CGContext,
         inbox_id: str | None,
+        inbox_retry_count: int = 0,
         inbox_created_at: datetime | None = None,
         inbox_processed_at: datetime | None = None,
     ):
-        parts = parse_subject(subject)
-        if not parts:
-            logger.warning("Invalid subject: %s", subject)
-            return False
+        raw_data = data if isinstance(data, dict) else {}
+        raw_metadata = raw_data.get("metadata")
+        raw_runtime_config = raw_data.get("runtime_config")
+        task_payload_data = {
+            "profile_box_id": raw_data.get("profile_box_id"),
+            "context_box_id": raw_data.get("context_box_id"),
+            "output_box_id": raw_data.get("output_box_id"),
+            "display_name": raw_data.get("display_name"),
+            "metadata": raw_metadata if isinstance(raw_metadata, dict) else {},
+            "runtime_config": raw_runtime_config if isinstance(raw_runtime_config, dict) else {},
+        }
         try:
-            payload = AgentTaskPayload(**data)
+            payload = AgentTaskPayload(**task_payload_data)
         except Exception as exc:  # noqa: BLE001
             logger.error("Payload decode failed: %s", exc)
             return False
 
-        try:
-            headers, trace_id, _ = normalize_headers(
-                nats=self.nats,
-                headers=headers,
-                trace_id=safe_str(payload, "trace_id"),
-            )
-        except ProtocolViolationError as exc:
-            logger.warning("Reject cmd (protocol_violation): %s", exc)
-            return False
-
         enqueued_at = self._new_enqueued_at()
         item = AgentTurnWorkItem(
-            project_id=parts.project_id,
-            channel_id=parts.channel_id or payload.channel_id,
-            agent_turn_id=payload.agent_turn_id,
-            agent_id=payload.agent_id,
+            ctx=ingress_ctx,
             profile_box_id=safe_str(payload, "profile_box_id"),
             context_box_id=safe_str(payload, "context_box_id"),
             output_box_id=safe_str(payload, "output_box_id"),
-            turn_epoch=payload.turn_epoch,
-            headers=headers,
-            parent_step_id=safe_str(payload, "parent_step_id"),
-            trace_id=trace_id,
             resume_data=None,
             stop_data=None,
             is_continuation=False,
             inbox_id=inbox_id,
             guard_inbox_id=inbox_id,
+            inbox_retry_count=_coerce_non_negative_int(inbox_retry_count),
             enqueued_at=enqueued_at,
             inbox_created_at=inbox_created_at,
             inbox_processed_at=inbox_processed_at,
@@ -529,62 +525,42 @@ class AgentWorker(ServiceBase):
         )
         logger.info(
             "Enqueued turn %s for %s (proj=%s, ch=%s)",
-            item.agent_turn_id,
-            item.agent_id,
-            item.project_id,
-            item.channel_id,
+            ingress_ctx.agent_turn_id,
+            ingress_ctx.agent_id,
+            ingress_ctx.project_id,
+            ingress_ctx.channel_id,
         )
         await self._queue_work_item(item)
         return True
 
     async def _enqueue_resume(
         self,
-        subject: str,
         data: dict,
-        headers: dict,
         *,
+        ingress_ctx: CGContext,
         inbox_id: str | None,
+        inbox_retry_count: int = 0,
         inbox_created_at: datetime | None = None,
         inbox_processed_at: datetime | None = None,
     ):
-        parts = parse_subject(subject)
-        agent_id = data.get("agent_id")
-        agent_turn_id = data.get("agent_turn_id")
-        turn_epoch = data.get("turn_epoch")
-
-        if not parts or not agent_id or not agent_turn_id or turn_epoch is None:
-            logger.warning("Resume missing context: %s %s", subject, data)
-            return False
-
-
         try:
-            headers, trace_id, _ = normalize_headers(
-                nats=self.nats,
-                headers=headers,
-                require_depth=True,
-            )
-        except ProtocolViolationError as exc:
-            logger.warning("Reject resume (protocol_violation): %s", exc)
+            _ = ingress_ctx.require_agent_turn_id
+        except ProtocolViolationError:
+            logger.warning("Resume missing context for inbox payload: %s", data)
             return False
 
         enqueued_at = self._new_enqueued_at()
         item = AgentTurnWorkItem(
-            project_id=parts.project_id,
-            channel_id=parts.channel_id,
-            agent_turn_id=str(agent_turn_id),
-            agent_id=agent_id,
+            ctx=ingress_ctx,
             profile_box_id=None,
             context_box_id=None,
             output_box_id=None,
-            turn_epoch=int(turn_epoch),
-            headers=headers,
-            parent_step_id=None,
-            trace_id=trace_id,
             resume_data=data,
             stop_data=None,
             is_continuation=False,
             inbox_id=inbox_id,
             guard_inbox_id=inbox_id,
+            inbox_retry_count=_coerce_non_negative_int(inbox_retry_count),
             enqueued_at=enqueued_at,
             inbox_created_at=inbox_created_at,
             inbox_processed_at=inbox_processed_at,
@@ -594,57 +570,43 @@ class AgentWorker(ServiceBase):
                 inbox_processed_at=inbox_processed_at,
             ),
         )
-        logger.info("Enqueued RESUME for %s turn=%s epoch=%s", agent_id, item.agent_turn_id, item.turn_epoch)
+        logger.info(
+            "Enqueued RESUME for %s turn=%s epoch=%s",
+            ingress_ctx.agent_id,
+            ingress_ctx.agent_turn_id,
+            ingress_ctx.turn_epoch,
+        )
         await self._queue_work_item(item)
         return True
 
     async def _enqueue_stop(
         self,
-        subject: str,
         data: dict,
-        headers: dict,
         *,
+        ingress_ctx: CGContext,
         inbox_id: str | None,
+        inbox_retry_count: int = 0,
         inbox_created_at: datetime | None = None,
         inbox_processed_at: datetime | None = None,
     ):
-        parts = parse_subject(subject)
-        agent_id = data.get("agent_id")
-        agent_turn_id = data.get("agent_turn_id")
-        turn_epoch = data.get("turn_epoch")
-
-        if not parts or not agent_id or not agent_turn_id or turn_epoch is None:
-            logger.warning("Stop missing context: %s %s", subject, data)
-            return False
-
         try:
-            headers, trace_id, _ = normalize_headers(
-                nats=self.nats,
-                headers=headers,
-                require_depth=True,
-            )
-        except ProtocolViolationError as exc:
-            logger.warning("Reject stop (protocol_violation): %s", exc)
+            _ = ingress_ctx.require_agent_turn_id
+        except ProtocolViolationError:
+            logger.warning("Stop missing context for inbox payload: %s", data)
             return False
 
         enqueued_at = self._new_enqueued_at()
         item = AgentTurnWorkItem(
-            project_id=parts.project_id,
-            channel_id=parts.channel_id,
-            agent_turn_id=str(agent_turn_id),
-            agent_id=agent_id,
+            ctx=ingress_ctx,
             profile_box_id=None,
             context_box_id=None,
             output_box_id=None,
-            turn_epoch=int(turn_epoch),
-            headers=headers,
-            parent_step_id=None,
-            trace_id=trace_id,
             resume_data=None,
             stop_data=data,
             is_continuation=False,
             inbox_id=inbox_id,
             guard_inbox_id=inbox_id,
+            inbox_retry_count=_coerce_non_negative_int(inbox_retry_count),
             enqueued_at=enqueued_at,
             inbox_created_at=inbox_created_at,
             inbox_processed_at=inbox_processed_at,
@@ -656,9 +618,9 @@ class AgentWorker(ServiceBase):
         )
         logger.info(
             "Enqueued STOP for %s turn=%s epoch=%s",
-            agent_id,
-            item.agent_turn_id,
-            item.turn_epoch,
+            ingress_ctx.agent_id,
+            ingress_ctx.agent_turn_id,
+            ingress_ctx.turn_epoch,
         )
         await self._queue_work_item(item)
         return True
@@ -668,9 +630,9 @@ class AgentWorker(ServiceBase):
         if not parts:
             logger.warning("Invalid wakeup subject: %s", subject)
             return
-        agent_id = data.get("agent_id")
+        agent_id = safe_str((headers or {}).get(CG_AGENT_ID))
         if not agent_id:
-            logger.warning("Wakeup missing agent_id: %s", data)
+            logger.warning("Wakeup missing %s header: %s", CG_AGENT_ID, headers)
             return
 
         key = WakeupKey(project_id=str(parts.project_id), agent_id=str(agent_id))
@@ -720,8 +682,12 @@ class AgentWorker(ServiceBase):
                     slot.dirty = True
                 return
 
-            state = await self.state_store.fetch(parts.project_id, agent_id)
-            rows = await self._claim_inbox_rows(parts=parts, agent_id=agent_id, state=state)
+            wakeup_ctx = CGContext(
+                project_id=parts.project_id,
+                agent_id=agent_id,
+                channel_id=parts.channel_id,
+            )
+            rows = await self._claim_inbox_rows(ctx=wakeup_ctx)
             if not rows:
                 return
 
@@ -738,24 +704,13 @@ class AgentWorker(ServiceBase):
                     ctx.inbox_id,
                     ctx.message_type,
                     ctx.row.get("correlation_id"),
-                    ctx.row.get("trace_id"),
-                    ctx.row.get("recursion_depth"),
+                    ctx.ctx.trace_id,
+                    ctx.ctx.recursion_depth,
                     ctx.row.get("created_at"),
                 )
                 new_status, _ = await self._handle_inbox_row(
-                    subject=subject,
-                    message_type=ctx.message_type,
-                    payload=ctx.payload,
-                    parts=parts,
-                    inbox_id=ctx.inbox_id,
-                    agent_id=agent_id,
-                    state=state,
-                    wakeup_headers=ctx.headers,
-                    trace_id=ctx.trace_id,
+                    row_ctx=ctx,
                     leased_turn=False,
-                    recursion_depth=ctx.recursion_depth,
-                    inbox_created_at=ctx.inbox_created_at,
-                    inbox_processed_at=ctx.inbox_processed_at,
                 )
                 return InboxRowResult(status=new_status)
 
@@ -774,14 +729,12 @@ class AgentWorker(ServiceBase):
                 handler=_handle_row,
                 logger=logger,
                 expected_status="processing",
-                require_depth=True,
                 status_update_hook=_status_hook,
             )
 
-    async def _claim_inbox_rows(self, *, parts: Any, agent_id: str, state: Any) -> list:
+    async def _claim_inbox_rows(self, *, ctx: CGContext) -> list:
         rows = await self.execution_store.claim_pending_inbox(
-            project_id=parts.project_id,
-            agent_id=agent_id,
+            ctx=ctx,
             limit=self.inbox_fetch_limit,
         )
         return rows
@@ -789,27 +742,17 @@ class AgentWorker(ServiceBase):
     async def _emit_inbox_progress(
         self,
         *,
-        project_id: str,
-        channel_id: str,
-        agent_id: str,
+        ctx: CGContext,
         inbox_id: Optional[str],
         status: str,
         reason: Optional[str] = None,
     ) -> None:
-        await self.react_processor.notify_inbox_progress(project_id=project_id, agent_id=agent_id)
+        await self.react_processor.notify_inbox_progress(ctx=ctx)
 
-        subject = format_subject(
-            project_id=project_id,
-            channel_id=channel_id or "public",
-            category="evt",
-            component="agent",
-            target=agent_id,
-            suffix="inbox_progress",
-            protocol_version=PROTOCOL_VERSION,
-        )
+        subject = ctx.subject("evt", "agent", ctx.agent_id, "inbox_progress")
         payload: Dict[str, Any] = {
-            "project_id": project_id,
-            "agent_id": agent_id,
+            "project_id": ctx.project_id,
+            "agent_id": ctx.agent_id,
             "status": status,
         }
         if inbox_id:
@@ -822,12 +765,114 @@ class AgentWorker(ServiceBase):
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Inbox progress publish failed proj=%s agent=%s inbox=%s status=%s: %s",
-                project_id,
-                agent_id,
+                ctx.project_id,
+                ctx.agent_id,
                 inbox_id,
                 status,
                 exc,
             )
+
+    async def _schedule_delayed_wakeup(
+        self,
+        *,
+        target_ctx: CGContext,
+        delay_seconds: float,
+    ) -> None:
+        try:
+            resolved_delay = max(0.0, float(delay_seconds or 0.0))
+            if resolved_delay > 0.0:
+                await asyncio.sleep(resolved_delay)
+            await self.l0.wakeup(target_ctx=target_ctx, reason="deferred_wakeup")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Delayed wakeup failed proj=%s agent=%s delay=%s: %s",
+                target_ctx.project_id,
+                target_ctx.agent_id,
+                delay_seconds,
+                exc,
+            )
+
+    async def _finalize_inbox_item(
+        self,
+        *,
+        worker_id: int,
+        item: AgentTurnWorkItem,
+    ) -> None:
+        if not item.inbox_id:
+            return
+
+        final_action = str(item.inbox_finalize_action or "consume")
+        if final_action == "defer" and item.resume_data is not None:
+            current_retry = _coerce_non_negative_int(item.inbox_retry_count, default=0)
+            next_retry = current_retry + 1
+            if next_retry > int(self.max_resume_defer_retries):
+                logger.warning(
+                    "Worker %s resume retry exhausted inbox=%s retry_count=%s max=%s; emit failed tool.result",
+                    worker_id,
+                    item.inbox_id,
+                    next_retry,
+                    self.max_resume_defer_retries,
+                )
+                await self.resume_handler.fail_retry_exhausted(
+                    item,
+                    retry_count=next_retry,
+                    max_retries=int(self.max_resume_defer_retries),
+                )
+                final_action = str(item.inbox_finalize_action or "consume")
+
+        if final_action == "defer":
+            updated = await self.execution_store.defer_inbox_with_backoff(
+                inbox_id=item.inbox_id,
+                project_id=item.ctx.project_id,
+                delay_seconds=float(item.retry_delay_seconds or 0.0),
+                reason=safe_str(item.retry_reason) or "worker_deferred",
+                last_error=safe_str(item.retry_reason),
+                expected_status="processing",
+            )
+            if not updated:
+                logger.warning(
+                    "Worker %s failed to defer inbox id=%s",
+                    worker_id,
+                    item.inbox_id,
+                )
+            else:
+                await self._emit_inbox_progress(
+                    ctx=item.ctx,
+                    inbox_id=item.inbox_id,
+                    status="deferred",
+                    reason=safe_str(item.retry_reason) or "worker_deferred",
+                )
+                self._spawn_background_task(
+                    self._schedule_delayed_wakeup(
+                        target_ctx=item.ctx,
+                        delay_seconds=float(item.retry_delay_seconds or 0.0),
+                    ),
+                    name=f"deferred_wakeup:{safe_str(item.ctx.project_id)}:{safe_str(item.ctx.agent_id)}",
+                )
+            return
+
+        target_status = "error" if final_action == "error" else "consumed"
+        progress_reason = "worker_error" if final_action == "error" else "worker_consumed"
+        updated = await self.execution_store.update_inbox_status(
+            inbox_id=item.inbox_id,
+            project_id=item.ctx.project_id,
+            status=target_status,
+            expected_status="processing",
+        )
+        if not updated:
+            logger.warning(
+                "Worker %s failed to mark %s inbox id=%s",
+                worker_id,
+                target_status,
+                item.inbox_id,
+            )
+            return
+        await self._emit_inbox_progress(
+            ctx=item.ctx,
+            inbox_id=item.inbox_id,
+            status=target_status,
+            reason=progress_reason,
+        )
 
     async def _on_inbox_status_updated(
         self,
@@ -845,10 +890,13 @@ class AgentWorker(ServiceBase):
         if not project_id or not agent_id:
             return
 
-        await self._emit_inbox_progress(
+        progress_ctx = CGContext(
             project_id=project_id,
             channel_id=channel_id or "public",
             agent_id=agent_id,
+        )
+        await self._emit_inbox_progress(
+            ctx=progress_ctx,
             inbox_id=inbox_id,
             status=status,
             reason="inbox_status_update",
@@ -857,53 +905,41 @@ class AgentWorker(ServiceBase):
     async def _handle_inbox_row(
         self,
         *,
-        subject: str,
-        message_type: str,
-        payload: dict,
-        parts: Any,
-        inbox_id: str,
-        agent_id: str,
-        state: Any,
-        wakeup_headers: Dict[str, str],
-        trace_id: Optional[str],
+        row_ctx: InboxRowContext,
         leased_turn: bool,
-        recursion_depth: int,
-        inbox_created_at: datetime | None,
-        inbox_processed_at: datetime | None,
     ) -> tuple[Optional[str], bool]:
+        message_type = row_ctx.message_type
+        payload = row_ctx.payload
+        inbox_id = row_ctx.inbox_id
+        inbox_retry_count = _coerce_non_negative_int((row_ctx.row or {}).get("retry_count"), default=0)
         if message_type == "turn":
             return await self._handle_turn_inbox(
-                subject=subject,
-                payload=payload,
-                parts=parts,
+                payload=dict(payload or {}),
                 inbox_id=inbox_id,
-                agent_id=agent_id,
-                state=state,
-                wakeup_headers=wakeup_headers,
-                trace_id=trace_id,
+                inbox_retry_count=inbox_retry_count,
+                wakeup_ctx=row_ctx.ctx,
                 leased_turn=leased_turn,
-                recursion_depth=recursion_depth,
-                inbox_created_at=inbox_created_at,
-                inbox_processed_at=inbox_processed_at,
+                inbox_created_at=row_ctx.inbox_created_at,
+                inbox_processed_at=row_ctx.inbox_processed_at,
             )
         if message_type in ("tool_result", "timeout"):
             enqueued = await self._enqueue_resume(
-                subject,
                 payload,
-                wakeup_headers,
+                ingress_ctx=row_ctx.ctx,
                 inbox_id=inbox_id,
-                inbox_created_at=inbox_created_at,
-                inbox_processed_at=inbox_processed_at,
+                inbox_retry_count=inbox_retry_count,
+                inbox_created_at=row_ctx.inbox_created_at,
+                inbox_processed_at=row_ctx.inbox_processed_at,
             )
             return (None if enqueued else "error"), leased_turn
         if message_type == "stop":
             enqueued = await self._enqueue_stop(
-                subject,
                 payload,
-                wakeup_headers,
+                ingress_ctx=row_ctx.ctx,
                 inbox_id=inbox_id,
-                inbox_created_at=inbox_created_at,
-                inbox_processed_at=inbox_processed_at,
+                inbox_retry_count=inbox_retry_count,
+                inbox_created_at=row_ctx.inbox_created_at,
+                inbox_processed_at=row_ctx.inbox_processed_at,
             )
             return (None if enqueued else "error"), leased_turn
 
@@ -917,116 +953,52 @@ class AgentWorker(ServiceBase):
     async def _handle_turn_inbox(
         self,
         *,
-        subject: str,
         payload: dict,
-        parts: Any,
         inbox_id: str,
-        agent_id: str,
-        state: Any,
-        wakeup_headers: Dict[str, str],
-        trace_id: Optional[str],
+        inbox_retry_count: int,
+        wakeup_ctx: CGContext,
         leased_turn: bool,
-        recursion_depth: int,
         inbox_created_at: datetime | None,
         inbox_processed_at: datetime | None,
     ) -> tuple[Optional[str], bool]:
-        agent_turn_id = safe_str(payload.get("agent_turn_id"))
+        recursion_depth = int(wakeup_ctx.recursion_depth)
+        agent_turn_id = safe_str(wakeup_ctx.agent_turn_id)
         if not agent_turn_id:
             logger.warning("Wakeup turn missing agent_turn_id inbox_id=%s", inbox_id)
             return "error", leased_turn
 
-        turn_epoch_raw = payload.get("turn_epoch")
-        try:
-            turn_epoch = int(turn_epoch_raw) if turn_epoch_raw is not None else 0
-        except (TypeError, ValueError):
-            turn_epoch = 0
+        turn_epoch = int(wakeup_ctx.turn_epoch or 0)
 
         if turn_epoch <= 0:
             logger.warning(
                 "Wakeup turn missing/invalid turn_epoch inbox_id=%s turn=%s epoch=%s",
                 inbox_id,
                 agent_turn_id,
-                turn_epoch_raw,
+                wakeup_ctx.turn_epoch,
             )
             return "error", leased_turn
 
-        if turn_epoch > 0:
-            try:
-                await self.state_store.update(
-                    project_id=parts.project_id,
-                    agent_id=agent_id,
-                    expect_turn_epoch=turn_epoch,
-                    expect_agent_turn_id=agent_turn_id,
-                    active_recursion_depth=recursion_depth,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Wakeup update active_recursion_depth failed agent=%s turn=%s: %s",
-                    agent_id,
-                    agent_turn_id,
-                    exc,
-                )
+        try:
+            await self.state_store.update(
+                ctx=wakeup_ctx,
+                active_recursion_depth=recursion_depth,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Wakeup update active_recursion_depth failed agent=%s turn=%s: %s",
+                wakeup_ctx.agent_id,
+                agent_turn_id,
+                exc,
+            )
         enqueued = await self._enqueue_cmd(
-            subject,
             payload,
-            wakeup_headers,
+            ingress_ctx=wakeup_ctx,
             inbox_id=inbox_id,
+            inbox_retry_count=inbox_retry_count,
             inbox_created_at=inbox_created_at,
             inbox_processed_at=inbox_processed_at,
         )
         return (None if enqueued else "error"), leased_turn
-
-    async def _enqueue_resume_from_ledger_row(self, *, head: Any, row: Dict[str, Any]) -> None:
-        payload = row.get("payload") or {}
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-        tool_call_id = safe_str(row.get("tool_call_id")) or safe_str(payload.get("tool_call_id"))
-        tool_result_card_id = safe_str(row.get("tool_result_card_id")) or safe_str(
-            payload.get("tool_result_card_id")
-        )
-        if not tool_call_id or not tool_result_card_id:
-            return
-        status = safe_str(payload.get("status"))
-        if status not in TOOL_RESULT_STATUS_SET:
-            status = STATUS_FAILED
-        after_execution = safe_str(payload.get("after_execution"))
-        if after_execution not in ("suspend", "terminate"):
-            after_execution = "suspend"
-        headers, trace_id = self._watchdog_build_headers(
-            trace_id=str(getattr(head, "trace_id", "") or ""),
-            recursion_depth=getattr(head, "active_recursion_depth", 0),
-        )
-        item = AgentTurnWorkItem(
-            project_id=head.project_id,
-            channel_id=head.active_channel_id or "public",
-            agent_turn_id=safe_str(getattr(head, "active_agent_turn_id", None)),
-            agent_id=head.agent_id,
-            profile_box_id=safe_str(head.profile_box_id),
-            context_box_id=safe_str(head.context_box_id),
-            output_box_id=safe_str(head.output_box_id),
-            turn_epoch=int(head.turn_epoch),
-            headers=dict(headers),
-            parent_step_id=safe_str(getattr(head, "parent_step_id", None)),
-            trace_id=trace_id,
-            step_count=0,
-            resume_data={
-                "tool_call_id": tool_call_id,
-                "status": status,
-                "after_execution": after_execution,
-                "tool_result_card_id": tool_result_card_id,
-                "step_id": safe_str(payload.get("step_id")),
-            },
-            is_continuation=True,
-            inbox_id=None,
-            guard_inbox_id=None,
-            enqueued_at=self._new_enqueued_at(),
-        )
-        await self._queue_work_item(item)
 
     async def _enqueue_suspended_reconcile_resumes(
         self,
@@ -1042,25 +1014,18 @@ class AgentWorker(ServiceBase):
             agent_turn_id = safe_str(getattr(head, "active_agent_turn_id", None))
             if not agent_turn_id:
                 continue
-            claimed_ledgers = await self.state_store.claim_turn_resume_ledgers(
-                project_id=head.project_id,
-                agent_id=head.agent_id,
-                agent_turn_id=agent_turn_id,
-                turn_epoch=int(head.turn_epoch),
-                lease_owner=self._resume_reconcile_lease_owner,
-                lease_seconds=max(5.0, self.watchdog_interval_seconds * 2.0),
-                limit=50,
-            )
-            if claimed_ledgers:
-                for ledger_row in claimed_ledgers:
-                    await self._enqueue_resume_from_ledger_row(head=head, row=ledger_row)
+            try:
+                head_turn_ctx = build_state_head_context(head)
+            except ProtocolViolationError as exc:
+                logger.warning(
+                    "Worker reconcile skip invalid state_head context agent=%s turn=%s err=%s",
+                    getattr(head, "agent_id", None),
+                    agent_turn_id,
+                    exc,
+                )
                 continue
-
             wait_rows = await self.state_store.list_turn_waiting_tools(
-                project_id=head.project_id,
-                agent_id=head.agent_id,
-                agent_turn_id=agent_turn_id,
-                turn_epoch=int(head.turn_epoch),
+                ctx=head_turn_ctx,
                 statuses=statuses,
             )
             if not wait_rows:
@@ -1074,117 +1039,72 @@ class AgentWorker(ServiceBase):
             if not tool_call_ids:
                 continue
 
-            try:
-                cards = await self.cardbox.get_cards_by_tool_call_ids(
-                    project_id=head.project_id,
-                    tool_call_ids=tool_call_ids,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Startup reconcile: failed loading tool_result cards agent=%s turn=%s: %s",
-                    head.agent_id,
-                    agent_turn_id,
-                    exc,
-                )
-                continue
-
-            by_call: Dict[str, list[Any]] = {}
-            for card in cards or []:
-                if getattr(card, "type", None) != "tool.result":
-                    continue
-                tcid = safe_str(getattr(card, "tool_call_id", None))
-                if not tcid:
-                    continue
-                by_call.setdefault(tcid, []).append(card)
-            for tcid, card_list in by_call.items():
-                card_list.sort(
-                    key=lambda card: getattr(card, "created_at", datetime.max.replace(tzinfo=UTC))
-                )
-
-            headers, trace_id = self._watchdog_build_headers(
-                trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
-                recursion_depth=head.active_recursion_depth,
-            )
-            parent_step_id = safe_str(getattr(head, "parent_step_id", None))
-
             for row in wait_rows:
                 tool_call_id = safe_str(row.get("tool_call_id"))
                 if not tool_call_id:
                     continue
-                candidates = by_call.get(tool_call_id) or []
-                if not candidates:
-                    continue
-                chosen_card = candidates[0]
-                tool_result_card_id = safe_str(getattr(chosen_card, "card_id", None))
-                if not tool_result_card_id:
-                    continue
-
-                try:
-                    payload = extract_tool_result_payload(chosen_card)
-                except Exception:
-                    payload = {}
-                meta = getattr(chosen_card, "metadata", None)
-                function_name = (
-                    safe_str(meta.get("function_name"))
-                    if isinstance(meta, dict)
-                    else None
+                pending_rows = await self.execution_store.claim_pending_inbox_by_correlation(
+                    ctx=head_turn_ctx,
+                    correlation_id=tool_call_id,
+                    limit=20,
                 )
-                if _is_watch_heartbeat_payload(function_name=function_name, payload=payload):
+                if not pending_rows:
                     continue
-                status = payload.get("status")
-                if status not in TOOL_RESULT_STATUS_SET:
-                    status = STATUS_FAILED
-                after_execution = payload.get("after_execution")
-                if after_execution not in ("suspend", "terminate"):
-                    after_execution = "suspend"
-
-                item = AgentTurnWorkItem(
-                    project_id=head.project_id,
-                    channel_id=head.active_channel_id or "public",
-                    agent_turn_id=agent_turn_id,
-                    agent_id=head.agent_id,
-                    profile_box_id=safe_str(head.profile_box_id),
-                    context_box_id=safe_str(head.context_box_id),
-                    output_box_id=safe_str(head.output_box_id),
-                    turn_epoch=int(head.turn_epoch),
-                    headers=dict(headers),
-                    parent_step_id=parent_step_id,
-                    trace_id=trace_id,
-                    step_count=0,
-                    resume_data={
-                        "tool_call_id": tool_call_id,
-                        "status": status,
-                        "after_execution": after_execution,
-                        "tool_result_card_id": tool_result_card_id,
-                        "step_id": safe_str(row.get("step_id")),
-                    },
-                    is_continuation=True,
-                    inbox_id=None,
-                    guard_inbox_id=None,
-                    enqueued_at=self._new_enqueued_at(),
-                )
-                await self.state_store.record_turn_resume_ledger(
-                    project_id=head.project_id,
-                    agent_id=head.agent_id,
-                    agent_turn_id=agent_turn_id,
-                    turn_epoch=int(head.turn_epoch),
-                    tool_call_id=tool_call_id,
-                    tool_result_card_id=tool_result_card_id,
-                    payload=item.resume_data or {},
-                )
-                await self._queue_work_item(item)
+                for pending_row in pending_rows:
+                    inbox_id = safe_str(pending_row.get("inbox_id"))
+                    message_type = safe_str(pending_row.get("message_type"))
+                    payload = pending_row.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    if message_type not in ("tool_result", "timeout"):
+                        await self.execution_store.update_inbox_status(
+                            inbox_id=inbox_id,
+                            project_id=head.project_id,
+                            status="error",
+                            expected_status="processing",
+                        )
+                        continue
+                    try:
+                        ingress_ctx, safe_payload = build_replay_context(
+                            raw_payload=payload,
+                            db_row=pending_row,
+                        )
+                    except ProtocolViolationError as exc:
+                        logger.warning(
+                            "Watchdog reconcile invalid inbox context id=%s: %s",
+                            inbox_id,
+                            exc,
+                        )
+                        await self.execution_store.update_inbox_status(
+                            inbox_id=inbox_id,
+                            project_id=head.project_id,
+                            status="error",
+                            expected_status="processing",
+                        )
+                        continue
+                    enqueued = await self._enqueue_resume(
+                        safe_payload,
+                        ingress_ctx=ingress_ctx,
+                        inbox_id=inbox_id,
+                        inbox_retry_count=_coerce_non_negative_int(pending_row.get("retry_count"), default=0),
+                        inbox_created_at=pending_row.get("created_at"),
+                        inbox_processed_at=pending_row.get("processed_at"),
+                    )
+                    if not enqueued:
+                        await self.execution_store.update_inbox_status(
+                            inbox_id=inbox_id,
+                            project_id=head.project_id,
+                            status="error",
+                            expected_status="processing",
+                        )
 
     async def _watchdog_loop(self) -> None:
         logger.info("Worker watchdog started interval=%ss", self.watchdog_interval_seconds)
         while True:
             try:
                 await self._requeue_stale_inbox()
-                requeued_ledgers = await self.state_store.requeue_expired_resume_ledgers(
-                    limit=500,
-                )
-                if requeued_ledgers:
-                    logger.info("Requeued %s expired resume ledger leases", requeued_ledgers)
-                await self._enqueue_suspended_reconcile_resumes(limit=200, include_received=False)
+                await self._wakeup_due_deferred_inbox(limit=200)
+                await self._enqueue_suspended_reconcile_resumes(limit=200, include_received=True)
                 await self._inject_timeout_reports()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Worker watchdog tick failed: %s", exc, exc_info=True)
@@ -1203,6 +1123,38 @@ class AgentWorker(ServiceBase):
                 self.inbox_processing_timeout_seconds,
             )
 
+    async def _wakeup_due_deferred_inbox(self, *, limit: int = 200) -> None:
+        rows = await self.execution_store.list_due_deferred_inbox_targets(limit=limit)
+        if not rows:
+            return
+        woke = 0
+        for row in rows:
+            project_id = safe_str(row.get("project_id"))
+            agent_id = safe_str(row.get("agent_id"))
+            if not project_id or not agent_id:
+                continue
+            channel_id = safe_str(row.get("channel_id")) or "public"
+            try:
+                await self.l0.wakeup(
+                    target_ctx=CGContext(
+                        project_id=project_id,
+                        channel_id=channel_id,
+                        agent_id=agent_id,
+                    ),
+                    reason="watchdog_due_deferred",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Worker watchdog failed deferred wakeup proj=%s agent=%s: %s",
+                    project_id,
+                    agent_id,
+                    exc,
+                )
+                continue
+            woke += 1
+        if woke:
+            logger.info("Worker watchdog woke deferred inbox targets=%s", woke)
+
     async def _watchdog_load_tool_call_card(self, *, project_id: str, tool_call_id: str) -> Optional[Any]:
         try:
             cards = await self.cardbox.get_cards_by_tool_call_ids(
@@ -1220,29 +1172,38 @@ class AgentWorker(ServiceBase):
         after_exec = "suspend"
         try:
             tool_def = await self.resource_store.fetch_tool_definition(project_id, tool_name)
-            after_exec_val = tool_def.get("after_execution") if tool_def else None
-            if after_exec_val in ("suspend", "terminate"):
-                after_exec = after_exec_val
+            after_exec_val = safe_str(tool_def.get("after_execution")) if isinstance(tool_def, dict) else ""
+            if after_exec_val not in ("suspend", "terminate"):
+                logger.warning(
+                    "Worker watchdog: invalid after_execution for timeout report tool=%s value=%s",
+                    tool_name,
+                    after_exec_val or "<empty>",
+                )
+                return after_exec
+            return after_exec_val
         except Exception as exc:  # noqa: BLE001
             logger.warning("Worker watchdog: load tool definition failed: %s", exc)
-        return after_exec
+            return after_exec
 
     def _watchdog_build_headers(
         self, *, trace_id: Optional[str], recursion_depth: Any
-    ) -> tuple[Dict[str, str], Optional[str]]:
-        headers: Dict[str, str] = {}
-        resolved_trace_id: Optional[str] = None
+    ) -> Optional[tuple[Dict[str, str], Optional[str]]]:
+        base_ctx = CGContext(project_id="sys.worker", channel_id="public", agent_id="worker.watchdog")
         try:
-            headers, _, resolved_trace_id = ensure_trace_headers(headers, trace_id=trace_id)
+            default_depth = max(0, int(recursion_depth or 0))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Worker watchdog: invalid recursion_depth=%r err=%s", recursion_depth, exc)
+            return None
+        try:
+            normalized_ctx = base_ctx.with_trace_transport(
+                base_headers={},
+                trace_id=trace_id,
+                default_depth=default_depth,
+            )
         except ProtocolViolationError as exc:
             logger.warning("Worker watchdog: invalid trace_id: %s", exc)
-            headers, _, resolved_trace_id = ensure_trace_headers(headers)
-        try:
-            headers = ensure_recursion_depth(headers, default_depth=recursion_depth)
-        except ProtocolViolationError as exc:
-            logger.warning("Worker watchdog: defaulted recursion depth: %s", exc)
-            headers[RECURSION_DEPTH_HEADER] = str(recursion_depth)
-        return headers, resolved_trace_id
+            return None
+        return dict(normalized_ctx.headers or {}), normalized_ctx.trace_id
 
     async def _inject_timeout_reports(self) -> None:
         rows = await self.state_store.list_timed_out_waiting_tools(limit=200)
@@ -1277,35 +1238,45 @@ class AgentWorker(ServiceBase):
             content = getattr(tool_call_card, "content", None)
             if content is not None:
                 tool_name = getattr(content, "tool_name", None)
-            tool_name = str(tool_name) if tool_name else "unknown"
+            tool_name = safe_str(tool_name)
+            if not tool_name:
+                logger.warning(
+                    "Worker watchdog: tool.call missing tool_name tool_call_id=%s agent=%s",
+                    tool_call_id,
+                    agent_id,
+                )
+                continue
             after_exec = await self._watchdog_resolve_after_execution(
                 project_id=project_id,
                 tool_name=tool_name,
             )
 
             cmd_data = {
-                "tool_call_id": tool_call_id,
-                "agent_turn_id": agent_turn_id,
-                "turn_epoch": turn_epoch,
-                "agent_id": agent_id,
                 "after_execution": after_exec,
                 "tool_name": tool_name,
             }
             tool_call_meta = dict(getattr(tool_call_card, "metadata", {}) or {})
-            trace_id_value = safe_str(row.get("trace_id"))
-            parent_step_id = safe_str(row.get("parent_step_id"))
-            step_id = safe_str(row.get("step_id"))
-            if trace_id_value and not tool_call_meta.get("trace_id"):
-                tool_call_meta["trace_id"] = trace_id_value
-            if parent_step_id and not tool_call_meta.get("parent_step_id"):
-                tool_call_meta["parent_step_id"] = parent_step_id
-            if step_id and not tool_call_meta.get("step_id"):
-                tool_call_meta["step_id"] = step_id
-
-            result_context = ToolResultContext.from_cmd_data(
+            resolved_step_id = safe_str(tool_call_meta.get("step_id")) or safe_str(row.get("step_id"))
+            resolved_parent_step_id = safe_str(tool_call_meta.get("parent_step_id")) or safe_str(
+                row.get("parent_step_id")
+            )
+            trace_id_value = safe_str(row.get("trace_id")) or safe_str(tool_call_meta.get("trace_id"))
+            base_turn_ctx = CGContext(
                 project_id=project_id,
+                channel_id=channel_id,
+                agent_id=agent_id,
+                agent_turn_id=agent_turn_id,
+                turn_epoch=int(turn_epoch),
+            )
+            result_cg_ctx = base_turn_ctx.evolve(
+                step_id=resolved_step_id,
+                tool_call_id=tool_call_id,
+                trace_id=trace_id_value,
+                parent_step_id=resolved_parent_step_id,
+            )
+            result_context = ToolResultContext(
+                ctx=result_cg_ctx,
                 cmd_data=cmd_data,
-                tool_call_meta=tool_call_meta,
             )
             payload, result_card = ToolResultBuilder(
                 result_context,
@@ -1323,67 +1294,82 @@ class AgentWorker(ServiceBase):
             )
             await self.cardbox.save_card(result_card)
 
-            headers, trace_id = self._watchdog_build_headers(
+            headers_result = self._watchdog_build_headers(
                 trace_id=trace_id_value or None,
                 recursion_depth=row.get("active_recursion_depth"),
             )
+            if headers_result is None:
+                logger.warning(
+                    "Worker watchdog: skip timeout injection due to invalid transport context "
+                    "project=%s agent=%s turn=%s tool_call_id=%s",
+                    project_id,
+                    agent_id,
+                    agent_turn_id,
+                    tool_call_id,
+                )
+                continue
+            headers, trace_id = headers_result
+            watchdog_source_ctx = result_cg_ctx.evolve(
+                agent_id="sys.agent_worker.watchdog",
+                agent_turn_id="",
+                step_id=None,
+                tool_call_id=None,
+                parent_agent_id=None,
+                parent_agent_turn_id=None,
+                parent_step_id=resolved_step_id,
+            ).with_trace_transport(
+                base_headers=headers,
+                trace_id=trace_id,
+                default_depth=int(base_turn_ctx.recursion_depth),
+            )
             async with self.execution_store.pool.connection() as conn:
                 async with conn.transaction():
-                    report_result = await report_primitive(
-                        store=self.execution_store,
-                        project_id=project_id,
-                        channel_id=channel_id,
-                        target_agent_id=agent_id,
-                        message_type="timeout",
-                        payload=payload,
-                        correlation_id=tool_call_id,
-                        headers=headers,
-                        traceparent=headers.get("traceparent"),
-                        tracestate=headers.get("tracestate"),
-                        trace_id=trace_id,
-                        parent_step_id=tool_call_meta.get("step_id"),
-                        source_agent_id="worker.watchdog",
+                    report_result = await self.l0.report_intent(
+                        source_ctx=watchdog_source_ctx,
+                        intent=ReportIntent(
+                            target=TurnRef(
+                                project_id=project_id,
+                                agent_id=agent_id,
+                                agent_turn_id=agent_turn_id,
+                                expected_turn_epoch=turn_epoch,
+                            ),
+                            message_type="timeout",
+                            payload=payload,
+                            correlation_id=tool_call_id,
+                        ),
                         conn=conn,
+                        wakeup=True,
                     )
-            headers = dict(headers)
-            headers["traceparent"] = report_result.traceparent
-
-            target = await resolve_agent_target(
-                resource_store=self.resource_store,
-                project_id=project_id,
-                agent_id=agent_id,
-            )
-            if not target:
+            if report_result.status != "accepted":
                 logger.warning(
-                    "Worker watchdog: missing worker_target agent=%s turn=%s",
+                    "Worker watchdog: timeout report rejected status=%s code=%s agent=%s turn=%s",
+                    report_result.status,
+                    report_result.error_code,
                     agent_id,
                     agent_turn_id,
                 )
                 continue
-            wakeup_subject = format_subject(
-                project_id,
-                channel_id,
-                "cmd",
-                "agent",
-                target,
-                "wakeup",
-            )
-            await self.nats.publish_event(
-                wakeup_subject,
-                {"agent_id": agent_id, "agent_turn_id": agent_turn_id},
-                headers=headers,
-                retry_count=3,
-                retry_delay=1.0,
+            wakeup_signals = list(report_result.wakeup_signals or ())
+            if wakeup_signals:
+                await self.l0.publish_wakeup_signals(wakeup_signals)
+            wakeup_ctx = (
+                wakeup_signals[0].target_ctx
+                if wakeup_signals
+                else base_turn_ctx.with_trace_transport(
+                    base_headers=headers,
+                    trace_id=safe_str(report_result.payload.get("trace_id")) or trace_id,
+                    default_depth=int(base_turn_ctx.recursion_depth),
+                )
             )
 
             head_key = (project_id, agent_id, agent_turn_id, turn_epoch)
             if head_key in cleared_heads:
                 continue
+            clear_ctx = base_turn_ctx.with_transport(
+                headers=wakeup_ctx.to_nats_headers(include_topology=False),
+            )
             updated = await self.state_store.update(
-                project_id=project_id,
-                agent_id=agent_id,
-                expect_turn_epoch=turn_epoch,
-                expect_agent_turn_id=agent_turn_id,
+                ctx=clear_ctx,
                 expect_status="suspended",
                 resume_deadline=None,
             )
@@ -1446,7 +1432,7 @@ class AgentWorker(ServiceBase):
                     kind = "stop"
                 await self._handle_work_item(
                     item=item,
-                    headers=item.headers,
+                    headers=item.ctx.headers,
                     worker_id=worker_id,
                     kind=kind,
                     queue_wait_ms=queue_wait_ms,
@@ -1457,27 +1443,7 @@ class AgentWorker(ServiceBase):
                 logger.error("Worker %s error processing item: %s", worker_id, exc, exc_info=True)
             finally:
                 if handled_ok and item.inbox_id:
-                    updated = await self.execution_store.update_inbox_status(
-                        inbox_id=item.inbox_id,
-                        project_id=item.project_id,
-                        status="consumed",
-                        expected_status="processing",
-                    )
-                    if not updated:
-                        logger.warning(
-                            "Worker %s failed to consume inbox id=%s",
-                            worker_id,
-                            item.inbox_id,
-                        )
-                    else:
-                        await self._emit_inbox_progress(
-                            project_id=item.project_id,
-                            channel_id=item.channel_id,
-                            agent_id=item.agent_id,
-                            inbox_id=item.inbox_id,
-                            status="consumed",
-                            reason="worker_consumed",
-                        )
+                    await self._finalize_inbox_item(worker_id=worker_id, item=item)
                 self.queue.task_done()
 
     @traced(
@@ -1487,7 +1453,6 @@ class AgentWorker(ServiceBase):
         include_links=True,
         record_exception=True,
         set_status_on_exception=True,
-        attributes_getter=_worker_item_span_attrs,
     )
     async def _handle_work_item(
         self,
@@ -1499,13 +1464,14 @@ class AgentWorker(ServiceBase):
         queue_wait_ms: Optional[float],
         inbox_age_ms: Optional[float],
     ) -> None:
+        _ = headers
         if self.observability.timing_worker_logs:
             logger.info(
                 "Worker %s processing %s agent=%s turn=%s queue_wait_ms=%s inbox_age_ms=%s inbox_id=%s",
                 worker_id,
                 kind,
-                item.agent_id,
-                item.agent_turn_id,
+                item.ctx.agent_id,
+                item.ctx.agent_turn_id,
                 queue_wait_ms,
                 inbox_age_ms,
                 item.inbox_id,
@@ -1515,8 +1481,8 @@ class AgentWorker(ServiceBase):
                 "Worker %s processing %s agent=%s turn=%s",
                 worker_id,
                 kind,
-                item.agent_id,
-                item.agent_turn_id,
+                item.ctx.agent_id,
+                item.ctx.agent_turn_id,
             )
 
         if item.resume_data is not None:

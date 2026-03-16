@@ -3,14 +3,13 @@
 > *"Unstructured intelligence is just entropy."*
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![NATS](https://img.shields.io/badge/NATS-JetStream-27AAE1.svg)](https://nats.io/)
 [![Postgres](https://img.shields.io/badge/Postgres-CardBox-336791.svg)](https://postgresql.org/)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-7289DA.svg)](https://discord.com/invite/intelligentinternet)
-
 [中文](README_CN.md) | [English](README.md)
 
-![Common Ground Title Image](docs/cg.png)
+<img width="2400" height="875" alt="image" src="https://github.com/user-attachments/assets/c74333ad-7b4e-49e6-8867-3d0e0c4790a7" />
 
 Modern Agent frameworks often rely on rigid static heuristics, lack state tracking and system resilience, and can easily collapse under complex multi-agent delegation scenarios ("Coordination Collapse").
 
@@ -50,17 +49,16 @@ CGC is not a single-machine Python library. It is a protocol-first OS kernel tha
 
 ---
 
-## ⚠️ Preview Limitations
+## ⚠️ V1R4 Release Scope and Current Limitations
 
-CGC has a broad vision, but Rome is not built in a day. This release is a **Preview Release**, with a current focus on validating the most fundamental **OS kernel** and underlying physical protocol.
+`V1R4` is the final stabilized release of the `v1` line. It is publishable and release-ready, but it is intentionally not the final shape of the future `v2` runtime model.
 
 Please note the following limitations before use:
 
 > ⚠️ **Security Warning:** This project is in Preview mode. The API (8099) and NATS (4222/8222/8080) endpoints are unauthenticated and include arbitrary command execution (RCE) capabilities (including sandbox and Skills). Never expose them to public networks (e.g., binding to `0.0.0.0`) in production.
 
-1. **Kernel-First, Lean Components**: The current version only provides a basic Generic Worker and a small set of core demo tools, with primary focus on kernel constraints and basic agent organization patterns.
-2. **Protocol in Fast Iteration (`v1r3`)**: Subject naming and payload protocols are currently at `v1r3` and may still have breaking changes before stable `v2`.
-   * *(No worries: a coding agent can help you migrate your business quickly.)*
+1. **`V1R4` is the stable final target for `v1`**: The current protocol target is `v1r4`. Further larger runtime-model changes are deferred to `v2`, not expected as more `v1` preview cuts.
+2. **Kernel-First, Lean Components**: The current release still centers on the kernel, Generic Worker, PMO orchestration, and a small set of core demo tools.
 3. **No ACL in This Release**: For local developer convenience, all APIs and NATS interfaces are fully public. Do not expose this directly to public networks.
 4. **Sandbox and Skill System (Experimental)**: The platform includes built-in support for E2B/SRT code execution sandboxes and the skill system, but this is still experimental.
 5. **Observability (Experimental)**: Topology observability and organizational context management are still being iterated and remain experimental.
@@ -70,6 +68,11 @@ Please note the following limitations before use:
 ## Getting Started
 
 Run your multi-agent OS kernel locally in under 5 minutes.
+
+Before starting, it is recommended to read:
+
+- [`docs/EN/05_operations/v1r4_release_notes.md`](docs/EN/05_operations/v1r4_release_notes.md)
+- [`docs/EN/05_operations/migration_v1r3_to_v1r4.md`](docs/EN/05_operations/migration_v1r3_to_v1r4.md) if you are upgrading an older `v1r3` deployment
 
 ### 1. Prepare Your Environment
 *   Docker & Docker Compose
@@ -98,6 +101,8 @@ export GEMINI_API_KEY="your_key"
 # export MOONSHOT_API_KEY="..."
 docker compose up -d --build
 ```
+
+> Note: Compose services use project-local virtualenv at `.venv.docker` (`UV_PROJECT_ENVIRONMENT=/app/.venv.docker`).
 
 This command automatically starts and initializes:
 `nats`, `postgres`, `db-init`, `api`, `pmo`, `agent-worker`, `mock-search`.
@@ -187,7 +192,7 @@ The docs are organized by **developer cognition depth**. See [`docs/EN/README.md
 | **🧩 CardBox Reference** | [CG-Cardbox Repository](https://github.com/Intelligent-Internet/CG-Cardbox) | Storage layer contributors |
 | **⚙️ Kernel Implementation** | [Worker Core Loop](docs/EN/03_kernel_l1/agent_worker.md) \| [Batch Orchestration Engine](docs/EN/03_kernel_l1/batch_manager.md) | System developers |
 | **🔬 Physical Protocol** | [State Machine Contracts](docs/EN/04_protocol_l0/state_machine.md) \| [NATS Specification](docs/EN/04_protocol_l0/nats_protocol.md) | Protocol designers, on-call responders |
-| **📈 Operations & Observability** | [Performance Tuning](docs/EN/05_operations/performance_tuning.md) \| [OTel Tracing](docs/EN/05_operations/observability.md) | SRE, operations, observability |
+| **📈 Operations & Observability** | [V1R4 Release Notes](docs/EN/05_operations/v1r4_release_notes.md) \| [Migration Guide](docs/EN/05_operations/migration_v1r3_to_v1r4.md) \| [OTel Tracing](docs/EN/05_operations/observability.md) | SRE, operations, observability |
 
 ---
 

@@ -1,15 +1,17 @@
 # State Machine and Lifecycle
 
 This is the L0 authoritative definition, describing the AgentTurn state machine, atomic I/O ordering, delivery contract, and Inbox/Wakeup constraints.
-For the complete Agent/PMO I/O contract, see `agent_pmo_protocol.md`.
+For the complete L1 implementation contracts, see `../03_kernel_l1/agent_worker.md` and `../03_kernel_l1/pmo_orchestration.md`.
 
 > Topology concepts and patterns are in `01_getting_started/architecture_intro.md`; implementation and behavior are governed by this L0 protocol.
+> Historical migration note: runtime dependency on `turn_resume_ledger` was removed during the `v1r3 -> v1r4` hard cut. Resume now runs only on `state.agent_inbox` (`deferred/retry_count/next_retry_at`). This warning matters for historical upgrades, not for fresh `V1R4` deployments.
 
 ## 1. Core invariants
 - Concurrent execution for the same `agent_id` is forbidden (single active Turn).
 - All state updates must be protected by the `turn_epoch + active_agent_turn_id` gating.
 - Terminal states must contain `task.deliverable`, and include `deliverable_card_id` in `evt.agent.*.task`.
 - **Inbox is the execution-side source of truth**: execution requests/receipts must be written to `state.agent_inbox`; NATS is used only for wakeup.
+- **Single-track resume**: retries/replay for `tool_result/timeout` run only through `state.agent_inbox` (`pending/deferred`), without runtime dependency on `turn_resume_ledger`.
 - **One Enqueue equals one Turn**: each Enqueue is bound by L0 to an independent `agent_turn_id/turn_epoch` and performs one delivery (`turn_epoch` can be created during queued→pending dispatch stage).
 - **Each Turn emits exactly one `evt.agent.*.task`**.
 - **Wakeup header is only a doorbell**: semantic fields follow the inbox records, and the header is not the authoritative audit source.
@@ -50,7 +52,7 @@ State fields:
 - `join` (`primitive="join"`, `edge_phase="request|response"`): records join-semantic subtask collaboration.
 
 ### 3.2 Wakeup + Claim (Worker)
-- After receiving wakeup, **claim pending inbox** first (`FOR UPDATE SKIP LOCKED`, ordered by `created_at ASC`).
+- After receiving wakeup, **claim due inbox** first (`status in (pending,deferred)` and `next_retry_at<=now()`, `FOR UPDATE SKIP LOCKED`, ordered by `next_retry_at, created_at ASC`).
 - State updates use **CAS gating** (`turn_epoch + active_agent_turn_id`) and do not rely on state row locks.
 - Worker must not create `agent_turn_id/turn_epoch` itself; missing or illegal inbox is a protocol error and should be rejected.
 - `status=idle`: L0 generates/takes over `agent_turn_id` at enqueue/lease time and increments `turn_epoch`, writes `trace_id/parent_step_id`, and sets `status=dispatched`.
@@ -62,7 +64,7 @@ State fields:
 
 ### 3.3 Tool Call (Worker)
 - Write `tool.call` card.
-- Publish `cmd.tool.*` or `cmd.sys.pmo.internal.*`.
+- Call `L0Engine.command_intent` to create command signals (transactionally write `execution_edges(primitive=tool_call,edge_phase=request)`, then publish `cmd.tool.*` or `cmd.sys.pmo.internal.*` after commit).
 - If `after_execution=suspend`:
   - set `waiting_tool_count`, record `resume_deadline`.
   - write/update `turn_waiting_tools` (`tool_call_id` and `step_id`) as the resume set.
@@ -77,6 +79,7 @@ State fields:
   - `resume_handler` validates `state= suspended` and that `tool_call_id` exists in current `turn_waiting_tools`.
   - receiving corresponding waiting item updates state; if pending items remain, keep `suspended` (preserve or refresh `resume_deadline`), otherwise transition to `running` or `idle` based on `after_execution`.
   - `expecting_correlation_id` is generally not involved in primary flow matching.
+  - Retryable failures are written back as inbox `deferred` with `retry_count/next_retry_at/defer_reason`, and are reclaimed by later wakeup/watchdog cycles.
 
 ### 3.5 Deliver (Worker)
 - Write `task.deliverable`.
@@ -87,6 +90,7 @@ State fields:
 - If `status=suspended` and `NOW() > resume_deadline`:
   - the **Worker Watchdog** discovers timeout items via `turn_waiting_tools`, constructs a Report with `message_type=timeout` (`correlation_id` = timed-out `tool_call_id`), and writes to `state.agent_inbox`.
   - synchronize cleanup/recording of `resume_deadline`, wake worker; the resume flow then continues processing.
+  - reconcile claims due `agent_inbox` rows by `turn_waiting_tools.tool_call_id` correlation, without passing through a resume-ledger relay.
 > For a more complete fallback and timeout mechanism, see `04_protocol_l0/watchdog_safety_net.md`.
 
 ## 4. Delivery Contract (L0)

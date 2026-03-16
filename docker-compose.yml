@@ -1,3 +1,25 @@
+x-app-env: &app_env
+  PYTHONPATH: /app
+  CG_CONFIG_TOML: /app/config.toml
+  PROJECT_ID: ${PROJECT_ID:-proj_mvp_001}
+  UV_PROJECT_ENVIRONMENT: /app/.venv.docker
+  ZAI_API_KEY: ${ZAI_API_KEY:-}
+  MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+  MINIMAX_API_BASE: ${MINIMAX_API_BASE:-}
+  MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
+  MOONSHOT_API_BASE: ${MOONSHOT_API_BASE:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  GOOGLE_API_KEY: ${GOOGLE_API_KEY:-${GEMINI_API_KEY:-}}
+  CG__observability__otel__enabled: ${CG__observability__otel__enabled:-true}
+  CG__observability__otel__otlp_endpoint: ${CG__observability__otel__otlp_endpoint:-http://otel-collector:4318/v1/traces}
+  CG__observability__otel__sampler_ratio: ${CG__observability__otel__sampler_ratio:-1.0}
+  CG__observability__timing__enabled: ${CG__observability__timing__enabled:-true}
+  OTEL_PROPAGATORS: ${OTEL_PROPAGATORS:-tracecontext,baggage}
+
 x-app-base: &app_base
   build: .
   working_dir: /app
@@ -5,26 +27,7 @@ x-app-base: &app_base
     - .:/app
     - ./config.docker.toml:/app/config.toml:ro
   environment:
-    PYTHONPATH: /app
-    CG_CONFIG_TOML: /app/config.toml
-    PROJECT_ID: ${PROJECT_ID:-proj_mvp_001}
-    UV_PROJECT_ENVIRONMENT: /tmp/.venv
-    ZAI_API_KEY: ${ZAI_API_KEY:-}
-    MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
-    MINIMAX_API_BASE: ${MINIMAX_API_BASE:-}
-    MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
-    MOONSHOT_API_BASE: ${MOONSHOT_API_BASE:-}
-    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-    ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
-    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-    OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
-    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-    GOOGLE_API_KEY: ${GOOGLE_API_KEY:-${GEMINI_API_KEY:-}}
-    CG__observability__otel__enabled: ${CG__observability__otel__enabled:-true}
-    CG__observability__otel__otlp_endpoint: ${CG__observability__otel__otlp_endpoint:-http://otel-collector:4318/v1/traces}
-    CG__observability__otel__sampler_ratio: ${CG__observability__otel__sampler_ratio:-1.0}
-    CG__observability__timing__enabled: ${CG__observability__timing__enabled:-true}
-    OTEL_PROPAGATORS: ${OTEL_PROPAGATORS:-tracecontext,baggage}
+    <<: *app_env
   restart: unless-stopped
 
 services:
@@ -97,9 +100,7 @@ services:
   api:
     <<: *app_base
     environment:
-      PYTHONPATH: /app
-      CG_CONFIG_TOML: /app/config.toml
-      PROJECT_ID: ${PROJECT_ID:-proj_mvp_001}
+      <<: *app_env
       CG_ENABLE_GOD_API: ${CG_ENABLE_GOD_API:-1}
     depends_on:
       otel-collector:
@@ -111,7 +112,7 @@ services:
       db-init:
         condition: service_completed_successfully
     ports:
-      - "127.0.0.1:8099:8099"
+      - "127.0.0.1:${CG_API_HOST_PORT:-8099}:8099"
     command: sh -lc "uv sync && uv run -m services.api"
 
   pmo:
@@ -140,12 +141,23 @@ services:
         condition: service_completed_successfully
     command: sh -lc "uv sync && uv run -m services.agent_worker.loop"
 
+  ui-worker:
+    <<: *app_base
+    depends_on:
+      otel-collector:
+        condition: service_started
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    command: sh -lc "uv sync && uv run -m services.ui_worker.loop"
+
   mock-search:
     <<: *app_base
     environment:
-      PYTHONPATH: /app
-      CG_CONFIG_TOML: /app/config.toml
-      PROJECT_ID: ${PROJECT_ID:-proj_mvp_001}
+      <<: *app_env
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       MOCK_SEARCH_USE_LLM: ${MOCK_SEARCH_USE_LLM:-1}
       MOCK_SEARCH_LLM_PROVIDER: ${MOCK_SEARCH_LLM_PROVIDER:-gemini}
@@ -160,6 +172,19 @@ services:
       db-init:
         condition: service_completed_successfully
     command: sh -lc "uv sync && uv run -m services.tools.mock_search"
+
+  word-count:
+    <<: *app_base
+    depends_on:
+      otel-collector:
+        condition: service_started
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    command: sh -lc "uv sync && uv run -m services.tools.word_count"
 
 volumes:
   nats-data:

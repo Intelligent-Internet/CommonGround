@@ -3,6 +3,7 @@ from typing import Optional, List, Dict, Any
 
 from psycopg_pool import AsyncConnectionPool
 
+from core.cg_context import CGContext
 from core.resource_models import ProjectAgent, ToolDefinition
 from .base import BaseStore
 
@@ -22,8 +23,7 @@ class ResourceStore(BaseStore):
 
     async def fetch_roster(
         self,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         *,
         conn: Any = None,
     ) -> Optional[Dict[str, Any]]:
@@ -40,12 +40,12 @@ class ResourceStore(BaseStore):
             FROM resource.project_agents
             WHERE project_id=%s AND agent_id=%s
             """,
-            (project_id, agent_id),
+            (ctx.project_id, ctx.agent_id),
             conn=conn,
         )
 
-    async def fetch_roster_model(self, project_id: str, agent_id: str) -> Optional[ProjectAgent]:
-        row = await self.fetch_roster(project_id, agent_id)
+    async def fetch_roster_model(self, ctx: CGContext) -> Optional[ProjectAgent]:
+        row = await self.fetch_roster(ctx)
         if not row:
             return None
         return ProjectAgent.model_validate(row)
@@ -189,8 +189,7 @@ class ResourceStore(BaseStore):
     async def upsert_project_agent(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         profile_box_id: str,
         worker_target: str,
         tags: List[str],
@@ -217,8 +216,8 @@ class ResourceStore(BaseStore):
             await conn.execute(
                 sql,
                 (
-                    project_id,
-                    agent_id,
+                    ctx.project_id,
+                    ctx.agent_id,
                     profile_box_id,
                     worker_target,
                     json.dumps(tags or []),
@@ -232,8 +231,8 @@ class ResourceStore(BaseStore):
             await own_conn.execute(
                 sql,
                 (
-                    project_id,
-                    agent_id,
+                    ctx.project_id,
+                    ctx.agent_id,
                     profile_box_id,
                     worker_target,
                     json.dumps(tags or []),

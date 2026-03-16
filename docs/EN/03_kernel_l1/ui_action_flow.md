@@ -2,6 +2,8 @@
 
 This document describes the internal processing flow of `cmd.sys.ui.action` as a reference for implementing the UI entry path and LLM reply pipeline. This flow is an **L1 implementation detail**; for external protocol behavior, refer to the L0 documentation.
 
+This flow is part of the validated `V1R4` release path: `UI Worker -> delegate_async -> PMO -> target worker -> tool_result -> UI ack`.
+
 ---
 
 ## 0) UI startup: Register UI Agent (precondition)
@@ -77,7 +79,7 @@ The target agent handles `turn` on its wakeup:
 
 PMO does not publish UI action ACK state directly. Instead:
 - `_reply_resume` first builds a `tool.result` card (contains `result/error/status/after_execution`).
-- `publish_tool_result_report` performs `L0.report(message_type="tool_result")` and writes to the target UI agent inbox.
+- `publish_tool_result_report` calls the L0 `report_intent` path (`message_type="tool_result"`) and writes to the target UI agent inbox.
 - L0 publishes `cmd.agent.<ui_worker>.wakeup`; UI Worker wakeup receives `message_type=tool_result` and enters finalization.
 
 ---
@@ -148,8 +150,8 @@ curl -sS -X POST http://127.0.0.1:8099/projects/proj_ui_chat_01/agents \
 
 3) Subscribe to ack and task:
 ```bash
-nats sub "cg.v1r3.proj_ui_chat_01.public.evt.sys.ui.action_ack"
-nats sub "cg.v1r3.proj_ui_chat_01.public.evt.agent.chat_agent_ui.task"
+nats sub "cg.v1r4.proj_ui_chat_01.public.evt.sys.ui.action_ack"
+nats sub "cg.v1r4.proj_ui_chat_01.public.evt.agent.chat_agent_ui.task"
 ```
 
 4) Send UI action:
@@ -164,7 +166,7 @@ Assume output:
 - action_id = `AAA`
 
 ```bash
-nats pub "cg.v1r3.proj_ui_chat_01.public.cmd.sys.ui.action" '{
+nats pub "cg.v1r4.proj_ui_chat_01.public.cmd.sys.ui.action" '{
   "action_id":"AAA",
   "agent_id":"ui_user_01",
   "tool_name":"delegate_async",

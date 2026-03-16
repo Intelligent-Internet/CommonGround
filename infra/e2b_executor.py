@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from core.cg_context import CGContext
 from core.errors import BadRequestError, NotFoundError
 from infra.sandbox_registry import SandboxRegistry
 
@@ -87,9 +88,8 @@ class E2BExecutor:
     async def execute(
         self,
         *,
-        project_id: str,
-        agent_id: Optional[str],
-        tool_call_id: Optional[str],
+        ctx: CGContext,
+        sandbox_agent_id: Optional[str] = None,
         session_id: Optional[str],
         language: str,
         code: str,
@@ -99,6 +99,11 @@ class E2BExecutor:
         workdir: Optional[str],
         extra_files: Optional[List[Dict[str, Any]]] = None,
     ) -> E2BResult:
+        project_id = str(ctx.project_id or "")
+        if not project_id:
+            raise BadRequestError("project_id is required")
+        agent_id = str(sandbox_agent_id or ctx.agent_id or "")
+        tool_call_id = ctx.tool_call_id or ""
         lang = (language or "").strip().lower()
         if lang not in {"python", "bash", "javascript", "typescript"}:
             raise BadRequestError("unsupported language")
@@ -114,7 +119,7 @@ class E2BExecutor:
         sandbox_instance: Optional[Any] = None
         keep_alive = False
         reuse_enabled = bool(self.sandbox_registry and self.sandbox_registry.enabled and agent_id)
-        lock_id = str(tool_call_id) if tool_call_id else ""
+        lock_id = tool_call_id
         if reuse_enabled and self.sandbox_registry:
             existing = await self.sandbox_registry.get_existing(
                 project_id=project_id, agent_id=str(agent_id)
@@ -132,7 +137,7 @@ class E2BExecutor:
                     existing.get("domain") or self.domain,
                 )
                 await self.sandbox_registry.store.delete_sandbox(
-                    project_id=project_id, agent_id=str(agent_id)
+                    ctx=ctx.evolve(agent_id=str(agent_id)),
                 )
                 existing = None
             if existing:
@@ -222,7 +227,7 @@ class E2BExecutor:
                 # Clear stale registry entry and retry once with a fresh sandbox.
                 if self.sandbox_registry and agent_id:
                     await self.sandbox_registry.store.delete_sandbox(
-                        project_id=project_id, agent_id=str(agent_id)
+                        ctx=ctx.evolve(agent_id=str(agent_id)),
                     )
                 sandbox_instance = await asyncio.to_thread(self._create_sandbox_instance, timeout_val)
                 new_id = getattr(sandbox_instance, "sandbox_id", None)
@@ -319,9 +324,8 @@ class E2BExecutor:
     async def prepare_remote_zip(
         self,
         *,
-        project_id: str,
-        agent_id: Optional[str],
-        tool_call_id: Optional[str],
+        ctx: CGContext,
+        sandbox_agent_id: Optional[str] = None,
         zip_bytes: bytes,
         dest_dir: str = "skill",
         zip_path: str = "/tmp/skill.zip",
@@ -329,6 +333,11 @@ class E2BExecutor:
         keep_archive: bool = False,
         timeout_sec: Optional[int] = None,
     ) -> Dict[str, Any]:
+        project_id = str(ctx.project_id or "")
+        if not project_id:
+            raise BadRequestError("project_id is required")
+        agent_id = str(sandbox_agent_id or ctx.agent_id or "")
+        tool_call_id = ctx.tool_call_id or ""
         if not isinstance(zip_bytes, (bytes, bytearray)) or not zip_bytes:
             raise BadRequestError("zip_bytes is empty")
         if not isinstance(dest_dir, str) or not dest_dir.strip():
@@ -349,7 +358,7 @@ class E2BExecutor:
         sandbox_instance: Optional[Any] = None
         keep_alive = True
         reuse_enabled = bool(self.sandbox_registry and self.sandbox_registry.enabled and agent_id)
-        lock_id = str(tool_call_id) if tool_call_id else ""
+        lock_id = tool_call_id
 
         if reuse_enabled and self.sandbox_registry:
             existing = await self.sandbox_registry.get_existing(
@@ -368,7 +377,7 @@ class E2BExecutor:
                     existing.get("domain") or self.domain,
                 )
                 await self.sandbox_registry.store.delete_sandbox(
-                    project_id=project_id, agent_id=str(agent_id)
+                    ctx=ctx.evolve(agent_id=str(agent_id)),
                 )
                 existing = None
             if existing:

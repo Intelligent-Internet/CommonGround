@@ -5,21 +5,23 @@
 ## 1. 基本约束
 - 工具执行端不写 `state.*`。
 - 工具参数必须通过 `tool_call_card_id` 指针读取 `tool.call` 卡，不要直接消费 payload 中的 `args/arguments`（当前服务端会按协议拒绝）。
-- 回调必须带原样的 `agent_turn_id/turn_epoch/tool_call_id/after_execution`。
+- 控制/路由身份字段（`agent_id/agent_turn_id/turn_epoch/tool_call_id/step_id/...`）必须来自 `CG-*` headers / `CGContext`，不能放在 payload。
+- 回调 payload 只承载业务/结果字段（例如：`status/after_execution/tool_result_card_id`）。
 - 如需覆盖 **有效** `after_execution`，请在 `tool.result.content.result.__cg_control.after_execution` 写入 `suspend|terminate`（保留命名空间）；回调字段仍需按原样携带（命令与回写中的 `after_execution`）。
 - 回调必须以入站 `traceparent` 为父创建子 span，并注入新的 `traceparent`（`tracestate` 可选）。
 - `tool.result` 的 `metadata.trace_id/parent_step_id/step_id` 必须**从 `tool.call` 卡的 metadata 原样复制**（不使用 payload 补写）。
 - **内容结构要求**：`tool.call` 内容必须是 `ToolCallContent`，`tool.result` 内容必须是 `ToolResultContent`；不再接受任意 dict/文本作为内容。
-- `ToolCommandPayload` 对 `cmd.tool.*` 的必填字段包括：`tool_call_id/agent_turn_id/turn_epoch/agent_id`；对于外部工具，通常还要求 `tool_call_card_id/tool_name/after_execution`。
+- `cmd.tool.*` 必须携带控制头 `CG-Tool-Call-Id`；`ToolCommandPayload` 只承载业务字段（常见为 `tool_call_card_id/tool_name/after_execution`）。
+- `publish_tool_result_report` 现在会校验结果卡指针，以及 `author_id/function_name/source_ctx` 的一致性；仅“知道 correlation_id” 已不足以回写成功。
 
 权威协议见：`04_protocol_l0/nats_protocol.md`。
 
 ## 2. 最小实现流程（任何语言）
 1) 按 `resource.tools` 中该工具的 `target_subject`（已展开 `{project_id}/{channel_id}`）订阅 `cmd.tool.*` 主题。
-2) 解析命令，校验 `tool_call_id/agent_turn_id/turn_epoch/agent_id/tool_call_card_id`，通常还包含 `tool_name/after_execution`。
+2) 解析命令，校验必需的 `CG-*` 控制头（尤其 `CG-Tool-Call-Id`）和 payload 业务字段（`tool_call_card_id`，通常还包括 `tool_name/after_execution`）。
 3) 读取 `tool.call` 卡（`tool_call_card_id`） → 从 `ToolCallContent.arguments` 取参数。
 4) 执行业务逻辑。
-5) 构造 `tool.result` 卡，并构造回写 payload（包含 `tool_call_id/agent_turn_id/agent_id/turn_epoch/after_execution/status/tool_result_card_id/step_id`）。
+5) 构造 `tool.result` 卡，并构造回写 payload（仅业务字段，通常为 `after_execution/status/tool_result_card_id`）。
 6) 调用 `publish_tool_result_report` 写 `tool_result` 到 L0 Inbox；L0 会按 `agent_id` 目标 agent 的 `worker_target` 发起 `cmd.agent.{target}.wakeup`。
 
 说明：回调唤醒目标不固定为 `worker_generic`，应以被调用 Agent 当前 roster 中的 `worker_target` 为准。
@@ -29,27 +31,28 @@
 ```python
 import json
 
-from core.utp_protocol import ToolCallContent
 from core.subject import parse_subject
-from infra.l0.tool_reports import publish_tool_result_report
-from infra.tool_executor import ToolResultBuilder, ToolResultContext
+from core.utp_protocol import ToolCallContent
 from core.utils import safe_str
+from infra.l0.tool_reports import publish_tool_result_report
+from infra.messaging.ingress import build_nats_ingress_context
+from infra.tool_executor import ToolResultBuilder, ToolResultContext
 
 
 async def handle_tool_command(msg, *, cardbox, nats, execution_store, resource_store=None, state_store=None):
-    data = json.loads(msg.data)
+    raw = json.loads(msg.data)
     parts = parse_subject(msg.subject)
     if parts is None:
         raise RuntimeError("invalid subject")
 
-    tool_call_id = data["tool_call_id"]
-    agent_turn_id = data["agent_turn_id"]
-    turn_epoch = data["turn_epoch"]
-    after_exec = data.get("after_execution")
-    tool_call_card_id = data["tool_call_card_id"]
-    project_id = parts.project_id
+    ingress_ctx, cmd_data = build_nats_ingress_context(
+        dict(msg.headers or {}),
+        raw,
+        parts,
+    )
+    tool_call_card_id = str(cmd_data["tool_call_card_id"])
 
-    cards = await cardbox.get_cards([tool_call_card_id], project_id=project_id)
+    cards = await cardbox.get_cards([tool_call_card_id], project_id=ingress_ctx.project_id)
     if not cards:
         raise RuntimeError(f"tool_call_card not found: {tool_call_card_id}")
     tool_call_card = cards[0]
@@ -71,32 +74,40 @@ async def handle_tool_command(msg, *, cardbox, nats, execution_store, resource_s
         status = "failed"
 
     ctx = ToolResultContext.from_cmd_data(
-        project_id=project_id,
-        cmd_data=data,
+        ctx=ingress_ctx,
+        cmd_data=cmd_data,
         tool_call_meta=tool_call_meta,
     )
-    payload, result_card = (
-        ToolResultBuilder(ctx, author_id="tool.example", function_name=safe_str(data.get("tool_name")) or "unknown")
-        .build(status=status, result=result)
+    payload, result_card = ToolResultBuilder(
+        ctx,
+        author_id="tool.example",
+        function_name=safe_str(cmd_data.get("tool_name")) or "unknown",
+    ).build(
+        status=status,
+        result=result,
     )
     await cardbox.save_card(result_card)
 
+    source_ctx = ingress_ctx.evolve(
+        agent_id="tool.example",
+        agent_turn_id="",
+        step_id=None,
+        tool_call_id=None,
+    )
     await publish_tool_result_report(
         nats=nats,
         execution_store=execution_store,
+        cardbox=cardbox,
         resource_store=resource_store,
         state_store=state_store,
-        project_id=project_id,
-        channel_id=parts.channel_id,
+        source_ctx=source_ctx,
+        target_ctx=ingress_ctx,
         payload=payload,
-        headers={},
-        source_agent_id="tool.example",
     )
     return {
-        "tool_call_id": tool_call_id,
-        "agent_turn_id": agent_turn_id,
-        "turn_epoch": turn_epoch,
-        "after_execution": after_exec,
+        "tool_call_id": ingress_ctx.require_tool_call_id,
+        "agent_turn_id": ingress_ctx.require_agent_turn_id,
+        "turn_epoch": ingress_ctx.turn_epoch,
         "status": status,
     }
 ```
@@ -156,3 +167,5 @@ async def handle_tool_command(msg, *, cardbox, nats, execution_store, resource_s
 
 模板变量（暂时仅支持 ID 字段）：`{project_id}` / `{channel_id}` / `{agent_id}` / `{agent_turn_id}` /
 `{step_id}` / `{tool_call_id}` / `{parent_step_id}` / `{trace_id}` / `{turn_epoch}` / `{context_box_id}`。
+
+如果工具接受 `session_id`，请把它视为调用者可见的 alias。运行时内部可能会按 owner（`project_id + agent_id`）重新作用域化底层执行身份，因此同名 alias 不是跨 agent 共享契约。

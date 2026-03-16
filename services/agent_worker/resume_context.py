@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from core.payload_control import RESUME_FORBIDDEN_FIELDS, payload_control_keys
 from core.status import STATUS_FAILED, TOOL_RESULT_STATUS_SET
 from core.utils import safe_str
 
@@ -13,21 +14,23 @@ class ResumeCommand:
     status: Optional[str]
     after_execution: Optional[str]
     tool_result_card_id: Optional[str]
-    step_id_hint: Optional[str]
-    source_agent_id: Optional[str]
     has_inline_result: bool
+    forbidden_payload_keys: tuple[str, ...]
 
 
 def parse_resume_command(data: Dict[str, Any]) -> ResumeCommand:
     payload = data or {}
+    forbidden_payload_keys = payload_control_keys(
+        payload,
+        control_fields=RESUME_FORBIDDEN_FIELDS,
+    )
     return ResumeCommand(
-        tool_call_id=safe_str(payload.get("tool_call_id")),
+        tool_call_id=None,
         status=safe_str(payload.get("status")),
         after_execution=safe_str(payload.get("after_execution")),
         tool_result_card_id=safe_str(payload.get("tool_result_card_id")),
-        step_id_hint=safe_str(payload.get("step_id")),
-        source_agent_id=safe_str(payload.get("source_agent_id")),
         has_inline_result="result" in payload,
+        forbidden_payload_keys=forbidden_payload_keys,
     )
 
 

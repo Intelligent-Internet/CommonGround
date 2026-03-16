@@ -32,7 +32,7 @@ from infra.cardbox_client import CardBoxClient
 from infra.llm_gateway import LLMService
 from infra.nats_client import NATSClient
 from infra.service_runtime import ServiceBase
-from infra.tool_executor import ToolCallContext
+from infra.tool_executor import ToolCallEnvelope
 from services.tools.tool_runner import (
     ToolPayloadValidation,
     ToolRunner,
@@ -99,7 +99,7 @@ class MockSearchService(ServiceBase):
                 require_after_execution=True,
                 allowed_after_execution=ALLOWED_AFTER_EXECUTION_VALUES,
             ),
-            result_author_id="tool_search_mock",
+            result_author_id="tool.search",
             logger=logger,
             service_name="SearchMock",
         )
@@ -361,46 +361,41 @@ class MockSearchService(ServiceBase):
 
     async def _execute_search_logic(
         self,
-        ctx: ToolCallContext,
+        envelope: ToolCallEnvelope,
     ) -> Dict[str, Any]:
-        parts = ctx.parts
-        payload = ctx.payload
-
-        tool_call_id = payload.tool_call_id
-        agent_turn_id = payload.agent_turn_id
-        turn_epoch = payload.turn_epoch
-        agent_id = payload.agent_id
+        cg_ctx = envelope.ctx
+        tool_call_id = cg_ctx.tool_call_id or ""
 
         target = await resolve_agent_target(
             resource_store=self.resource_store,
-            project_id=parts.project_id,
-            agent_id=str(agent_id),
+            ctx=cg_ctx,
         )
         if not target:
             raise ProtocolViolationError(
                 "missing worker_target for agent",
                 detail={
-                    "project_id": parts.project_id,
-                    "agent_id": str(agent_id),
-                    "tool_call_id": str(tool_call_id),
+                    "project_id": cg_ctx.project_id,
+                    "agent_id": cg_ctx.agent_id,
+                    "tool_call_id": tool_call_id,
                 },
             )
-        args = ctx.args
+        args = envelope.args
         query = args.get("query", "")
         if not isinstance(query, str):
             query = str(query)
 
         print(
-            f"[SearchMock] CMD recv turn={agent_turn_id} epoch={turn_epoch} tool_call_id={tool_call_id} query='{query}'"
+            f"[SearchMock] CMD recv turn={cg_ctx.agent_turn_id} epoch={cg_ctx.turn_epoch} "
+            f"tool_call_id={tool_call_id} query='{query}'"
         )
         results = await self._build_results(query=query)
 
         return {"query": query, "results": results}
 
     async def _handle_cmd(self, subject: str, data: Dict[str, Any], headers: Dict[str, str]):
-        async def _execute(ctx: ToolCallContext) -> Dict[str, Any]:
-            print(f"[SearchMock] 🔒 Leader acquired tool_call_id={ctx.payload.tool_call_id}")
-            return await self._execute_search_logic(ctx)
+        async def _execute(envelope: ToolCallEnvelope) -> Dict[str, Any]:
+            print(f"[SearchMock] 🔒 Leader acquired tool_call_id={envelope.ctx.tool_call_id}")
+            return await self._execute_search_logic(envelope)
 
         run_result = await self.tool_runner.run(
             subject=subject,
@@ -413,7 +408,7 @@ class MockSearchService(ServiceBase):
             print(f"[SearchMock] invalid subject: {subject}")
             return
 
-        tool_call_id = str(data.get("tool_call_id") or "")
+        tool_call_id = str((headers or {}).get("CG-Tool-Call-Id") or "")
         if run_result.is_leader:
             print(f"[SearchMock] ↩️ tool_result sent (leader) tool_call_id={tool_call_id}")
         elif run_result.is_leader is False:

@@ -14,7 +14,7 @@ INSERT INTO resource.tools (
 ) VALUES (
     'proj_mvp_001',
     'jina_search',
-    'cg.v1r3.proj_mvp_001.public.cmd.tool.jina.search',
+    'cg.v1r4.proj_mvp_001.public.cmd.tool.jina.search',
     '{
         "type": "object",
         "properties": {
@@ -54,7 +54,7 @@ INSERT INTO resource.tools (
 ) VALUES (
     'proj_mvp_001',
     'jina_reader',
-    'cg.v1r3.proj_mvp_001.public.cmd.tool.jina.read',
+    'cg.v1r4.proj_mvp_001.public.cmd.tool.jina.read',
     '{
         "type": "object",
         "properties": {

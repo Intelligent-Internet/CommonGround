@@ -2,15 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Optional
 
 import uuid6
 
+from core.cg_context import CGContext
 from core.errors import ProtocolViolationError
-from core.headers import require_recursion_depth
+from core.message_source import MessageSource
 from core.trace import TRACEPARENT_HEADER, next_traceparent, normalize_trace_id
 from infra.observability.otel import get_tracer, mark_span_error, traced
-from infra.stores import ExecutionEdgeInsert, ExecutionStore, InboxInsert
+from infra.stores import ExecutionStore
 
 
 logger = logging.getLogger("ExecutionPrimitives")
@@ -41,28 +42,6 @@ class JoinResult:
     correlation_id: str
     trace_id: Optional[str]
     recursion_depth: Optional[int]
-
-
-def _resolve_traceparent(
-    traceparent: Optional[str],
-    headers: Mapping[str, str] | None,
-) -> Optional[str]:
-    if traceparent:
-        return str(traceparent)
-    if headers:
-        return headers.get(TRACEPARENT_HEADER)
-    return None
-
-
-def _resolve_recursion_depth(
-    recursion_depth: Optional[int],
-    headers: Mapping[str, str] | None,
-) -> int:
-    if recursion_depth is None:
-        return require_recursion_depth(headers)
-    if recursion_depth < 0:
-        raise ProtocolViolationError("invalid recursion_depth")
-    return int(recursion_depth)
 
 
 async def _inherit_recursion_depth(
@@ -106,61 +85,107 @@ async def _inherit_recursion_depth(
     return inherited
 
 
+def _build_trace_write_ctx(
+    *,
+    ctx: CGContext,
+    headers: Dict[str, str],
+    traceparent: str,
+    tracestate: Optional[str],
+    trace_id: Optional[str],
+    recursion_depth: int,
+) -> CGContext:
+    return ctx.evolve(
+        recursion_depth=int(recursion_depth),
+        trace_id=trace_id,
+    ).with_trace_transport(
+        base_headers=headers,
+        traceparent=traceparent,
+        tracestate=str(tracestate) if tracestate else None,
+        trace_id=trace_id,
+        default_depth=int(recursion_depth),
+    )
+
+
 @traced(_TRACER, "execution.enqueue", span_arg="_span")
 async def enqueue(
     *,
     store: ExecutionStore,
-    project_id: str,
-    channel_id: Optional[str],
-    target_agent_id: str,
+    ctx: CGContext,
+    source: MessageSource,
     message_type: str,
     payload: Dict[str, Any],
-    enqueue_mode: Optional[str] = "call",
     correlation_id: Optional[str] = None,
-    recursion_depth: Optional[int] = None,
-    headers: Mapping[str, str] | None = None,
-    traceparent: Optional[str] = None,
-    tracestate: Optional[str] = None,
-    trace_id: Optional[str] = None,
-    parent_step_id: Optional[str] = None,
-    source_agent_id: Optional[str] = None,
-    source_agent_turn_id: Optional[str] = None,
-    source_step_id: Optional[str] = None,
-    target_agent_turn_id: Optional[str] = None,
+    enqueue_mode: Optional[str] = "call",
+    inbox_status: str = "pending",
     conn: Any,
     _span: Any = None,
 ) -> EnqueueResult:
     span = _span
     if span is not None:
-        span.set_attribute("cg.project_id", str(project_id))
-        span.set_attribute("cg.target_agent_id", str(target_agent_id))
-        span.set_attribute("cg.message_type", str(message_type))
+        span.set_attribute("cg.message_type", message_type)
         if correlation_id:
             span.set_attribute("cg.correlation_id", str(correlation_id))
     try:
-        inbox_record, edge_record, result = await build_enqueue_records(
-            store=store,
-            project_id=project_id,
-            channel_id=channel_id,
-            target_agent_id=target_agent_id,
-            message_type=message_type,
-            payload=payload,
-            enqueue_mode=enqueue_mode,
-            correlation_id=correlation_id,
-            recursion_depth=recursion_depth,
+        if not message_type:
+            raise ProtocolViolationError("missing message_type")
+
+        resolved_mode = str(enqueue_mode or "call")
+        if resolved_mode != "call":
+            raise ProtocolViolationError("unsupported enqueue_mode")
+
+        headers = ctx.to_nats_headers()
+        tracestate = headers.get("tracestate")
+        resolved_depth = ctx.recursion_depth
+
+        traceparent = headers.get(TRACEPARENT_HEADER)
+        traceparent, trace_id = next_traceparent(traceparent, ctx.trace_id)
+
+        if correlation_id:
+            inbox_id = str(correlation_id)
+            correlation_id = inbox_id
+        else:
+            inbox_id = f"inbox_{uuid6.uuid7().hex}"
+            correlation_id = inbox_id
+        edge_id = f"edge_{uuid6.uuid7().hex}"
+
+        write_ctx = _build_trace_write_ctx(
+            ctx=ctx,
             headers=headers,
             traceparent=traceparent,
             tracestate=tracestate,
             trace_id=trace_id,
-            parent_step_id=parent_step_id,
-            source_agent_id=source_agent_id,
-            source_agent_turn_id=source_agent_turn_id,
-            source_step_id=source_step_id,
-            target_agent_turn_id=target_agent_turn_id,
-            conn=conn,
+            recursion_depth=int(resolved_depth),
         )
-
-        await store.enqueue_with_conn(conn, inbox=inbox_record, edge=edge_record)
+        inserted = await store.enqueue_with_conn(
+            conn,
+            ctx=write_ctx,
+            source=source,
+            inbox_id=inbox_id,
+            message_type=message_type,
+            enqueue_mode="call",
+            correlation_id=correlation_id,
+            payload=payload,
+            edge_id=edge_id,
+            primitive="enqueue",
+            edge_phase="request",
+            metadata={
+                "message_type": message_type,
+                "enqueue_mode": "call",
+                "inbox_id": inbox_id,
+                "recursion_depth": resolved_depth,
+                "cg_ctx": write_ctx.to_sys_dict(),
+            },
+            inbox_status=inbox_status,
+        )
+        if not inserted:
+            raise ProtocolViolationError("duplicate enqueue correlation")
+        result = EnqueueResult(
+            inbox_id=inbox_id,
+            correlation_id=correlation_id,
+            traceparent=traceparent,
+            trace_id=trace_id,
+            recursion_depth=int(resolved_depth),
+        )
         if span is not None:
             span.set_attribute("cg.inbox_id", str(result.inbox_id))
         return result
@@ -169,203 +194,78 @@ async def enqueue(
         raise
 
 
-async def build_enqueue_records(
-    *,
-    store: ExecutionStore,
-    project_id: str,
-    channel_id: Optional[str],
-    target_agent_id: str,
-    message_type: str,
-    payload: Dict[str, Any],
-    enqueue_mode: Optional[str] = "call",
-    correlation_id: Optional[str] = None,
-    recursion_depth: Optional[int] = None,
-    headers: Mapping[str, str] | None = None,
-    traceparent: Optional[str] = None,
-    tracestate: Optional[str] = None,
-    trace_id: Optional[str] = None,
-    parent_step_id: Optional[str] = None,
-    source_agent_id: Optional[str] = None,
-    source_agent_turn_id: Optional[str] = None,
-    source_step_id: Optional[str] = None,
-    target_agent_turn_id: Optional[str] = None,
-    inbox_status: str = "pending",
-    conn: Any,
-) -> tuple[InboxInsert, ExecutionEdgeInsert, EnqueueResult]:
-    if not project_id:
-        raise ProtocolViolationError("missing project_id")
-    if not target_agent_id:
-        raise ProtocolViolationError("missing target_agent_id")
-    if not message_type:
-        raise ProtocolViolationError("missing message_type")
-
-    resolved_mode = str(enqueue_mode or "call")
-    if resolved_mode != "call":
-        raise ProtocolViolationError("unsupported enqueue_mode")
-    resolved_depth = _resolve_recursion_depth(recursion_depth, headers)
-    resolved_depth = await _inherit_recursion_depth(
-        store=store,
-        project_id=project_id,
-        correlation_id=correlation_id,
-        resolved_depth=resolved_depth,
-        conn=conn,
-    )
-    traceparent = _resolve_traceparent(traceparent, headers)
-    traceparent, trace_id = next_traceparent(traceparent, trace_id)
-
-    if correlation_id:
-        inbox_id = str(correlation_id)
-        correlation_id = inbox_id
-    else:
-        inbox_id = f"inbox_{uuid6.uuid7().hex}"
-        correlation_id = inbox_id
-    edge_id = f"edge_{uuid6.uuid7().hex}"
-    inbox_record = InboxInsert(
-        inbox_id=inbox_id,
-        project_id=project_id,
-        agent_id=target_agent_id,
-        message_type=message_type,
-        enqueue_mode="call",
-        correlation_id=correlation_id,
-        recursion_depth=resolved_depth,
-        traceparent=traceparent,
-        tracestate=tracestate,
-        trace_id=trace_id,
-        parent_step_id=parent_step_id,
-        source_agent_id=source_agent_id,
-        source_step_id=source_step_id,
-        payload=payload,
-        status=inbox_status,
-    )
-    edge_record = ExecutionEdgeInsert(
-        edge_id=edge_id,
-        project_id=project_id,
-        channel_id=channel_id,
-        primitive="enqueue",
-        edge_phase="request",
-        source_agent_id=source_agent_id,
-        source_agent_turn_id=source_agent_turn_id,
-        source_step_id=source_step_id,
-        target_agent_id=target_agent_id,
-        target_agent_turn_id=target_agent_turn_id,
-        correlation_id=correlation_id,
-        enqueue_mode="call",
-        recursion_depth=resolved_depth,
-        trace_id=trace_id,
-        parent_step_id=parent_step_id,
-        metadata={
-            "message_type": message_type,
-            "enqueue_mode": "call",
-            "inbox_id": inbox_id,
-            "recursion_depth": resolved_depth,
-        },
-    )
-    result = EnqueueResult(
-        inbox_id=inbox_id,
-        correlation_id=correlation_id,
-        traceparent=traceparent,
-        trace_id=trace_id,
-        recursion_depth=resolved_depth,
-    )
-    return inbox_record, edge_record, result
-
-
 @traced(_TRACER, "execution.report", span_arg="_span")
 async def report(
     *,
     store: ExecutionStore,
-    project_id: str,
-    channel_id: Optional[str],
-    target_agent_id: str,
+    ctx: CGContext,
+    source: MessageSource,
     message_type: str,
     payload: Dict[str, Any],
     correlation_id: str,
-    recursion_depth: Optional[int] = None,
-    headers: Mapping[str, str] | None = None,
-    traceparent: Optional[str] = None,
-    tracestate: Optional[str] = None,
-    trace_id: Optional[str] = None,
-    parent_step_id: Optional[str] = None,
-    source_agent_id: Optional[str] = None,
-    source_agent_turn_id: Optional[str] = None,
-    source_step_id: Optional[str] = None,
-    target_agent_turn_id: Optional[str] = None,
     conn: Any,
     _span: Any = None,
 ) -> ReportResult:
     span = _span
+
     if span is not None:
-        span.set_attribute("cg.project_id", str(project_id))
-        span.set_attribute("cg.target_agent_id", str(target_agent_id))
-        span.set_attribute("cg.message_type", str(message_type))
+        span.set_attribute("cg.message_type", message_type)
         span.set_attribute("cg.correlation_id", str(correlation_id))
     try:
-        if not project_id:
-            raise ProtocolViolationError("missing project_id")
-        if not target_agent_id:
-            raise ProtocolViolationError("missing target_agent_id")
         if not message_type:
             raise ProtocolViolationError("missing message_type")
         if not correlation_id:
             raise ProtocolViolationError("missing correlation_id")
 
-        resolved_depth = _resolve_recursion_depth(recursion_depth, headers)
+        resolved_depth = ctx.recursion_depth
         require_match = message_type in ("tool_result", "timeout")
         resolved_depth = await _inherit_recursion_depth(
             store=store,
-            project_id=project_id,
+            project_id=ctx.project_id,
             correlation_id=correlation_id,
             resolved_depth=resolved_depth,
             conn=conn,
             require_match=require_match,
         )
-        traceparent = _resolve_traceparent(traceparent, headers)
-        traceparent, trace_id = next_traceparent(traceparent, trace_id)
+
+        headers = ctx.to_nats_headers()
+        tracestate = headers.get("tracestate")
+        traceparent = headers.get(TRACEPARENT_HEADER)
+        traceparent, trace_id = next_traceparent(traceparent, ctx.trace_id)
 
         inbox_id = f"inbox_{uuid6.uuid7().hex}"
         if trace_id:
             trace_id = normalize_trace_id(trace_id)
         edge_id = f"edge_{uuid6.uuid7().hex}"
-        inbox_record = InboxInsert(
-            inbox_id=inbox_id,
-            project_id=project_id,
-            agent_id=target_agent_id,
-            message_type=message_type,
-            enqueue_mode=None,
-            correlation_id=correlation_id,
-            recursion_depth=resolved_depth,
+        write_ctx = _build_trace_write_ctx(
+            ctx=ctx,
+            headers=headers,
             traceparent=traceparent,
             tracestate=tracestate,
             trace_id=trace_id,
-            parent_step_id=parent_step_id,
-            source_agent_id=source_agent_id,
-            source_step_id=source_step_id,
-            payload=payload,
-            status="pending",
+            recursion_depth=int(resolved_depth),
         )
-        edge_record = ExecutionEdgeInsert(
+        inserted = await store.enqueue_with_conn(
+            conn,
+            ctx=write_ctx,
+            source=source,
+            inbox_id=inbox_id,
+            message_type=message_type,
+            enqueue_mode=None,
+            correlation_id=correlation_id,
+            payload=payload,
             edge_id=edge_id,
-            project_id=project_id,
-            channel_id=channel_id,
             primitive="report",
             edge_phase="response",
-            source_agent_id=source_agent_id,
-            source_agent_turn_id=source_agent_turn_id,
-            source_step_id=source_step_id,
-            target_agent_id=target_agent_id,
-            target_agent_turn_id=target_agent_turn_id,
-            correlation_id=correlation_id,
-            enqueue_mode=None,
-            recursion_depth=resolved_depth,
-            trace_id=trace_id,
-            parent_step_id=parent_step_id,
             metadata={
                 "message_type": message_type,
                 "inbox_id": inbox_id,
                 "recursion_depth": resolved_depth,
+                "cg_ctx": write_ctx.to_sys_dict(),
             },
         )
-        await store.enqueue_with_conn(conn, inbox=inbox_record, edge=edge_record)
+        if not inserted:
+            raise ProtocolViolationError("duplicate report correlation")
 
         if span is not None:
             span.set_attribute("cg.inbox_id", str(inbox_id))
@@ -374,7 +274,7 @@ async def report(
             correlation_id=correlation_id,
             traceparent=traceparent,
             trace_id=trace_id,
-            recursion_depth=resolved_depth,
+            recursion_depth=int(resolved_depth),
         )
     except Exception as exc:
         mark_span_error(span, exc)
@@ -385,64 +285,35 @@ async def report(
 async def join_request(
     *,
     store: ExecutionStore,
-    project_id: str,
-    channel_id: Optional[str],
-    source_agent_id: Optional[str],
-    source_agent_turn_id: Optional[str],
-    source_step_id: Optional[str],
-    target_agent_id: Optional[str],
-    target_agent_turn_id: Optional[str],
+    ctx: CGContext,
+    source: MessageSource,
     correlation_id: str,
-    recursion_depth: Optional[int] = None,
-    trace_id: Optional[str] = None,
-    parent_step_id: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     conn: Any,
     _span: Any = None,
 ) -> JoinResult:
     span = _span
+
     if span is not None:
-        span.set_attribute("cg.project_id", str(project_id))
         span.set_attribute("cg.correlation_id", str(correlation_id))
     try:
-        if not project_id:
-            raise ProtocolViolationError("missing project_id")
         if not correlation_id:
             raise ProtocolViolationError("missing correlation_id")
-        if recursion_depth is None:
-            raise ProtocolViolationError("missing recursion_depth")
-        if recursion_depth < 0:
-            raise ProtocolViolationError("invalid recursion_depth")
 
-        recursion_depth = await _inherit_recursion_depth(
-            store=store,
-            project_id=project_id,
-            correlation_id=correlation_id,
-            resolved_depth=recursion_depth,
-            conn=conn,
-            require_match=False,
-        )
-        if trace_id:
-            trace_id = normalize_trace_id(trace_id)
+        recursion_depth = ctx.recursion_depth
+        trace_id = normalize_trace_id(ctx.trace_id) if ctx.trace_id else None
         edge_id = f"edge_{uuid6.uuid7().hex}"
+        merged_metadata = dict(metadata or {})
+        merged_metadata["cg_ctx"] = ctx.to_sys_dict()
         await store.insert_execution_edge_with_conn(
             conn,
+            ctx=ctx,
+            source=source,
             edge_id=edge_id,
-            project_id=project_id,
-            channel_id=channel_id,
             primitive="join",
             edge_phase="request",
-            source_agent_id=source_agent_id,
-            source_agent_turn_id=source_agent_turn_id,
-            source_step_id=source_step_id,
-            target_agent_id=target_agent_id,
-            target_agent_turn_id=target_agent_turn_id,
             correlation_id=correlation_id,
-            enqueue_mode=None,
-            recursion_depth=recursion_depth,
-            trace_id=trace_id,
-            parent_step_id=parent_step_id,
-            metadata=metadata or {},
+            metadata=merged_metadata,
         )
         if span is not None:
             span.set_attribute("cg.edge_id", str(edge_id))
@@ -461,58 +332,42 @@ async def join_request(
 async def join_response(
     *,
     store: ExecutionStore,
-    project_id: str,
-    channel_id: Optional[str],
-    source_agent_id: Optional[str],
-    source_agent_turn_id: Optional[str],
-    source_step_id: Optional[str],
-    target_agent_id: Optional[str],
-    target_agent_turn_id: Optional[str],
+    ctx: CGContext,
+    source: MessageSource,
     correlation_id: str,
-    recursion_depth: Optional[int] = None,
-    trace_id: Optional[str] = None,
-    parent_step_id: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     conn: Any,
     _span: Any = None,
 ) -> JoinResult:
     span = _span
+
     if span is not None:
-        span.set_attribute("cg.project_id", str(project_id))
         span.set_attribute("cg.correlation_id", str(correlation_id))
     try:
-        if not project_id:
-            raise ProtocolViolationError("missing project_id")
         if not correlation_id:
             raise ProtocolViolationError("missing correlation_id")
 
         recursion_depth = await _inherit_recursion_depth(
             store=store,
-            project_id=project_id,
+            project_id=ctx.project_id,
             correlation_id=correlation_id,
-            resolved_depth=recursion_depth,
+            resolved_depth=ctx.recursion_depth,
             conn=conn,
             require_match=True,
         )
+        trace_id = normalize_trace_id(ctx.trace_id) if ctx.trace_id else None
         edge_id = f"edge_{uuid6.uuid7().hex}"
+        merged_metadata = dict(metadata or {})
+        merged_metadata["cg_ctx"] = ctx.to_sys_dict()
         await store.insert_execution_edge_with_conn(
             conn,
+            ctx=ctx,
+            source=source,
             edge_id=edge_id,
-            project_id=project_id,
-            channel_id=channel_id,
             primitive="join",
             edge_phase="response",
-            source_agent_id=source_agent_id,
-            source_agent_turn_id=source_agent_turn_id,
-            source_step_id=source_step_id,
-            target_agent_id=target_agent_id,
-            target_agent_turn_id=target_agent_turn_id,
             correlation_id=correlation_id,
-            enqueue_mode=None,
-            recursion_depth=recursion_depth,
-            trace_id=trace_id,
-            parent_step_id=parent_step_id,
-            metadata=metadata or {},
+            metadata=merged_metadata,
         )
         if span is not None:
             span.set_attribute("cg.edge_id", str(edge_id))

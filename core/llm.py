@@ -10,6 +10,7 @@ class LLMConfig(BaseModel):
     temperature: float = 1.0
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
+    reasoning_effort: Optional[str] = None
     stop: Optional[List[str]] = None
     stream: bool = True
     stream_options: Optional[Dict[str, Any]] = None

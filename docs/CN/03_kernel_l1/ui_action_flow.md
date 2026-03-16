@@ -2,6 +2,8 @@
 
 本文描述 `cmd.sys.ui.action` 的内部处理流程，作为 UI 入口与 LLM 回复链路的实现参考。该流程是 **L1 实现细节**，对外协议以 L0 文档为准。
 
+这条链路已经纳入 `V1R4` 最终发布验证：`UI Worker -> delegate_async -> PMO -> target worker -> tool_result -> UI ack`。
+
 ---
 
 ## 0) UI 启动：注册 UI Agent（前置）
@@ -77,7 +79,7 @@ UI Worker 的 wakeup 阶段（`_process_ui_action`）：
 
 PMO 不直接发布“UI 回执状态”给 UI action；而是：
 - `_reply_resume` 先构建 `tool.result` 卡片（含 `result/error/status/after_execution`）；
-- `publish_tool_result_report` 执行 `L0.report(message_type="tool_result")` 写入目标 UI agent 的 inbox；
+- `publish_tool_result_report` 调用 L0 的 `report_intent` 路径（`message_type="tool_result"`）写入目标 UI agent 的 inbox；
 - L0 发布 `cmd.agent.<ui_worker>.wakeup`，UI worker wakeup 收到 `message_type=tool_result` 进入收尾处理。
 
 ---
@@ -148,8 +150,8 @@ curl -sS -X POST http://127.0.0.1:8099/projects/proj_ui_chat_01/agents \
 
 3) 订阅 ack 与 task：
 ```bash
-nats sub "cg.v1r3.proj_ui_chat_01.public.evt.sys.ui.action_ack"
-nats sub "cg.v1r3.proj_ui_chat_01.public.evt.agent.chat_agent_ui.task"
+nats sub "cg.v1r4.proj_ui_chat_01.public.evt.sys.ui.action_ack"
+nats sub "cg.v1r4.proj_ui_chat_01.public.evt.agent.chat_agent_ui.task"
 ```
 
 4) 发送 UI action：
@@ -164,7 +166,7 @@ PY
 - action_id = `AAA`
 
 ```bash
-nats pub "cg.v1r3.proj_ui_chat_01.public.cmd.sys.ui.action" '{
+nats pub "cg.v1r4.proj_ui_chat_01.public.cmd.sys.ui.action" '{
   "action_id":"AAA",
   "agent_id":"ui_user_01",
   "tool_name":"delegate_async",
@@ -180,4 +182,3 @@ nats pub "cg.v1r3.proj_ui_chat_01.public.cmd.sys.ui.action" '{
 5) 期望结果：
 - `evt.sys.ui.action_ack`：入口阶段可见 `status=accepted`，工具执行结束后可见 `status=done`（或失败场景 `status=rejected`）。
 - `evt.agent.chat_agent_ui.task`：`status=success` 且包含 `deliverable_card_id`。
-

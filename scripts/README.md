@@ -11,6 +11,19 @@
 
 ## Setup
 
+### 标准环境入口（推荐）
+```bash
+# 1) 拉起并重建 compose 全链路（默认 API 端口 8099）
+scripts/setup/cg_stack.sh up
+
+# 2) 查看统一环境变量
+scripts/setup/cg_stack.sh env
+
+# 3) 在统一环境下执行任意命令（examples / integration / benchmarks）
+scripts/setup/cg_stack.sh run uv run -m examples.quickstarts.demo_principal_fullflow_api --project proj_mvp_001 --channel public "hello"
+scripts/setup/cg_stack.sh run uv run pytest tests/integration/test_state_edges.py -q -rs
+```
+
 ### reset_db
 ```bash
 uv run -m scripts.setup.reset_db

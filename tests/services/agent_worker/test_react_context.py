@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from core.cg_context import CGContext
 from core.llm import LLMConfig
 from services.agent_worker.react_context import (
     build_card_metadata,
@@ -24,7 +25,7 @@ def test_sanitize_provider_options_removes_sensitive_keys() -> None:
 
 
 def test_build_stream_start_metadata_redacts_api_keys() -> None:
-    item = SimpleNamespace(agent_id="agent_1")
+    item = SimpleNamespace(ctx=CGContext(project_id="proj_1", agent_id="agent_1", channel_id="public"))
     profile = SimpleNamespace(
         card_id="profile_1",
         name="Planner",
@@ -45,7 +46,16 @@ def test_build_stream_start_metadata_redacts_api_keys() -> None:
 
 
 def test_build_card_metadata_includes_trace_parent_and_extra() -> None:
-    item = SimpleNamespace(agent_turn_id="turn_1", trace_id="trace_1", parent_step_id="parent_1")
+    item = SimpleNamespace(
+        ctx=CGContext(
+            project_id="proj_1",
+            agent_id="agent_1",
+            channel_id="public",
+            agent_turn_id="turn_1",
+            trace_id="trace_1",
+            parent_step_id="parent_1",
+        )
+    )
     metadata = build_card_metadata(
         item=item,
         step_id="step_1",

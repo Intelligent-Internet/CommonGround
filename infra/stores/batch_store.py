@@ -3,6 +3,8 @@ from typing import Optional, List, Dict, Any
 
 from psycopg_pool import AsyncConnectionPool
 
+from core.cg_context import CGContext
+
 from .base import BaseStore
 
 
@@ -45,17 +47,13 @@ class BatchStore(BaseStore):
         self,
         *,
         batch_id: str,
-        project_id: str,
-        parent_agent_id: str,
-        parent_agent_turn_id: str,
-        parent_tool_call_id: str,
-        parent_turn_epoch: int,
-        parent_channel_id: Optional[str],
+        parent_ctx: CGContext,
         task_count: int,
         deadline_at: Optional[str],
         metadata: Dict[str, Any],
         conn: Any = None,
     ) -> None:
+        parent_tool_call_id = parent_ctx.require_tool_call_id
         sql = f"""
             INSERT INTO {self._plans_table()} (
                 batch_id, project_id, parent_agent_id, parent_agent_turn_id,
@@ -69,12 +67,12 @@ class BatchStore(BaseStore):
                 sql,
                 (
                     batch_id,
-                    project_id,
-                    parent_agent_id,
-                    parent_agent_turn_id,
+                    parent_ctx.project_id,
+                    parent_ctx.agent_id,
+                    parent_ctx.agent_turn_id,
                     parent_tool_call_id,
-                    parent_turn_epoch,
-                    parent_channel_id,
+                    int(parent_ctx.turn_epoch),
+                    parent_ctx.channel_id or None,
                     task_count,
                     deadline_at,
                     json.dumps(metadata),
@@ -86,12 +84,12 @@ class BatchStore(BaseStore):
                 sql,
                 (
                     batch_id,
-                    project_id,
-                    parent_agent_id,
-                    parent_agent_turn_id,
+                    parent_ctx.project_id,
+                    parent_ctx.agent_id,
+                    parent_ctx.agent_turn_id,
                     parent_tool_call_id,
-                    parent_turn_epoch,
-                    parent_channel_id,
+                    int(parent_ctx.turn_epoch),
+                    parent_ctx.channel_id or None,
                     task_count,
                     deadline_at,
                     json.dumps(metadata),
@@ -164,8 +162,7 @@ class BatchStore(BaseStore):
             SELECT t.batch_task_id, t.batch_id, t.project_id, t.agent_id,
                    t.profile_box_id, t.context_box_id, t.output_box_id, t.payload_hash, t.attempt_count,
                    t.metadata AS task_metadata,
-                   p.parent_agent_id, p.parent_agent_turn_id, p.parent_tool_call_id,
-                   p.parent_turn_epoch, p.parent_channel_id, p.metadata AS batch_metadata, p.deadline_at
+                   p.metadata AS batch_metadata, p.deadline_at
             FROM {self._tasks_table()} t
             JOIN {self._plans_table()} p
               ON p.batch_id=t.batch_id AND p.project_id=t.project_id
@@ -186,14 +183,13 @@ class BatchStore(BaseStore):
     ) -> List[Dict[str, Any]]:
         """Dispatched batch tasks that have a turn id but are missing turn_epoch.
 
-        This is used as a reconciliation input when L0 ACK is pending/unknown.
+        This is used as a watchdog input when the batch layer is still observing lease progress.
         """
         older = max(0.0, float(older_than_seconds))
         sql = f"""
             SELECT t.batch_task_id, t.batch_id, t.project_id, t.agent_id,
                    t.current_agent_turn_id, t.current_turn_epoch, t.attempt_count, t.updated_at,
                    t.metadata AS task_metadata,
-                   p.parent_channel_id,
                    p.deadline_at,
                    CASE
                      WHEN jsonb_typeof(p.metadata->'fail_fast') = 'boolean'
@@ -245,7 +241,7 @@ class BatchStore(BaseStore):
         batch_task_id: str,
         project_id: str,
         agent_turn_id: str,
-        turn_epoch: int,
+        turn_epoch: Optional[int],
     ) -> None:
         sql = f"""
             UPDATE {self._tasks_table()}
@@ -416,7 +412,8 @@ class BatchStore(BaseStore):
                     updated_at=NOW()
                 WHERE batch_task_id=%s
                   AND project_id=%s
-                  AND status='pending'
+                  AND current_agent_turn_id IS NULL
+                  AND status IN ('pending','dispatched')
                 RETURNING batch_id
             """
             params = (error_detail, patch_json, batch_task_id, project_id)

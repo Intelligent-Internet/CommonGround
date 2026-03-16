@@ -23,10 +23,9 @@ async def test_gemini_live_thought_signature_roundtrip():
 
     base_cfg = dict(
         model="gemini-3-flash-preview",
+        reasoning_effort="low",
         provider_options={
             "custom_llm_provider": "gemini",
-            "allowed_openai_params": ["extra_body"],
-            "extra_body": {"thinking_config": {"thinking_level": "HIGH"}},
         },
         stream=False,  # non-stream yields signature reliably
         temperature=1.0,
@@ -110,10 +109,9 @@ async def test_gemini_live_stream_signature():
     svc = LLMService()
     cfg = LLMConfig(
         model="gemini-3-flash-preview",
+        reasoning_effort="low",
         provider_options={
             "custom_llm_provider": "gemini",
-            "allowed_openai_params": ["extra_body"],
-            "extra_body": {"thinking_config": {"thinking_level": "HIGH"}},
         },
         stream=True,
         temperature=1.0,

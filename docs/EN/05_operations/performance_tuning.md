@@ -61,7 +61,6 @@ Notes:
 | `pmo.dispatched_timeout_seconds` | `CG__pmo__dispatched_timeout_seconds` | `30.0` | Reclaims `dispatched` items to idle when timed out | Benchmarks commonly set to `0` (disabled); production should be larger than worst-case queueing time to avoid false recovery |
 | `pmo.active_reap_seconds` | `CG__pmo__active_reap_seconds` | `300.0` | Reclaims long-running `running` heads | Keep default in production; shorten with alarm correlation when abnormal long-task backlog appears |
 | `pmo.pending_wakeup_seconds` | `CG__pmo__pending_wakeup_seconds` | `5.0` | Pending inbox (`queued/pending`) wakeup retransmit threshold | Lower to reduce visible latency when pending backlog grows |
-| `pmo.pending_wakeup_skip_seconds` | `CG__pmo__pending_wakeup_skip_seconds` | `300.0` | Missing `channel` threshold for pending-inbox skip (`<=0` disables) | Used to avoid endless retries on dirty data; too small values may drop alerts incorrectly |
 
 ### 2.3 PMO L0 Ordering and Queue State (no separate L0Subscriber config)
 

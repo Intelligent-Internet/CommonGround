@@ -4,29 +4,16 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional
 
 from core.errors import BadRequestError, NotFoundError, ProtocolViolationError
-from core.trace import trace_id_from_headers
 from core.utp_protocol import extract_tool_call_args
 
-from .context import ToolCallContext
+from core.cg_context import CGContext
+
+from .context import ToolCallEnvelope
 
 
 def extract_tool_call_metadata(tool_call_card: Any) -> Dict[str, Any]:
     meta = getattr(tool_call_card, "metadata", None)
     return dict(meta) if isinstance(meta, dict) else {}
-
-
-def extract_tool_call_lineage(tool_call_meta: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    def _maybe_str(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value)
-        return text if text else None
-
-    return {
-        "step_id": _maybe_str(tool_call_meta.get("step_id")),
-        "trace_id": _maybe_str(tool_call_meta.get("trace_id")),
-        "parent_step_id": _maybe_str(tool_call_meta.get("parent_step_id")),
-    }
 
 
 @dataclass
@@ -41,15 +28,13 @@ class ToolCallHydrationError(Exception):
 async def hydrate_tool_call_context(
     *,
     cardbox: Any,
-    subject: str,
-    parts: Any,
+    cg_ctx: CGContext,
     data: Mapping[str, Any],
-    headers: Mapping[str, str],
     payload: Any,
     require_tool_call_type: bool = False,
     validate_tool_call_id_match: bool = False,
-) -> ToolCallContext:
-    project_id = str(getattr(parts, "project_id", "") or "")
+) -> ToolCallEnvelope:
+    project_id = cg_ctx.project_id
     tool_call_card_id = getattr(payload, "tool_call_card_id", None)
     if not tool_call_card_id:
         raise ToolCallHydrationError(BadRequestError("missing required field: tool_call_card_id"), {})
@@ -73,9 +58,12 @@ async def hydrate_tool_call_context(
         )
 
     if validate_tool_call_id_match:
-        payload_tool_call_id = getattr(payload, "tool_call_id", None)
+        try:
+            ctx_tool_call_id = cg_ctx.require_tool_call_id
+        except ProtocolViolationError as exc:
+            raise ToolCallHydrationError(exc, tool_call_meta) from exc
         card_tool_call_id = getattr(tool_call_card, "tool_call_id", None)
-        if card_tool_call_id not in (None, "", payload_tool_call_id):
+        if card_tool_call_id not in (None, "", ctx_tool_call_id):
             raise ToolCallHydrationError(
                 ProtocolViolationError("tool_call_id mismatch between payload and tool.call card"),
                 tool_call_meta,
@@ -86,22 +74,17 @@ async def hydrate_tool_call_context(
     except ProtocolViolationError as exc:
         raise ToolCallHydrationError(exc, tool_call_meta) from exc
 
-    headers_dict = dict(headers or {})
     if "trace_id" not in tool_call_meta or not tool_call_meta.get("trace_id"):
-        fallback_trace_id = trace_id_from_headers(headers_dict)
+        fallback_trace_id = cg_ctx.trace_id
         if fallback_trace_id:
             tool_call_meta = dict(tool_call_meta)
             tool_call_meta["trace_id"] = str(fallback_trace_id)
 
-    return ToolCallContext(
-        project_id=project_id,
+    resolved_ctx = cg_ctx.with_lineage_meta(tool_call_meta)
+    return ToolCallEnvelope(
+        ctx=resolved_ctx,
         cmd_data=dict(data or {}),
-        tool_call_meta=tool_call_meta,
-        subject=subject,
-        parts=parts,
-        headers=headers_dict,
         payload=payload,
-        raw_data=dict(data or {}),
         tool_call_card=tool_call_card,
         args=args,
     )

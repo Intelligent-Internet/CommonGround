@@ -22,9 +22,7 @@ BUILTIN_AFTER_EXEC = {
 
 def _build_tool_result_card(
     *,
-    project_id: str,
-    cmd_data: Dict[str, Any],
-    tool_call_meta: Dict[str, Any],
+    ctx: CGContext,
     status: str,
     result: Any,
     error: Any,
@@ -32,10 +30,9 @@ def _build_tool_result_card(
     function_name: str,
     after_execution: str,
 ) -> Card:
-    result_context = ToolResultContext.from_cmd_data(
-        project_id=project_id,
-        cmd_data=cmd_data,
-        tool_call_meta=tool_call_meta,
+    result_context = ToolResultContext(
+        ctx=ctx,
+        cmd_data={"after_execution": after_execution, "tool_name": function_name},
     )
     builder = ToolResultBuilder(
         result_context,
@@ -200,45 +197,24 @@ async def try_execute_builtin_tool(
     args: Dict[str, Any],
     cardbox: CardBoxClient,
     ctx: CGContext,
-    tool_call_id: str,
     context_box_id: Optional[str],
 ) -> Optional[ActionOutcome]:
     if fn_name != "submit_result":
         return None
 
-    project_id = str(ctx.project_id or "")
-    agent_id = str(ctx.agent_id or "")
-    agent_turn_id = str(ctx.agent_turn_id or "")
-    step_id = str(ctx.step_id or "")
-    parent_step_id: Optional[str] = ctx.parent_step_id
-    trace_id: Optional[str] = ctx.trace_id
-    if not project_id or not agent_id or not agent_turn_id or not step_id:
-        raise ValueError("try_execute_builtin_tool requires ctx with project/agent/turn/step ids")
+    _ = ctx.require_agent_turn_id
+    _ = ctx.require_step_id
+    _ = ctx.require_tool_call_id
 
     result_any = args.get("result") if isinstance(args, dict) else None
-    tool_call_meta = {
-        "step_id": step_id,
-        **({"trace_id": trace_id} if trace_id else {}),
-        **({"parent_step_id": parent_step_id} if parent_step_id else {}),
-    }
-    cmd_data = {
-        "tool_call_id": tool_call_id,
-        "agent_turn_id": agent_turn_id,
-        "turn_epoch": 0,
-        "agent_id": agent_id,
-        "after_execution": "suspend",
-        "tool_name": "submit_result",
-    }
 
     if result_any is None:
         tool_result_card = _build_tool_result_card(
-            project_id=project_id,
-            cmd_data=cmd_data,
-            tool_call_meta=tool_call_meta,
+            ctx=ctx,
             status=STATUS_FAILED,
             result=None,
             error="submit_result requires args.result",
-            author_id=agent_id,
+            author_id=ctx.agent_id,
             function_name="submit_result",
             after_execution="suspend",
         )
@@ -248,9 +224,9 @@ async def try_execute_builtin_tool(
     required_fields: List[Dict[str, str]] = []
     if context_box_id:
         try:
-            box = await cardbox.get_box(str(context_box_id), project_id=project_id)
+            box = await cardbox.get_box(str(context_box_id), project_id=ctx.project_id)
             if box and box.card_ids:
-                cards = await cardbox.get_cards(list(box.card_ids), project_id=project_id)
+                cards = await cardbox.get_cards(list(box.card_ids), project_id=ctx.project_id)
                 for c in reversed(cards):
                     if getattr(c, "type", "") == "task.result_fields":
                         required_fields = _extract_result_fields_from_card_content(
@@ -263,28 +239,23 @@ async def try_execute_builtin_tool(
     normalized, err = _normalize_submit_result_payload(result_any, required_fields=required_fields)
     if err:
         tool_result_card = _build_tool_result_card(
-            project_id=project_id,
-            cmd_data=cmd_data,
-            tool_call_meta=tool_call_meta,
+            ctx=ctx,
             status=STATUS_FAILED,
             result=None,
             error=err,
-            author_id=agent_id,
+            author_id=ctx.agent_id,
             function_name="submit_result",
             after_execution="suspend",
         )
         await cardbox.save_card(tool_result_card)
         return ActionOutcome(cards=[tool_result_card], suspend=False, mark_complete=False)
 
-    cmd_data["after_execution"] = "terminate"
     tool_result_card = _build_tool_result_card(
-        project_id=project_id,
-        cmd_data=cmd_data,
-        tool_call_meta=tool_call_meta,
+        ctx=ctx,
         status=STATUS_SUCCESS,
         result=normalized,
         error=None,
-        author_id=agent_id,
+        author_id=ctx.agent_id,
         function_name="submit_result",
         after_execution="terminate",
     )
@@ -295,17 +266,16 @@ async def try_execute_builtin_tool(
     )
     deliverable_card = Card(
         card_id=uuid6.uuid7().hex,
-        project_id=project_id,
+        project_id=ctx.project_id,
         type="task.deliverable",
         content=deliverable_content,
         created_at=datetime.now(UTC),
-        author_id=agent_id,
+        author_id=ctx.agent_id,
         metadata={
-            "agent_turn_id": agent_turn_id,
-            "step_id": step_id,
+            "agent_turn_id": ctx.agent_turn_id,
+            "step_id": ctx.step_id,
             "role": "assistant",
-            **({"trace_id": trace_id} if trace_id else {}),
-            **({"parent_step_id": parent_step_id} if parent_step_id else {}),
+            **ctx.to_lineage_meta(exclude_step_id=True),
         },
     )
     await cardbox.save_card(tool_result_card)

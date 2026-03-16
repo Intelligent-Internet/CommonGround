@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 
 import toml
 
+from core.cg_context import CGContext
 from core.utils import REPO_ROOT, set_loop_policy, set_python_path
 
 set_loop_policy()
@@ -72,22 +73,21 @@ class SandboxReaper:
         for row in rows:
             project_id = str(row.get("project_id"))
             agent_id = str(row.get("agent_id"))
+            ctx = CGContext(project_id=project_id, agent_id=agent_id)
             sandbox_id = str(row.get("sandbox_id"))
             domain = row.get("domain") or self.domain
             await self.sandbox_store.mark_status(
-                project_id=project_id,
-                agent_id=agent_id,
+                ctx=ctx,
                 status="deleting",
                 metadata={"last_reap_attempt": "delete"},
             )
             try:
                 await asyncio.to_thread(self._kill_sandbox, sandbox_id, domain)
-                await self.sandbox_store.delete_sandbox(project_id=project_id, agent_id=agent_id)
+                await self.sandbox_store.delete_sandbox(ctx=ctx)
                 logger.info("Deleted sandbox %s (project=%s agent=%s)", sandbox_id, project_id, agent_id)
             except Exception as exc:  # noqa: BLE001
                 await self.sandbox_store.mark_status(
-                    project_id=project_id,
-                    agent_id=agent_id,
+                    ctx=ctx,
                     status="error",
                     metadata={"last_error": str(exc)},
                 )

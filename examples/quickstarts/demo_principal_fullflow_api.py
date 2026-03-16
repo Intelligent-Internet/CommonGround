@@ -185,7 +185,7 @@ async def main() -> None:
         await _ensure_project(api, str(args.project))
         await _ensure_resources(api, str(args.project), str(args.profile_name))
 
-        launcher_agent_id = f"demo_launcher_{uuid6.uuid7().hex[:12]}"
+        launcher_agent_id = f"demo_launcher_{uuid6.uuid7().hex[-12:]}"
         upsert_resp = await api.post(
             f"/projects/{args.project}/agents",
             json={
@@ -201,7 +201,7 @@ async def main() -> None:
         )
         upsert_resp.raise_for_status()
 
-        principal_agent_id = f"principal_{uuid6.uuid7().hex[:12]}"
+        principal_agent_id = f"principal_{uuid6.uuid7().hex[-12:]}"
         provision = await _call_pmo(
             api,
             project_id=str(args.project),

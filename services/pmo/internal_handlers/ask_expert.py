@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
+from core.cg_context import CGContext
 from core.errors import BadRequestError, ProtocolViolationError
 from core.utils import safe_str
 
-from .base import InternalHandlerResult
-from .context import InternalHandlerContext
+from .base import InternalHandlerDeps, InternalHandlerResult
 from .delegate_async import DelegateAsyncHandler
 from .orchestration_primitives import resolve_current_output_box_id
 
@@ -17,10 +18,11 @@ class AskExpertHandler:
     async def handle(
         self,
         *,
-        ctx: InternalHandlerContext,
+        deps: InternalHandlerDeps,
+        ctx: CGContext,
+        cmd: Any,
         parent_after_execution: str,
     ) -> InternalHandlerResult:
-        cmd = ctx.cmd
         if cmd.tool_name != self.name:
             raise ProtocolViolationError(
                 f"tool_name mismatch: expected {self.name}, got {safe_str(cmd.tool_name)}"
@@ -43,22 +45,22 @@ class AskExpertHandler:
         }
         if include_history:
             output_box_id = await resolve_current_output_box_id(
-                deps=ctx.deps,
-                project_id=ctx.meta.project_id,
-                agent_id=cmd.source_agent_id,
+                deps=deps,
+                ctx=ctx,
             )
             delegate_args["context_box_id"] = output_box_id
 
         delegate_cmd = SimpleNamespace(
             tool_name="delegate_async",
             arguments=delegate_args,
-            source_agent_id=cmd.source_agent_id,
-            agent_turn_id=cmd.agent_turn_id,
+            source_agent_id=ctx.agent_id,
+            agent_turn_id=ctx.agent_turn_id,
             tool_call_id=cmd.tool_call_id,
-            step_id=cmd.step_id,
+            step_id=ctx.step_id,
         )
-        delegate_ctx = ctx.fork(cmd=delegate_cmd)
         return await DelegateAsyncHandler().handle(
-            ctx=delegate_ctx,
+            deps=deps,
+            ctx=ctx,
+            cmd=delegate_cmd,
             parent_after_execution=parent_after_execution,
         )

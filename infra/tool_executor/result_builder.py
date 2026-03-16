@@ -17,9 +17,9 @@ from core.utp_protocol import (
     ToolResultContent,
     normalize_after_execution,
 )
+from core.cg_context import CGContext
 
 from .context import ToolResultContext
-from .hydration import extract_tool_call_lineage
 
 
 def _is_json_serializable(value: Any) -> bool:
@@ -52,25 +52,17 @@ def _normalize_after_execution(
 
 def build_tool_result_metadata(
     *,
-    agent_turn_id: Any,
-    tool_call_id: Any,
+    ctx: CGContext,
     function_name: Any,
-    tool_call_meta: Dict[str, Any],
     role: str = "tool",
 ) -> Dict[str, Any]:
-    lineage = extract_tool_call_lineage(tool_call_meta)
     metadata: Dict[str, Any] = {
-        "agent_turn_id": str(agent_turn_id),
-        "tool_call_id": str(tool_call_id),
+        "agent_turn_id": ctx.require_agent_turn_id,
+        "tool_call_id": str(ctx.tool_call_id or ""),
         "role": role,
         "function_name": str(function_name),
     }
-    if lineage["step_id"]:
-        metadata["step_id"] = lineage["step_id"]
-    if lineage["trace_id"]:
-        metadata["trace_id"] = lineage["trace_id"]
-    if lineage["parent_step_id"]:
-        metadata["parent_step_id"] = lineage["parent_step_id"]
+    metadata.update(ctx.to_lineage_meta())
     return metadata
 
 
@@ -84,6 +76,7 @@ class ToolResultBuilder:
         error_source: str = "tool",
     ):
         self.ctx = ctx
+        self.cg_ctx = ctx.ctx
         self.author_id = str(author_id)
         self.function_name = function_name
         self.error_source = str(error_source)
@@ -227,31 +220,25 @@ class ToolResultBuilder:
             result=result,
             error=normalized_error,
         )
+        cg_ctx = self.cg_ctx
 
         result_card = SchemaCard(
             card_id=uuid6.uuid7().hex,
-            project_id=str(self.ctx.project_id),
+            project_id=cg_ctx.project_id,
             type="tool.result",
             content=content,
             created_at=datetime.now(UTC),
             author_id=self.author_id,
             metadata=build_tool_result_metadata(
-                agent_turn_id=self.ctx.agent_turn_id,
-                tool_call_id=self.ctx.tool_call_id,
+                ctx=cg_ctx,
                 function_name=resolved_function_name,
-                tool_call_meta=self.ctx.tool_call_meta,
             ),
-            tool_call_id=str(self.ctx.tool_call_id),
+            tool_call_id=str(cg_ctx.tool_call_id or ""),
         )
 
         payload = {
-            "tool_call_id": str(self.ctx.tool_call_id),
-            "agent_turn_id": str(self.ctx.agent_turn_id),
-            "turn_epoch": int(self.ctx.turn_epoch),
             "after_execution": str(effective_after_execution),
             "status": status_value,
             "tool_result_card_id": result_card.card_id,
-            "agent_id": str(self.ctx.agent_id),
-            "step_id": self.ctx.step_id,
         }
         return payload, result_card

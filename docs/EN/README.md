@@ -2,6 +2,13 @@
 
 This repository documentation is organized by the user task path, and for open-source users it is divided into the `01~05` directories.
 
+## V1 Final Release Entry
+
+If you are landing on the final `v1` release candidate, start here before reading the rest of the docs:
+
+- `05_operations/v1r4_release_notes.md`: final `V1R4` release summary against `main`
+- `05_operations/migration_v1r3_to_v1r4.md`: upgrade checklist from earlier `v1r3` deployments
+
 ## New Entry (Recommended First)
 
 ```text
@@ -27,10 +34,13 @@ docs/EN/
 │   ├── utp_tool_protocol.md
 │   ├── cardbox_storage.md
 │   ├── watchdog_safety_net.md
-│   └── traceability.md
+│   ├── traceability.md
+│   └── cg_context_spec.md
 ├── 05_operations/              # For operations troubleshooting
+│   ├── v1r4_release_notes.md
 │   ├── performance_tuning.md
-│   └── observability.md
+│   ├── observability.md
+│   └── migration_v1r3_to_v1r4.md
 ├── REFERENCE/                  # Reference dictionary
 │   ├── data_schema.md
 │   └── nats_subjects.generated.md
@@ -40,10 +50,11 @@ docs/EN/
 ## Reading Order
 
 1. First contact: `01_getting_started/quick_start.md`
-2. Application development: `02_building_agents/*`
-3. Kernel mechanisms: `03_kernel_l1/*`
-4. Protocol constraints: `04_protocol_l0/*`
-5. Operations troubleshooting: `05_operations/*`
+2. Final `v1` release summary / upgrade path: `05_operations/v1r4_release_notes.md` / `05_operations/migration_v1r3_to_v1r4.md`
+3. Application development: `02_building_agents/*`
+4. Kernel mechanisms: `03_kernel_l1/*`
+5. Protocol constraints: `04_protocol_l0/*`
+6. Operations troubleshooting: `05_operations/*`
 
 ## Legacy Directory
 

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from psycopg_pool import AsyncConnectionPool
 
+from core.cg_context import CGContext
 from .base import BaseStore
 
 
@@ -30,20 +31,19 @@ class SandboxStore(BaseStore):
     async def close(self, *, timeout: float | None = None) -> None:
         await super().close(timeout=timeout)
 
-    async def get_sandbox(self, *, project_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
+    async def get_sandbox(self, *, ctx: CGContext) -> Optional[Dict[str, Any]]:
         sql = """
             SELECT *
             FROM resource.sandboxes
             WHERE project_id=%s AND agent_id=%s
         """
-        row = await self.fetch_one(sql, (project_id, agent_id))
+        row = await self.fetch_one(sql, (ctx.project_id, ctx.agent_id))
         return dict(row) if row else None
 
     async def upsert_sandbox(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         sandbox_id: str,
         domain: Optional[str],
         template: Optional[str],
@@ -81,8 +81,8 @@ class SandboxStore(BaseStore):
         row = await self.fetch_one(
             sql,
             (
-                project_id,
-                agent_id,
+                ctx.project_id,
+                ctx.agent_id,
                 sandbox_id,
                 domain,
                 template,
@@ -100,8 +100,7 @@ class SandboxStore(BaseStore):
     async def touch_sandbox(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         expires_at: Optional[datetime],
     ) -> None:
         sql = """
@@ -111,13 +110,12 @@ class SandboxStore(BaseStore):
             WHERE project_id=%s AND agent_id=%s
         """
         async with self.pool.connection() as conn:
-            await conn.execute(sql, (expires_at, project_id, agent_id))
+            await conn.execute(sql, (expires_at, ctx.project_id, ctx.agent_id))
 
     async def try_lock(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         locked_by: str,
         lock_expires_at: datetime,
     ) -> bool:
@@ -130,24 +128,23 @@ class SandboxStore(BaseStore):
         async with self.pool.connection() as conn:
             res = await conn.execute(
                 sql,
-                (locked_by, lock_expires_at, project_id, agent_id, locked_by),
+                (locked_by, lock_expires_at, ctx.project_id, ctx.agent_id, locked_by),
             )
             return res.rowcount > 0
 
-    async def release_lock(self, *, project_id: str, agent_id: str, locked_by: str) -> None:
+    async def release_lock(self, *, ctx: CGContext, locked_by: str) -> None:
         sql = """
             UPDATE resource.sandboxes
             SET locked_by=NULL, locked_at=NULL, lock_expires_at=NULL
             WHERE project_id=%s AND agent_id=%s AND locked_by=%s
         """
         async with self.pool.connection() as conn:
-            await conn.execute(sql, (project_id, agent_id, locked_by))
+            await conn.execute(sql, (ctx.project_id, ctx.agent_id, locked_by))
 
     async def mark_status(
         self,
         *,
-        project_id: str,
-        agent_id: str,
+        ctx: CGContext,
         status: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -158,15 +155,15 @@ class SandboxStore(BaseStore):
             WHERE project_id=%s AND agent_id=%s
         """
         async with self.pool.connection() as conn:
-            await conn.execute(sql, (status, json.dumps(metadata or {}), project_id, agent_id))
+            await conn.execute(sql, (status, json.dumps(metadata or {}), ctx.project_id, ctx.agent_id))
 
-    async def delete_sandbox(self, *, project_id: str, agent_id: str) -> None:
+    async def delete_sandbox(self, *, ctx: CGContext) -> None:
         sql = """
             DELETE FROM resource.sandboxes
             WHERE project_id=%s AND agent_id=%s
         """
         async with self.pool.connection() as conn:
-            await conn.execute(sql, (project_id, agent_id))
+            await conn.execute(sql, (ctx.project_id, ctx.agent_id))
 
     async def list_expired(
         self,

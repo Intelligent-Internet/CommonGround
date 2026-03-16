@@ -3,16 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
 
+from core.cg_context import CGContext
+
 
 @dataclass(frozen=True, slots=True)
 class BatchCreateRequest:
-    project_id: str
-    channel_id: str
-    source_agent_id: str
-    parent_agent_turn_id: str
-    parent_turn_epoch: int
-    parent_tool_call_id: str
-    parent_step_id: str
+    parent_ctx: CGContext
     parent_after_execution: str
     tool_suffix: str
     task_specs: List[Dict[str, Any]]
@@ -20,9 +16,7 @@ class BatchCreateRequest:
     deadline_seconds: Optional[float]
     lineage_parent_step_id: Optional[str] = None
     structured_output: Optional[str] = None
-    trace_id: Optional[str] = None
     parent_traceparent: Optional[str] = None
-    recursion_depth: Optional[int] = None
 
 
 class Orchestrator(Protocol):

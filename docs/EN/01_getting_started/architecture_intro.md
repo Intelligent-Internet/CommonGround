@@ -48,7 +48,7 @@ Documentation entry points:
 1) **Enqueue/Report**: `L0Engine` or its wrapper (such as `infra/l0/tool_reports.py`) writes requests to `state.agent_inbox` and records `execution_edges`.
 2) **Wakeup**: L0 publishes `cmd.agent.{target}.wakeup` based on `worker_target` (the `target` is the `worker_target` from `resource.roster`, for example, `worker_generic`).
 3) **Worker**: acquires lock competitively → claims inbox in batches → hydrates `state/resource/cards` → executes LLM.
-4) **Tool Call**: Worker writes `tool.call` card and publishes commands to the topic defined by `target_subject` in the tool definition (usually `cmd.sys.pmo.internal.*` or `cmd.tool.*`).
+4) **Tool Call**: Worker/ToolCaller/API write `tool.call` card, then dispatch commands through `L0Engine.command_intent` to the tool-defined `target_subject` (usually `cmd.sys.pmo.internal.*` or `cmd.tool.*`).
 5) **Report**: Tool callbacks write `tool.result` card, which flows back through `infra/l0/tool_reports.py` to `L0Engine.report`, into `state.agent_inbox`, and triggers `cmd.agent.{target}.wakeup` again.
 6) **Finalize**: Worker writes/updates `task.deliverable` when finishing a turn and publishes `evt.agent.*.task`.
 > Constraint: **success/failure of one Turn is consolidated into one `evt.agent.*.task` result event** for that Turn. `BatchManager` dispatches multiple sub-turns, so multiple task results are generated.
@@ -74,7 +74,7 @@ Based on VSM cybernetics, dampers suppress inter-subsystem oscillation and preve
   - Propagation and increment:
     - Current L0 primitives default `enqueue_mode` processing to `"call"`; code does not preserve `transfer/notify` modes.
     - Depth is typically propagated along call relationships; default user entry depth is `0`.
-    - For explicit child-call derivation, PMO increments manually, such as `services/pmo/internal_handlers/context.py::bump_recursion_depth` and `services/pmo/l1_orchestrators/batch_manager.py::child_depth = parent_depth + 1`.
+    - Spawn-like child dispatch now goes through L0 `SpawnIntent`; callers provide target intent and lineage, while L0 derives child depth and topology.
     - `Join/Report` constrain and inherit original depth by `correlation_id`; `tool_result`/`timeout` paths remain consistent.
   - Differentiation: this threshold stabilizes cross-Agent call chains and complements, rather than replaces, per-Agent internal `max_steps`.
 

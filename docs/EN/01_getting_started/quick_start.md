@@ -2,6 +2,8 @@
 
 This page gives an end-to-end path: environment preparation -> initialization -> starting services -> resource setup -> running the demo. For more protocol and implementation details, see the L0/L1 documentation.
 
+The current repository target is the final `V1R4` release of the `v1` line. If you are upgrading from an older `v1r3` deployment, read the release note and migration guide in `../05_operations/` first.
+
 ## Compatibility Notes
 
 - The project currently supports Linux/macOS path semantics more completely. If you use Windows, it is recommended to run this guide under **WSL2** or **Docker** to avoid path and process-detection compatibility issues.
@@ -15,7 +17,7 @@ This page gives an end-to-end path: environment preparation -> initialization ->
 > `git submodule update --init --recursive`
 
 ### Dependencies
-- Python 3.12+ (main branch is based on 3.12)
+- Python 3.13+ (repo baseline is based on 3.13)
 - `uv`
 - Postgres (recommended 15+)
 - NATS (2.10+, with JetStream enabled)
@@ -61,9 +63,11 @@ cp config.toml.sample config.toml
 ```
 Edit `[protocol]`, `[nats]`, and `[cardbox]` in `config.toml` as needed, and set the DB DSN.
 
-> Important: `[protocol].version` must be `v1r3` (and match your deployed protocol). If missing or incorrect, NATS subjects may not match and Worker/PMO may not receive messages.
+> Important: `[protocol].version` must be `v1r4` (and match your deployed protocol). If missing or incorrect, NATS subjects may not match and Worker/PMO may not receive messages.
 
 > Port note: default docker-compose ports are NATS 4222 and Postgres 5432; the repository example DSN may use 5433, so rely on your local `config.toml`.
+
+> Local override note: if `4222` is already occupied on your machine, either update `[nats].servers` in `config.toml` or export `NATS_SERVERS=nats://127.0.0.1:4223` (or another local port) before running services/examples.
 
 ## 2. Initialize Database
 
@@ -212,7 +216,7 @@ uv run -m examples.quickstarts.demo_ui_action \
 
 ### 6.1 Subscribe to Streaming Output
 ```bash
-nats sub "cg.v1r3.proj_demo_01.public.str.agent.*.chunk"
+nats sub "cg.v1r4.proj_demo_01.public.str.agent.*.chunk"
 ```
 
 ### 6.2 Agent scheduling inspection (script)

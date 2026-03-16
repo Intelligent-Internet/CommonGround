@@ -6,7 +6,6 @@ from datetime import datetime, UTC
 from typing import Any, Optional
 
 from core.cg_context import CGContext
-from core.subject import format_subject
 from core.utp_protocol import AgentTaskPayload
 from core.utp_protocol import Card, JsonContent, TextContent
 from core.status import STATUS_FAILED, STATUS_TIMEOUT
@@ -14,13 +13,12 @@ from core.time_utils import to_iso, utc_now
 from infra.event_emitter import emit_agent_state, emit_agent_task
 from core.utils import safe_str
 from core.errors import ProtocolViolationError
-from infra.agent_routing import resolve_agent_target
 from infra.cardbox_client import CardBoxClient
-from infra.l0_engine import L0Engine
+from infra.stores.context_hydration import build_replay_context, build_state_head_context
+from infra.l0_engine import AddressIntent, L0Engine, TurnRef
+from infra.l1_helpers import finish_turn_idle_and_emit
 from infra.nats_client import NATSClient
-from infra.primitives import enqueue as enqueue_primitive
 from infra.stores import ExecutionStore, ResourceStore, StateStore
-from infra.worker_helpers import normalize_headers
 
 logger = logging.getLogger("PMO.L0Guard")
 
@@ -40,7 +38,6 @@ class L0Guard:
         dispatched_timeout_seconds: float,
         active_reap_seconds: float,
         pending_wakeup_seconds: float,
-        pending_wakeup_skip_seconds: float,
     ) -> None:
         self.state_store = state_store
         self.resource_store = resource_store
@@ -57,32 +54,112 @@ class L0Guard:
         self.dispatched_timeout_seconds = dispatched_timeout_seconds
         self.active_reap_seconds = active_reap_seconds
         self.pending_wakeup_seconds = pending_wakeup_seconds
-        self.pending_wakeup_skip_seconds = pending_wakeup_skip_seconds
 
-    def _normalize_watchdog_headers(
+    def _normalize_watchdog_ctx(
         self,
         *,
-        trace_id: Optional[str] = None,
-        default_depth: int = 0,
-        headers: Optional[dict[str, str]] = None,
-    ) -> tuple[dict[str, str], Optional[str], int]:
-        merged_headers = dict(headers or {})
+        ctx: CGContext,
+    ) -> Optional[CGContext]:
         try:
-            normalized, resolved_trace_id, depth = normalize_headers(
-                nats=self.nats,
-                headers=merged_headers,
-                trace_id=trace_id,
-                default_depth=default_depth,
+            return ctx.with_trace_transport(
+                base_headers=ctx.headers,
+                trace_id=ctx.trace_id,
+                default_depth=int(ctx.recursion_depth),
             )
         except ProtocolViolationError as exc:
-            logger.warning("Watchdog default header normalization fallback: %s", exc)
-            normalized, resolved_trace_id, depth = normalize_headers(
-                nats=self.nats,
-                headers={},
-                trace_id=trace_id,
-                default_depth=default_depth,
+            logger.warning("Watchdog context normalization failed: %s", exc)
+            return None
+
+    def _head_turn_ctx(self, head: Any) -> Optional[CGContext]:
+        try:
+            return build_state_head_context(head)
+        except ProtocolViolationError as exc:
+            logger.warning(
+                "Watchdog invalid state_head context agent=%s turn=%s err=%s",
+                getattr(head, "agent_id", None),
+                getattr(head, "active_agent_turn_id", None),
+                exc,
             )
-        return normalized, resolved_trace_id, int(depth or default_depth or 0)
+            return None
+
+    def _normalize_head_ctx(self, head: Any) -> Optional[CGContext]:
+        head_ctx = self._head_turn_ctx(head)
+        if head_ctx is None:
+            return None
+        return self._normalize_watchdog_ctx(ctx=head_ctx)
+
+    @staticmethod
+    def _force_termination_ctx_from_head(head: Any) -> CGContext:
+        return CGContext(
+            project_id=head.project_id,
+            agent_id=head.agent_id,
+            agent_turn_id=head.active_agent_turn_id or "",
+            channel_id=head.active_channel_id or "public",
+        )
+
+    def _normalize_head_ctx_for_action(self, *, head: Any, action: str) -> Optional[CGContext]:
+        normalized_head_ctx = self._normalize_head_ctx(head)
+        if normalized_head_ctx is None:
+            logger.warning(
+                "Watchdog skip %s: invalid head context, agent=%s turn=%s",
+                action,
+                head.agent_id,
+                head.active_agent_turn_id,
+            )
+            return None
+        return normalized_head_ctx
+
+    @staticmethod
+    def _build_watchdog_retransmit_correlation_id(head: Any) -> str:
+        turn_id = safe_str(getattr(head, "active_agent_turn_id", None))
+        nonce = uuid6.uuid7().hex
+        if turn_id:
+            return f"{turn_id}:watchdog_retransmit:{nonce}"
+        return f"watchdog_retransmit:{nonce}"
+
+    async def _mark_pending_inbox_error(
+        self,
+        *,
+        inbox_id: Any,
+        project_id: Any,
+        agent_id: Any,
+        error_code: str,
+        detail: Optional[str] = None,
+    ) -> None:
+        patch: dict[str, Any] = {
+            "watchdog_error": error_code,
+            "watchdog_at": to_iso(utc_now()),
+        }
+        if detail:
+            patch["watchdog_detail"] = detail
+        try:
+            await self.execution_store.patch_inbox_payload(
+                inbox_id=inbox_id,
+                project_id=project_id,
+                patch=patch,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        await self.execution_store.update_inbox_status(
+            inbox_id=inbox_id,
+            project_id=project_id,
+            status="error",
+        )
+        if detail:
+            logger.warning(
+                "Watchdog mark invalid pending inbox as error inbox=%s agent=%s code=%s detail=%s",
+                inbox_id,
+                agent_id,
+                error_code,
+                detail,
+            )
+            return
+        logger.warning(
+            "Watchdog mark invalid pending inbox as error inbox=%s agent=%s code=%s",
+            inbox_id,
+            agent_id,
+            error_code,
+        )
 
     async def _ensure_watchdog_deliverable(
         self,
@@ -90,6 +167,10 @@ class L0Guard:
         *,
         reason: str,
     ) -> Optional[str]:
+        # Business-level safety net (must keep): when a turn times out/reaped and no
+        # explicit task.deliverable exists, PMO watchdog must synthesize one so
+        # downstream consumers can always rely on output_box terminal artifact.
+        # This is intentionally NOT part of protocol fallback cleanup.
         deliverable_card_id: Optional[str] = None
         if not head.output_box_id:
             return None
@@ -164,78 +245,72 @@ class L0Guard:
                     head.agent_id,
                 )
                 continue
+            head_ctx = self._head_turn_ctx(head)
+            if head_ctx is None:
+                continue
             claimed = await self.state_store.update(
-                project_id=head.project_id,
-                agent_id=head.agent_id,
-                expect_turn_epoch=head.turn_epoch,
-                expect_agent_turn_id=head.active_agent_turn_id,
+                ctx=head_ctx,
                 new_status="dispatched",
             )
             if not claimed:
                 continue
 
             payload = AgentTaskPayload(
-                agent_turn_id=head.active_agent_turn_id,
-                agent_id=head.agent_id,
-                channel_id=head.active_channel_id,
                 profile_box_id=safe_str(head.profile_box_id),
                 context_box_id=safe_str(head.context_box_id),
                 output_box_id=safe_str(head.output_box_id),
-                turn_epoch=head.turn_epoch,
-                parent_agent_turn_id=None,
                 runtime_config={},
             )
-            default_depth = int(getattr(head, "active_recursion_depth", 0) or 0)
-            headers, trace_id, depth = self._normalize_watchdog_headers(
-                trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
-                default_depth=default_depth,
-            )
+            enqueue_ctx = self._normalize_head_ctx_for_action(head=head, action="resend")
+            if enqueue_ctx is None:
+                continue
             async with self.execution_store.pool.connection() as conn:
                 async with conn.transaction():
-                    enqueue_result = await enqueue_primitive(
-                        store=self.execution_store,
-                        project_id=head.project_id,
-                        channel_id=head.active_channel_id,
-                        target_agent_id=head.agent_id,
-                        message_type="turn",
-                        payload=payload.model_dump(),
-                        enqueue_mode="call",
-                        correlation_id=None,
-                        recursion_depth=depth,
-                        headers=headers,
-                        traceparent=headers.get("traceparent"),
-                        tracestate=headers.get("tracestate"),
-                        trace_id=trace_id,
-                        parent_step_id=head.parent_step_id,
-                        source_agent_id=None,
-                        source_agent_turn_id=None,
-                        source_step_id=head.parent_step_id,
-                        target_agent_turn_id=head.active_agent_turn_id,
+                    enqueue_result = await self.l0.enqueue_intent(
+                        source_ctx=enqueue_ctx.evolve(
+                            agent_id="sys.pmo.l0_guard",
+                            agent_turn_id="",
+                            step_id=None,
+                            tool_call_id=None,
+                        ),
+                        intent=AddressIntent(
+                            target=TurnRef(
+                                project_id=head.project_id,
+                                agent_id=head.agent_id,
+                                agent_turn_id=str(head.active_agent_turn_id),
+                                expected_turn_epoch=int(head.turn_epoch) if int(head.turn_epoch or 0) > 0 else None,
+                            ),
+                            message_type="turn",
+                            payload=payload.model_dump(),
+                            correlation_id=self._build_watchdog_retransmit_correlation_id(head),
+                        ),
                         conn=conn,
+                        wakeup=True,
                     )
-            headers = dict(headers)
-            headers["traceparent"] = enqueue_result.traceparent
-            target = await resolve_agent_target(
-                resource_store=self.resource_store,
-                project_id=head.project_id,
-                agent_id=head.agent_id,
-            )
-            if not target:
-                logger.warning("Watchdog skip wake-up: missing worker_target, agent=%s", head.agent_id)
+            if enqueue_result.status != "accepted":
+                logger.warning(
+                    "Watchdog retransmit enqueue rejected: status=%s code=%s agent=%s turn=%s",
+                    enqueue_result.status,
+                    enqueue_result.error_code,
+                    head.agent_id,
+                    head.active_agent_turn_id,
+                )
                 continue
-            wakeup_subject = format_subject(
-                head.project_id,
-                head.active_channel_id,
-                "cmd",
-                "agent",
-                target,
-                "wakeup",
-            )
-            await self.nats.publish_event(
-                wakeup_subject,
-                {"agent_id": head.agent_id, "agent_turn_id": head.active_agent_turn_id},
-                headers=headers,
-            )
+            wakeup_signals = list(enqueue_result.wakeup_signals or ())
+            if wakeup_signals:
+                await self.l0.publish_wakeup_signals(wakeup_signals)
+            else:
+                wakeup_ctx = enqueue_ctx.with_trace_transport(
+                    trace_id=safe_str(enqueue_result.payload.get("trace_id")) or enqueue_ctx.trace_id,
+                    default_depth=int(enqueue_ctx.recursion_depth),
+                ).evolve(
+                    channel_id=head.active_channel_id,
+                )
+                await self.l0.wakeup(
+                    target_ctx=wakeup_ctx,
+                    reason="watchdog_retransmit",
+                    metadata={"agent_turn_id": safe_str(head.active_agent_turn_id)},
+                )
             logger.warning(
                 "Watchdog retransmitting wake-up: agent=%s turn=%s epoch=%s",
                 head.agent_id,
@@ -255,16 +330,20 @@ class L0Guard:
         for head in heads:
             if not head.active_agent_turn_id:
                 continue
-            updated = await self.state_store.finish_turn_idle(
-                project_id=head.project_id,
-                agent_id=head.agent_id,
-                expect_turn_epoch=head.turn_epoch,
-                expect_agent_turn_id=head.active_agent_turn_id,
+            head_ctx = self._head_turn_ctx(head)
+            if head_ctx is None:
+                continue
+            output_box_id = str(head.output_box_id) if head.output_box_id else None
+            committed_ctx = await finish_turn_idle_and_emit(
+                state_store=self.state_store,
+                nats=self.nats,
+                ctx=head_ctx,
+                last_output_box_id=output_box_id,
                 expect_status="dispatched",
-                last_output_box_id=safe_str(head.output_box_id),
                 bump_epoch=True,
+                state_metadata={"error": "dispatch_timeout"},
             )
-            if not updated:
+            if committed_ctx is None:
                 continue
             logger.warning(
                 "Watchdog handling dispatch timeout: agent=%s turn=%s epoch=%s",
@@ -273,31 +352,8 @@ class L0Guard:
                 head.turn_epoch,
             )
 
-            headers, _, _ = self._normalize_watchdog_headers(
-                trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
-                default_depth=int(getattr(head, "active_recursion_depth", 0) or 0),
-            )
-            state_ctx = CGContext(
-                project_id=head.project_id,
-                channel_id=head.active_channel_id or "public",
-                agent_id=head.agent_id,
-                agent_turn_id=head.active_agent_turn_id,
-                trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
-                headers=dict(headers or {}),
-            )
-            await emit_agent_state(
-                nats=self.nats,
-                ctx=state_ctx,
-                turn_epoch=head.turn_epoch,
-                status="idle",
-                output_box_id=str(head.output_box_id) if head.output_box_id else None,
-                metadata={"error": "dispatch_timeout"},
-            )
-
             await self.state_store.record_force_termination(
-                project_id=head.project_id,
-                agent_id=head.agent_id,
-                agent_turn_id=head.active_agent_turn_id,
+                ctx=self._force_termination_ctx_from_head(head),
                 reason="dispatch_timeout",
                 output_box_id=head.output_box_id,
             )
@@ -307,38 +363,27 @@ class L0Guard:
                 reason="dispatch_timeout",
             )
 
-            headers, _, _ = self._normalize_watchdog_headers(
-                trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
-                default_depth=int(getattr(head, "active_recursion_depth", 0) or 0),
-            )
-            task_ctx = CGContext(
-                project_id=head.project_id,
-                channel_id=head.active_channel_id or "public",
-                agent_id=head.agent_id,
-                agent_turn_id=head.active_agent_turn_id,
-                trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
-                headers=dict(headers or {}),
-            )
-            await emit_agent_task(
-                nats=self.nats,
-                ctx=task_ctx,
-                status=STATUS_TIMEOUT,
-                output_box_id=str(head.output_box_id) if head.output_box_id else None,
-                deliverable_card_id=str(deliverable_card_id) if deliverable_card_id else None,
-                error="dispatch_timeout",
-                stats={},
-            )
+            normalized_committed_ctx = self._normalize_watchdog_ctx(ctx=committed_ctx)
+            if normalized_committed_ctx is not None:
+                await emit_agent_task(
+                    nats=self.nats,
+                    ctx=normalized_committed_ctx,
+                    status=STATUS_TIMEOUT,
+                    output_box_id=output_box_id,
+                    deliverable_card_id=str(deliverable_card_id) if deliverable_card_id else None,
+                    error="dispatch_timeout",
+                    stats={},
+                )
 
             # Try to move forward in the queue after forcing idle.
             try:
-                await self.l0.wakeup(
-                    project_id=head.project_id,
-                    channel_id=head.active_channel_id or "public",
-                    target_agent_id=head.agent_id,
-                    mode="dispatch_next",
-                    reason="watchdog_forced_idle",
-                    headers=headers,
-                )
+                wakeup_ctx = self._normalize_head_ctx_for_action(head=head, action="wakeup")
+                if wakeup_ctx is not None:
+                    await self.l0.wakeup(
+                        target_ctx=wakeup_ctx,
+                        mode="dispatch_next",
+                        reason="watchdog_forced_idle",
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Watchdog wake-up (dispatch_next) failed agent=%s: %s", head.agent_id, exc)
 
@@ -353,15 +398,19 @@ class L0Guard:
         for head in heads:
             if not head.active_agent_turn_id:
                 continue
-            updated = await self.state_store.finish_turn_idle(
-                project_id=head.project_id,
-                agent_id=head.agent_id,
-                expect_turn_epoch=head.turn_epoch,
-                expect_agent_turn_id=head.active_agent_turn_id,
-                last_output_box_id=safe_str(head.output_box_id),
+            head_ctx = self._head_turn_ctx(head)
+            if head_ctx is None:
+                continue
+            output_box_id = str(head.output_box_id) if head.output_box_id else None
+            committed_ctx = await finish_turn_idle_and_emit(
+                state_store=self.state_store,
+                nats=self.nats,
+                ctx=head_ctx,
+                last_output_box_id=output_box_id,
                 bump_epoch=True,
+                emit_state=False,
             )
-            if updated:
+            if committed_ctx is not None:
                 logger.warning(
                     "Watchdog cleaning stale turn: agent=%s turn=%s epoch=%s prev_status=%s",
                     head.agent_id,
@@ -371,48 +420,29 @@ class L0Guard:
                 )
 
                 # Try to move forward in the queue after forcing idle.
-                headers, _, _ = self._normalize_watchdog_headers(
-                    trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
-                    default_depth=int(getattr(head, "active_recursion_depth", 0) or 0),
-                )
-                try:
-                    await self.l0.wakeup(
-                        project_id=head.project_id,
-                        channel_id=head.active_channel_id or "public",
-                        target_agent_id=head.agent_id,
-                        mode="dispatch_next",
-                        reason="watchdog_forced_idle",
-                        headers=headers,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Watchdog wake-up (dispatch_next) failed agent=%s: %s", head.agent_id, exc)
+                normalized_committed_ctx = self._normalize_watchdog_ctx(ctx=committed_ctx)
+                if normalized_committed_ctx is not None:
+                    try:
+                        await self.l0.wakeup(
+                            target_ctx=normalized_committed_ctx,
+                            mode="dispatch_next",
+                            reason="watchdog_forced_idle",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Watchdog wake-up (dispatch_next) failed agent=%s: %s", head.agent_id, exc)
 
-                headers, _, _ = self._normalize_watchdog_headers(
-                    trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
-                    default_depth=int(getattr(head, "active_recursion_depth", 0) or 0),
-                )
-                state_ctx = CGContext(
-                    project_id=head.project_id,
-                    channel_id=head.active_channel_id or "public",
-                    agent_id=head.agent_id,
-                    agent_turn_id=head.active_agent_turn_id,
-                    trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
-                    headers=dict(headers or {}),
-                )
-                await emit_agent_state(
-                    nats=self.nats,
-                    ctx=state_ctx,
-                    turn_epoch=head.turn_epoch,
-                    status="idle",
-                    output_box_id=str(head.output_box_id) if head.output_box_id else None,
-                    metadata={"error": "timeout_reaped_by_watchdog"},
-                )
+                if normalized_committed_ctx is not None:
+                    await emit_agent_state(
+                        nats=self.nats,
+                        ctx=normalized_committed_ctx,
+                        status="idle",
+                        output_box_id=output_box_id,
+                        metadata={"error": "timeout_reaped_by_watchdog"},
+                    )
 
                 # 1. Record audit
                 await self.state_store.record_force_termination(
-                    project_id=head.project_id,
-                    agent_id=head.agent_id,
-                    agent_turn_id=head.active_agent_turn_id,
+                    ctx=self._force_termination_ctx_from_head(head),
                     reason="timeout_reaped_by_watchdog",
                     output_box_id=head.output_box_id,
                 )
@@ -424,27 +454,16 @@ class L0Guard:
                 )
                 
                 # 2. Publish event
-                headers, _, _ = self._normalize_watchdog_headers(
-                    trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
-                    default_depth=int(getattr(head, "active_recursion_depth", 0) or 0),
-                )
-                task_ctx = CGContext(
-                    project_id=head.project_id,
-                    channel_id=head.active_channel_id or "public",
-                    agent_id=head.agent_id,
-                    agent_turn_id=head.active_agent_turn_id,
-                    trace_id=str(head.trace_id) if getattr(head, "trace_id", None) else None,
-                    headers=dict(headers or {}),
-                )
-                await emit_agent_task(
-                    nats=self.nats,
-                    ctx=task_ctx,
-                    status=STATUS_FAILED,
-                    output_box_id=str(head.output_box_id) if head.output_box_id else None,
-                    deliverable_card_id=str(deliverable_card_id) if deliverable_card_id else None,
-                    error="timeout_reaped_by_watchdog",
-                    stats={},
-                )
+                if normalized_committed_ctx is not None:
+                    await emit_agent_task(
+                        nats=self.nats,
+                        ctx=normalized_committed_ctx,
+                        status=STATUS_FAILED,
+                        output_box_id=output_box_id,
+                        deliverable_card_id=str(deliverable_card_id) if deliverable_card_id else None,
+                        error="timeout_reaped_by_watchdog",
+                        stats={},
+                    )
 
     async def poke_stale_inbox(self) -> None:
         if self.pending_wakeup_seconds <= 0:
@@ -459,92 +478,37 @@ class L0Guard:
             project_id = row.get("project_id")
             agent_id = row.get("agent_id")
             inbox_id = row.get("inbox_id")
-            message_type = row.get("message_type")
-            payload = row.get("payload") or {}
             if not project_id or not agent_id:
                 continue
-            channel_id = None
-            if message_type == "turn":
-                channel_id = safe_str(payload.get("channel_id"))
+            channel_id = safe_str(row.get("channel_id"))
             if not channel_id:
-                state = await self.state_store.fetch(project_id, agent_id)
-                channel_id = safe_str(state.active_channel_id) if state else None
-            if not channel_id:
-                created_at = row.get("created_at")
-                age_seconds: Optional[float] = None
-                if isinstance(created_at, datetime):
-                    if created_at.tzinfo is None:
-                        created_at = created_at.replace(tzinfo=UTC)
-                    age_seconds = (datetime.now(UTC) - created_at).total_seconds()
-                if (
-                    self.pending_wakeup_skip_seconds > 0
-                    and age_seconds is not None
-                    and age_seconds >= self.pending_wakeup_skip_seconds
-                ):
-                    try:
-                        await self.execution_store.patch_inbox_payload(
-                            inbox_id=inbox_id,
-                            project_id=project_id,
-                            patch={
-                                "watchdog_error": "missing_channel",
-                                "watchdog_at": to_iso(utc_now()),
-                            },
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass
-                    await self.execution_store.update_inbox_status(
-                        inbox_id=inbox_id,
-                        project_id=project_id,
-                        status="skipped",
-                    )
-                    logger.warning(
-                        "Watchdog skipping pending wake-up: missing channel, inbox=%s agent=%s age=%.1fs",
-                        inbox_id,
-                        agent_id,
-                        age_seconds,
-                    )
-                    continue
-                logger.warning(
-                    "Watchdog skipping pending wake-up: missing channel, inbox=%s agent=%s",
-                    inbox_id,
-                    agent_id,
+                await self._mark_pending_inbox_error(
+                    inbox_id=inbox_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    error_code="missing_channel",
                 )
                 continue
 
-            target = await resolve_agent_target(
-                resource_store=self.resource_store,
-                project_id=project_id,
-                agent_id=agent_id,
-            )
-            if not target:
-                logger.warning("Watchdog skipping pending wake-up: missing worker_target, agent=%s", agent_id)
+            replay_row = dict(row)
+            replay_row["project_id"] = project_id
+            replay_row["agent_id"] = agent_id
+            replay_row["channel_id"] = channel_id
+            try:
+                wakeup_ctx, _ = build_replay_context(
+                    raw_payload=row.get("payload") if isinstance(row.get("payload"), dict) else {},
+                    db_row=replay_row,
+                )
+            except ProtocolViolationError as exc:
+                await self._mark_pending_inbox_error(
+                    inbox_id=inbox_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    error_code="invalid_replay_context",
+                    detail=str(exc),
+                )
                 continue
-            subject = format_subject(
-                project_id,
-                channel_id,
-                "cmd",
-                "agent",
-                target,
-                "wakeup",
-            )
-            headers: dict[str, str] = {}
-            traceparent = row.get("traceparent")
-            if traceparent:
-                headers["traceparent"] = str(traceparent)
-            tracestate = row.get("tracestate")
-            if tracestate:
-                headers["tracestate"] = str(tracestate)
-            headers, _, _ = self._normalize_watchdog_headers(
-                headers=headers,
-                trace_id=str(row.get("trace_id")) if row.get("trace_id") else None,
-                default_depth=int(row.get("recursion_depth") or 0),
-            )
-
-            await self.nats.publish_event(
-                subject,
-                {
-                    "agent_id": agent_id,
-                    "agent_turn_id": safe_str(payload.get("agent_turn_id")) or None,
-                },
-                headers=headers,
+            await self.l0.wakeup(
+                target_ctx=wakeup_ctx,
+                reason="watchdog_pending_inbox",
             )
