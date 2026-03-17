@@ -28,6 +28,12 @@ class _DummyStateStore:
         self.finish_calls.append(kwargs)
         return self.update_result
 
+    async def finish_turn_idle_transition(self, **kwargs):
+        self.finish_calls.append(kwargs)
+        ctx = kwargs["ctx"]
+        next_epoch = int(ctx.turn_epoch) + (1 if kwargs.get("bump_epoch") else 0)
+        return SimpleNamespace(committed_ctx=ctx.with_bumped_epoch(next_epoch))
+
     async def fetch(self, ctx):
         _ = ctx
         return SimpleNamespace(
@@ -234,6 +240,23 @@ async def test_persist_thought_card_writes_tool_call_ids_to_step() -> None:
         and call.get("tool_call_ids") == ["tc_1", "tc_2"]
         for call in step_store.update_calls
     )
+
+
+@pytest.mark.asyncio
+async def test_load_context_card_ids_prefers_output_history_before_new_context() -> None:
+    cardbox = _DummyCardBox()
+    cardbox.boxes["output_1"] = SimpleNamespace(card_ids=["old_user", "old_assistant"])
+    cardbox.boxes["context_1"] = SimpleNamespace(card_ids=["new_instruction", "old_assistant"])
+    processor = _make_processor(cardbox=cardbox)
+    ctx = react_step_module.StepRuntime(
+        item=_make_item(),
+        start_ts=time.monotonic(),
+        state=SimpleNamespace(),
+    )
+
+    context_ids = await processor._load_context_card_ids(ctx)
+
+    assert context_ids == ["old_user", "old_assistant", "new_instruction"]
 
 
 @pytest.mark.asyncio

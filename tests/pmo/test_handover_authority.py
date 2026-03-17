@@ -30,6 +30,7 @@ class _DummyCardBox:
             "profile_delegatee": SimpleNamespace(card_ids=[]),
         }
         self.saved_cards = []
+        self.saved_box_card_ids = []
 
     async def get_box(self, box_id, *, project_id, conn=None):
         _ = project_id, conn
@@ -45,6 +46,7 @@ class _DummyCardBox:
 
     async def save_box(self, card_ids, *, project_id, conn=None):
         _ = project_id, conn
+        self.saved_box_card_ids.append(list(card_ids))
         return "box_packed"
 
 
@@ -130,3 +132,40 @@ async def test_handover_pack_context_rejects_unlisted_inherit_box() -> None:
                 },
             },
         )
+
+
+@pytest.mark.asyncio
+async def test_handover_pack_context_appends_instruction_after_inherited_cards() -> None:
+    cardbox = _DummyCardBox()
+    packer = HandoverPacker(cardbox=cardbox, resource_store=_DummyResourceStore())
+
+    context_box_id, profile_box_id, card_ids = await packer.pack_context(
+        ctx=_ctx(),
+        tool_suffix="delegate_async",
+        arguments={
+            "profile_name": "delegatee",
+            "instruction": "do work",
+            "input_box_ids": ["box_context"],
+        },
+        handover={
+            "target_profile_config": {"profile_name": "delegatee"},
+            "authorized_inherit_box_ids": ["box_context"],
+            "context_packing_config": {
+                "pack_arguments": [{"arg_key": "instruction", "as_card_type": "task.instruction"}],
+                "inherit_context": {
+                    "include_boxes_from_args": ["input_box_ids"],
+                    "include_parent": True,
+                },
+            },
+        },
+    )
+
+    assert context_box_id == "box_packed"
+    assert profile_box_id == "profile_delegatee"
+    assert len(cardbox.saved_cards) == 2
+    instruction_card = cardbox.saved_cards[0]
+    parent_card = cardbox.saved_cards[1]
+    assert instruction_card.type == "task.instruction"
+    assert parent_card.type == "meta.parent_pointer"
+    assert card_ids == ["c_ctx", instruction_card.card_id, parent_card.card_id]
+    assert cardbox.saved_box_card_ids == [card_ids]
