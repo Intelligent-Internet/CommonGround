@@ -71,38 +71,6 @@ class HandoverPacker:
             target_profile_ref = found["profile_box_id"]
 
             ctx_cfg = handover.get("context_packing_config") or {}
-            pack_args = ctx_cfg.get("pack_arguments") or []
-            for rule in pack_args:
-                if not isinstance(rule, dict):
-                    continue
-                arg_key = rule.get("arg_key")
-                card_type = rule.get("as_card_type", "task.instruction")
-                card_meta = (rule.get("card_metadata") or {}).copy()
-                card_meta.setdefault("role", "user")
-                if arg_key and arg_key in arguments:
-                    content_val = arguments.get(arg_key)
-                    if card_type == "task.result_fields":
-                        if not isinstance(content_val, list):
-                            raise BadRequestError(
-                                "task.result_fields must be a list of field objects"
-                            )
-                        content = FieldsSchemaContent(fields=content_val)
-                    elif isinstance(content_val, (dict, list)):
-                        content = JsonContent(data=content_val)
-                    else:
-                        content = TextContent(text=str(content_val))
-                    card = Card(
-                        card_id=uuid6.uuid7().hex,
-                        project_id=project_id,
-                        type=card_type,
-                        content=content,
-                        created_at=datetime.now(UTC),
-                        author_id=tool_suffix,
-                        metadata=card_meta,
-                    )
-                    await self.cardbox.save_card(card, conn=conn)
-                    card_ids.append(card.card_id)
-
             inherit_cfg = (ctx_cfg.get("inherit_context") or {}) if isinstance(ctx_cfg, dict) else {}
             include_from_args = inherit_cfg.get("include_boxes_from_args") or []
             authorized_inherit_box_ids = {
@@ -144,6 +112,38 @@ class HandoverPacker:
                             if cid not in existing:
                                 card_ids.append(cid)
                                 existing.add(cid)
+
+            pack_args = ctx_cfg.get("pack_arguments") or []
+            for rule in pack_args:
+                if not isinstance(rule, dict):
+                    continue
+                arg_key = rule.get("arg_key")
+                card_type = rule.get("as_card_type", "task.instruction")
+                card_meta = (rule.get("card_metadata") or {}).copy()
+                card_meta.setdefault("role", "user")
+                if arg_key and arg_key in arguments:
+                    content_val = arguments.get(arg_key)
+                    if card_type == "task.result_fields":
+                        if not isinstance(content_val, list):
+                            raise BadRequestError(
+                                "task.result_fields must be a list of field objects"
+                            )
+                        content = FieldsSchemaContent(fields=content_val)
+                    elif isinstance(content_val, (dict, list)):
+                        content = JsonContent(data=content_val)
+                    else:
+                        content = TextContent(text=str(content_val))
+                    card = Card(
+                        card_id=uuid6.uuid7().hex,
+                        project_id=project_id,
+                        type=card_type,
+                        content=content,
+                        created_at=datetime.now(UTC),
+                        author_id=tool_suffix,
+                        metadata=card_meta,
+                    )
+                    await self.cardbox.save_card(card, conn=conn)
+                    card_ids.append(card.card_id)
 
             if inherit_cfg.get("include_parent"):
                 parent_card = _build_parent_pointer_card(project_id, source_agent_id)

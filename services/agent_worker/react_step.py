@@ -872,24 +872,24 @@ class ReactStepProcessor:
     async def _load_context_card_ids(self, ctx: StepRuntime) -> List[str]:
         item = ctx.item
         context_ids: List[str] = []
-        if item.context_box_id:
-            ctx_box = await self.cardbox.get_box(item.context_box_id, project_id=item.ctx.project_id)
-            if ctx_box:
-                context_ids = list(ctx_box.card_ids or [])
-                logger.info("Loaded %d cards from context_box=%s", len(context_ids), item.context_box_id)
-
         if item.output_box_id and item.output_box_id != item.context_box_id:
             logger.info("Loading additional context from output_box=%s", item.output_box_id)
             out_box = await self.cardbox.get_box(item.output_box_id, project_id=item.ctx.project_id)
             if out_box and out_box.card_ids:
+                context_ids = list(out_box.card_ids or [])
+                logger.info("Loaded %d cards from output_box=%s", len(context_ids), item.output_box_id)
+
+        if item.context_box_id:
+            ctx_box = await self.cardbox.get_box(item.context_box_id, project_id=item.ctx.project_id)
+            if ctx_box and ctx_box.card_ids:
                 existing = set(context_ids)
                 added_count = 0
-                for cid in out_box.card_ids:
+                for cid in ctx_box.card_ids:
                     if cid not in existing:
                         context_ids.append(cid)
                         existing.add(cid)
                         added_count += 1
-                logger.info("Added %d new cards from output_box", added_count)
+                logger.info("Added %d new cards from context_box=%s", added_count, item.context_box_id)
 
         logger.info("Final Context Card IDs: %s", context_ids)
         return context_ids
