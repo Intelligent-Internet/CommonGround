@@ -1,0 +1,7 @@
+{
+  "tools": {
+    "exec": {
+      "pathAppend": "${CG_REPO_ROOT}/.venv/bin"
+    }
+  }
+}

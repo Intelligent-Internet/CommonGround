@@ -1,0 +1,31 @@
+{
+  "kind": "common_ground.work_order.v1",
+  "objective": "Use a suitable expert agent through CommonGround to complete a small local-only website change and return the result as JSON.",
+  "input": {
+    "requester_message": "Update the landing page headline to a clearer version while preserving the existing style.",
+    "available_resources": [
+      {
+        "kind": "repository",
+        "clone_url": "${DEMO_REPO_URL}",
+        "base_branch": "main",
+        "description": "Use this repository for the local-only coding task."
+      }
+    ],
+    "constraints": [
+      "Choose an appropriate expert agent through CommonGround rather than using a local subagent.",
+      "This fixture is local-only: do not push to a remote and do not open a PR."
+    ],
+    "validation_hint": "python3 tests/smoke_test.py"
+  },
+  "expected_output": {
+    "type": "json",
+    "instructions": "Return JSON summarizing the expert execution result while preserving the authoritative child outcome."
+  },
+  "delegation_policy": {
+    "may_delegate": true
+  },
+  "provenance": {
+    "demo": "multihop_agent_handoff_demo",
+    "path": "single_hop"
+  }
+}

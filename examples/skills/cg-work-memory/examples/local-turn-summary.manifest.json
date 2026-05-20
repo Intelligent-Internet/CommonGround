@@ -1,0 +1,39 @@
+{
+  "kind": "agent_work_memory_report_manifest.v1",
+  "request_id": "local-agent-demo-turn-001",
+  "summary": "Local agent completed a task and captured a concise public work summary.",
+  "records": [
+    {
+      "role": "local_turn_summary",
+      "payload": {
+        "kind": "cg.turn_record.v1",
+        "schema_version": "1",
+        "type": "execution_summary",
+        "summary": "Reviewed the requested task, completed the local work, and recorded the outcome for future inspection.",
+        "details": {
+          "user_intent": "Demonstrate how a local agent can report one completed instruction turn to CommonGround work memory.",
+          "actions_taken": [
+            "Prepared a public summary of the completed work",
+            "Excluded private scratchpad, credentials, claim tokens, and chain-of-thought",
+            "Prepared a work-memory report manifest for CommonGround"
+          ],
+          "outcome": "ready_to_submit",
+          "validation": [
+            "Manifest follows agent_work_memory_report_manifest.v1 shape",
+            "Report uses cg report work-memory instead of worker lifecycle commands"
+          ]
+        },
+        "refs": [],
+        "producer": {
+          "runtime": "local-agent",
+          "component": "cg-work-memory"
+        }
+      },
+      "source_refs": []
+    }
+  ],
+  "final_payload": {
+    "kind": "agent_work_memory_report_result.v1",
+    "summary": "Local work-memory report submitted."
+  }
+}

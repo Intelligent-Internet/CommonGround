@@ -1,50 +1,64 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=80"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "CommonGround"
-version = "0.1.0"
-description = "Protocol-first multi-agent operating system kernel for sociotechnical coordination, combining Postgres as truth source with NATS wakeup semantics."
+name = "commonground-kernel"
+version = "3.1.0"
+description = "CommonGround service, CLI, and integration implementation"
 readme = "README.md"
 requires-python = ">=3.13"
+license = "Apache-2.0"
+authors = [
+    { name = "Intelligent Internet" },
+]
+keywords = ["commonground", "agent", "cli", "ledger", "workflow"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
-    "pydantic>=2.10.6",
-    "jsonschema>=4.25.1",
-    "nats-py==2.12.0",
-    "aiosqlite>=0.21.0",
-    "toml>=0.10.2",
-    "psycopg[binary,pool]>=3.1",
-    "duckdb>=0.10",
-    "pydantic-settings>=2.2",
-    "httpx>=0.28.1",
-    "boto3>=1.41.1",
-    "litellm>=1.80.9,<2",
-    "openai>=2.8,<3",
-    "tenacity>=8.2.3",
-    "fastapi>=0.115.0",
-    "uvicorn>=0.30.0",
-    "instructor>=1.13.0",
-    "google-genai>=1.53.0",
-    "google-cloud-storage>=2.16.0",
-    "e2b-code-interpreter>=0.1.0",
-    "uuid6>=2025.0.1",
-    "pyyaml>=6.0.1",
-    "python-multipart>=0.0.20",
-    "opentelemetry-api>=1.30.0",
-    "opentelemetry-sdk>=1.30.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.30.0",
-    "card-box-core",
+    "python-dotenv>=1.0",
+    "httpx>=0.28",
+    "uuid6>=2024.7.10",
 ]
 
-[tool.setuptools.packages.find]
-include = ["core*", "infra*"]
+[project.optional-dependencies]
+server = [
+    "boto3>=1.42.6",
+    "cardbox",
+    "cryptography>=46",
+    "fastapi>=0.115",
+    "instructor",
+    "litellm",
+    "psycopg[binary]>=3.2",
+    "psycopg-pool>=3.2",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "requests",
+    "tenacity==9.1.2",
+    "uvicorn>=0.30",
+]
+nanobot = [
+    "nanobot-ai",
+]
+
+[project.scripts]
+cg = "CommonGround.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Intelligent-Internet/CommonGround"
+Repository = "https://github.com/Intelligent-Internet/CommonGround"
+Issues = "https://github.com/Intelligent-Internet/CommonGround/issues"
+
+[tool.uv]
+package = true
 
 [tool.uv.sources]
-card-box-core = { path = "./card-box-cg", editable = true }
+cardbox = { path = "CG-Cardbox", editable = true }
 
-[dependency-groups]
-dev = [
-    "pytest>=9.0.1",
-    "pytest-asyncio>=1.3.0",
-]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["CommonGround*", "Integrations*"]

@@ -1,0 +1,31 @@
+{
+  "kind": "common_ground.work_order.v1",
+  "objective": "Act as the requester-facing personal agent. Resolve any missing context needed for a small local-only website change, then delegate the concrete implementation to a suitable expert agent and finish the root turn with a concise JSON summary.",
+  "input": {
+    "requester_message": "Update the landing page headline to a clearer version while preserving the existing style.",
+    "current_context": [
+      "The requester has not supplied the repository URL or base branch yet.",
+      "Another personal agent in this project may know the missing repository details.",
+      "Once the repository is known, hand the implementation to an available coding expert rather than doing the coding work yourself."
+    ],
+    "constraints": [
+      "Use CommonGround child dispatch rather than local subagents.",
+      "This fixture is local-only: do not push to a remote and do not open a PR."
+    ],
+    "fixture_hints": [
+      "In this fixture project, one peer personal agent can help resolve the missing repository details.",
+      "In this fixture project, one expert agent can perform the coding task once the repo is known."
+    ],
+    "validation_hint": "If a repository is available and the task is completed, a lightweight validation command is python3 tests/smoke_test.py."
+  },
+  "expected_output": {
+    "type": "json",
+    "instructions": "Return JSON that preserves the important child outcomes and the final result."
+  },
+  "delegation_policy": {
+    "may_delegate": true
+  },
+  "provenance": {
+    "demo": "multihop_agent_handoff_demo"
+  }
+}

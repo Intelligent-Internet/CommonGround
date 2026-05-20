@@ -1,146 +1,111 @@
+from __future__ import annotations
+
 import argparse
-import asyncio
 import os
-import sys
+from pathlib import Path
 
+import psycopg
 from psycopg import sql
-from psycopg_pool import AsyncConnectionPool
+from psycopg.conninfo import conninfo_to_dict
 
-from core.utils import set_loop_policy
-from infra.project_bootstrap import bootstrap_cardbox, ensure_schema
-from scripts.utils.config import load_toml_config, resolve_cardbox_dsn
-
-set_loop_policy()
-
-# 0. Load Config (Env > Config File)
-cfg = load_toml_config()
-DSN, source = resolve_cardbox_dsn(cfg)
-if source == "env":
-    print("Using DSN from Environment (PG_DSN)")
-elif source == "missing":
-    print("❌ config.toml not found!")
-    sys.exit(1)
-else:
-    print("Using DSN from config.toml")
-
-if not DSN:
-    print("❌ No DSN found. Set PG_DSN env var or configure in config.toml")
-    sys.exit(1)
-
-# Mask password for display
-safe_dsn = DSN.split("@")[-1] if "@" in DSN else "..."
-print(f"Target DB: ...@{safe_dsn}")
+from CommonGround.infra import postgres
+from Integrations.admin_service.agent_join_invites import AGENT_JOIN_INVITE_SCHEMA_SQL
+from Integrations.admin_service.byoa_workflow import (
+    BYOA_REGISTRATION_EVENTS_SCHEMA_SQL,
+    BYOA_REGISTRATION_REQUESTS_SCHEMA_SQL,
+)
 
 
-async def reset_db(grant_role: str | None = None):
-    print("⚠️  WARNING: This will wipe ALL data (State, Agents, Tools) AND CardBox data (Cards/Boxes).")
-    print("⚠️  All schemas will be dropped and re-created from scratch.")
-    confirm = input("Are you sure? (y/n): ")
-    if confirm.lower() != 'y':
-        print("Aborted.")
-        return
+DROP_SQL = """
+drop table if exists agent_connection_bindings;
+drop table if exists agent_join_invites;
+drop table if exists byoa_registration_events;
+drop table if exists byoa_registration_requests;
+drop table if exists sync_queue;
+drop table if exists api_logs;
+drop table if exists card_box_history_logs;
+drop table if exists card_boxes;
+drop table if exists card_transformations;
+drop table if exists card_operation_logs;
+drop table if exists cards;
+drop table if exists cg_ledger_scope_index;
+drop table if exists cg_kernel_ledger;
+drop table if exists cg_spawn_envelopes;
+drop table if exists cg_semantic_records;
+drop table if exists cg_turns;
+drop table if exists cg_project_turn_counters;
+drop table if exists cg_agent_credentials;
+drop table if exists cg_agents;
+"""
 
-    pool = AsyncConnectionPool(DSN, open=False)
-    await pool.open()
 
-    # 1. Drop Tables (Clean Slate)
-    drop_sqls = [
-        "DROP SCHEMA IF EXISTS sandbox CASCADE;",
-        "DROP SCHEMA IF EXISTS application CASCADE;",
-        # Project schema tables
-        "DROP TABLE IF EXISTS resource.tools CASCADE;",
-        "DROP TABLE IF EXISTS resource.project_agents CASCADE;",
-        "DROP TABLE IF EXISTS resource.profiles CASCADE;",
-        "DROP TABLE IF EXISTS resource.skill_versions CASCADE;",
-        "DROP TABLE IF EXISTS resource.skills CASCADE;",
-        "DROP TABLE IF EXISTS resource.artifacts CASCADE;",
-        "DROP TABLE IF EXISTS resource.sandboxes CASCADE;",
-        # Issue #42: Batch tables
-        "DROP TABLE IF EXISTS state.pmo_batch_tasks CASCADE;",
-        "DROP TABLE IF EXISTS state.pmo_batches CASCADE;",
-        # v1r2 audit + inbox tables
-        "DROP TABLE IF EXISTS state.identity_edges CASCADE;",
-        "DROP TABLE IF EXISTS state.execution_edges CASCADE;",
-        "DROP TABLE IF EXISTS state.agent_inbox CASCADE;",
-        "DROP TABLE IF EXISTS state.agent_state_pointers CASCADE;",
-        "DROP TABLE IF EXISTS state.agent_state_head CASCADE;",
-        "DROP TABLE IF EXISTS state.agent_steps CASCADE;",
-        # CardBox (card-box-cg) schema objects
-        "DROP TABLE IF EXISTS card_transformations CASCADE;",
-        "DROP TABLE IF EXISTS card_box_history_logs CASCADE;",
-        "DROP TABLE IF EXISTS card_operation_logs CASCADE;",
-        "DROP TABLE IF EXISTS card_boxes CASCADE;",
-        "DROP TABLE IF EXISTS cards CASCADE;",
-        "DROP TABLE IF EXISTS sync_queue CASCADE;",
-        "DROP TABLE IF EXISTS api_logs CASCADE;",
-        "DROP TABLE IF EXISTS public.projects CASCADE;",
-    ]
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Reset CommonGround PostgreSQL schema.")
+    parser.add_argument(
+        "--grant",
+        action="append",
+        default=[],
+        help="Role name to grant table privileges to. Can be passed multiple times.",
+    )
+    return parser.parse_args()
 
-    async with pool.connection() as conn:
-        print("🗑️  Dropping tables...")
-        for query_str in drop_sqls:
-            try:
-                await conn.execute(query_str)
-            except Exception as e:
-                print(f"Error executing {query_str}: {e}")
 
-    # 2. Run Init SQLs (Project)
-    print("🏗️  Re-creating schema (Project)...")
+def _require_pg_dsn() -> str:
+    pg_dsn = os.environ.get("PG_DSN")
+    if not pg_dsn:
+        raise SystemExit("PG_DSN is required")
+    return pg_dsn
+
+
+def _grant_role(cur, *, role: str, database_name: str) -> None:
+    role_ident = sql.Identifier(role)
+    cur.execute(
+        sql.SQL("grant connect on database {} to {}").format(sql.Identifier(database_name), role_ident)
+    )
+    cur.execute(sql.SQL("grant usage on schema public to {}").format(role_ident))
+    cur.execute(
+        sql.SQL(
+            "grant select, insert, update, delete, truncate, references, trigger "
+            "on all tables in schema public to {}"
+        ).format(role_ident)
+    )
+    cur.execute(
+        sql.SQL(
+            "alter default privileges in schema public grant "
+            "select, insert, update, delete, truncate, references, trigger on tables to {}"
+        ).format(role_ident)
+    )
+
+
+def reset_database(pg_dsn: str, grants: tuple[str, ...] = ()) -> None:
+    dsn_params = conninfo_to_dict(pg_dsn)
+    database_name = dsn_params.get("dbname")
+    if not database_name:
+        raise SystemExit("PG_DSN must include dbname")
+
+    schema_sql = Path(__file__).resolve().parents[2] / "CG-Cardbox" / "cardbox" / "adapters" / "postgres_schema.sql"
+    conn = psycopg.connect(pg_dsn, autocommit=False)
     try:
-        await ensure_schema(pool)
-    except Exception as e:
-        print(f"❌ Error executing ensure_schema: {e}")
-        await pool.close()
-        return
+        with conn.cursor() as cur:
+            cur.execute("select pg_advisory_lock(hashtext(%s))", ("commonground_v3_reset_db",))
+            cur.execute(DROP_SQL)
+            cur.execute(postgres.SCHEMA_SQL)
+            cur.execute(schema_sql.read_text())
+            cur.execute(BYOA_REGISTRATION_REQUESTS_SCHEMA_SQL)
+            cur.execute(BYOA_REGISTRATION_EVENTS_SCHEMA_SQL)
+            cur.execute(AGENT_JOIN_INVITE_SCHEMA_SQL)
+            for role in grants:
+                _grant_role(cur, role=role, database_name=database_name)
+            cur.execute("select pg_advisory_unlock(hashtext(%s))", ("commonground_v3_reset_db",))
+        conn.commit()
+    finally:
+        conn.close()
 
-    await pool.close()
 
-    # 3. Run Init Schema (CardBox) - using separate sync connection
-    print("🏗️  Re-creating schema (CardBox)...")
-    try:
-        await bootstrap_cardbox(DSN)
-    except Exception as e:
-        print(f"❌ Error bootstrapping CardBox: {e}")
-        return
+def main() -> None:
+    args = _parse_args()
+    reset_database(_require_pg_dsn(), tuple(args.grant))
 
-    # 4. Grant Permissions (if requested)
-    if grant_role:
-        print(f"🔐 Granting permissions to role: {grant_role}...")
-        pool = AsyncConnectionPool(DSN, open=False)
-        await pool.open()
-        try:
-            async with pool.connection() as conn:
-                # Grant Usage on Schemas
-                await conn.execute(
-                    sql.SQL("GRANT USAGE ON SCHEMA public, resource, state, application TO {}").format(
-                        sql.Identifier(grant_role)
-                    )
-                )
-                
-                for schema in ["public", "resource", "state", "application"]:
-                    # Grant All on Tables
-                    await conn.execute(
-                        sql.SQL("GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA {} TO {}").format(
-                            sql.Identifier(schema), sql.Identifier(grant_role)
-                        )
-                    )
-                    # Grant All on Sequences
-                    await conn.execute(
-                        sql.SQL("GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {} TO {}").format(
-                            sql.Identifier(schema), sql.Identifier(grant_role)
-                        )
-                    )
-                print("✅ Permissions granted.")
-        except Exception as e:
-            print(f"❌ Error granting permissions: {e}")
-        finally:
-            await pool.close()
-
-    print("✅ Database reset & schema re-creation complete.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--grant", help="Grant privileges to this role (e.g. cardbox)")
-    args = parser.parse_args()
-
-    asyncio.run(reset_db(grant_role=args.grant))
+    main()

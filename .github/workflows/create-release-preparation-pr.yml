@@ -1,0 +1,90 @@
+name: Create Release Preparation PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the leading v prefix.
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prepare-release:
+    name: Create release preparation draft pull request
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+
+      - name: Resolve requested release version
+        id: version
+        run: |
+          RAW_VERSION="${{ inputs.version }}"
+          RELEASE_VERSION="${RAW_VERSION#v}"
+          TAG_NAME="v$RELEASE_VERSION"
+
+          if git ls-remote --exit-code --refs --tags origin "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG_NAME already exists on origin."
+            exit 1
+          fi
+
+          echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Sync release version metadata
+        run: |
+          uv run --with packaging python scripts/release/sync_release_version.py --version "${{ steps.version.outputs.version }}" --write
+          uv run --with packaging python scripts/release/sync_release_version.py --version "${{ steps.version.outputs.version }}" --check
+
+          if git diff --quiet VERSION pyproject.toml uv.lock; then
+            echo "::error::Repository metadata already matches version ${{ steps.version.outputs.version }}. No release preparation PR was created."
+            exit 1
+          fi
+
+      - name: Create version sync pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          title: "chore(release): sync version metadata for ${{ steps.version.outputs.version }}"
+          body: |
+            ## Summary
+            This PR was created automatically by the release-preparation workflow to synchronize repository version metadata for the requested release.
+
+            ### Source
+            - Release tag: `${{ steps.version.outputs.tag }}`
+            - Release version: `${{ steps.version.outputs.version }}`
+            - Workflow: `.github/workflows/create-release-preparation-pr.yml`
+
+            ### Updated Files
+            - `VERSION`
+            - `pyproject.toml`
+            - `uv.lock`
+
+            ### Next Step
+            - Merge this PR into `main`
+            - `.github/workflows/publish.yml` will create the release tag from the merged `main` commit, publish to PyPI, and sync the GitHub Release
+          branch: "release/version-${{ steps.version.outputs.version }}"
+          base: main
+          commit-message: "chore(release): sync version metadata for ${{ steps.version.outputs.version }}"
+          delete-branch: true
+          draft: true
+          add-paths: |
+            VERSION
+            pyproject.toml
+            uv.lock

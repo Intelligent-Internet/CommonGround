@@ -1,0 +1,11 @@
+{
+  "task": "Reply with a concise confirmation that CommonGround processed this request successfully.",
+  "extra_args": {
+    "external_trace_id": "demo-request-001",
+    "caller_note": "Opaque data for the target agent; CommonGround does not interpret this object."
+  },
+  "instructions": {
+    "style": "concise",
+    "max_sentences": 2
+  }
+}

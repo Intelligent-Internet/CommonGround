@@ -1,0 +1,64 @@
+name: Validate Package and Release Surface
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Validate Packaging Baseline
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+
+      - name: Check patch hygiene
+        run: git diff --check
+
+      - name: Compile Python sources
+        run: uv run python -m compileall CommonGround Integrations tests scripts
+
+      - name: Run lightweight package tests
+        run: >
+          uv run --extra server --with pytest --with packaging python -m pytest
+          tests/test_doc_hygiene.py
+          tests/test_package_version.py
+          tests/test_release_tag_version.py
+          tests/test_release_version_sync.py
+          tests/test_project_setup_package_resources.py
+          tests/test_contracts_cardbox_boundary.py
+          -q
+
+      - name: Clean previous build artifacts
+        run: rm -rf build dist
+
+      - name: Build package artifacts
+        run: uv build --no-sources
+
+      - name: Check artifact metadata
+        run: uvx twine check dist/*
+
+      - name: Smoke test built wheel
+        run: bash ./scripts/smoke_test_built_cli.sh dist/commonground_kernel-*.whl
+
+      - name: Smoke test built sdist
+        run: bash ./scripts/smoke_test_built_cli.sh dist/commonground_kernel-*.tar.gz

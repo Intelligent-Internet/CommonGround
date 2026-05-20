@@ -1,0 +1,20 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "${CG_REPO_ROOT}/examples/nanobot/multihop_agent_handoff_demo/workspace_b"
+    }
+  },
+  "gateway": {
+    "cg": {
+      "enabled": true,
+      "baseUrl": "${CG_BASE_URL}",
+      "projectId": "${CG_PROJECT_ID}",
+      "agentId": "nanobot_b",
+      "authTokenEnv": "CG_AGENT_CREDENTIAL_TOKEN",
+      "claimPollIntervalMs": 500,
+      "claimHeartbeatIntervalMs": 500,
+      "progressMinIntervalMs": 500,
+      "contextLimit": 100
+    }
+  }
+}

@@ -1,234 +1,415 @@
-# Common Ground Core (CGC)
+# CommonGround Kernel
 
-> *"未经结构化的智能只是熵。" (Unstructured intelligence is just entropy.)*
-
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
-[![NATS](https://img.shields.io/badge/NATS-JetStream-27AAE1.svg)](https://nats.io/)
-[![Postgres](https://img.shields.io/badge/Postgres-CardBox-336791.svg)](https://postgresql.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-supported-336791.svg)](https://www.postgresql.org/)
+[![Release: v3r1--preview](https://img.shields.io/badge/release-v3r1--preview-orange.svg)](docs/zh/release-notes.md)
+[![API: v3r1](https://img.shields.io/badge/API-v3r1-555555.svg)](docs/zh/reference/http.md)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-7289DA.svg)](https://discord.com/invite/intelligentinternet)
-[English](README.md) | [中文](README_CN.md)
 
-<img width="2400" height="875" alt="image" src="https://github.com/user-attachments/assets/c74333ad-7b4e-49e6-8867-3d0e0c4790a7" />
+[中文](README_CN.md) | [English](README.md)
 
-当今的 Agent 框架依赖死板的静态启发式规则，缺乏状态追踪与系统弹性，极易在复杂的“多智能体委托”中陷入协调崩溃（Coordination Collapse）
+![CommonGround Kernel banner](docs/assets/commonground-kernel-banner.png)
 
-我们基于**控制论（Cybernetics）**构建了一个真正的**社会技术操作系统（Sociotechnical OS）** —— **Common Ground Core**。
+> Agent 很少能长期独自完成真实工作。真实工作会跨越人、工具、服务、runtime 与其他 Agent。
 
-**边缘的自由，内核的约束。 (Freedom at the edges. Constraints at the kernel.)**
+**CommonGround Kernel v3r1 preview** 是面向真实人类与 Agent 协作、多 Agent 工作的开源公共底层。它让 Agent 工作被持久保存、公开记录，并能被下一个接手的人、Agent、工具或外部 runtime 继续读取和使用。
 
----
+CommonGround 把 Agent 工作变成持久的共同语境（durable common ground）。它不只是持久日志。它是一个保留下来的公共协作底座，让人类与 Agent 能够在交接、暂停、会话结束或 runtime 更换之后，重新建立共同基础。它保存后续参与者继续工作所需的共享任务状态、交接事实、边界输入输出、证据与恢复语境。
 
-## CGC 是什么？
+它也是一个小型的**宪法化账本内核（constitutional ledger kernel）**：它定义独立参与者协作所需的最小公共事实、工作边界、语义归属与因果关系，而不要求所有参与者被吸收到同一个中央 runtime 里。
 
-CGC 不是一个供单机调用的 Python 库，而是一套定义了 Agent 间物理协作定律的，Protocol First 的操作系统内核。
-
-*   **结构化透明与万物皆卡 (CardBox & Immutable Ledger)**
-    所有的通信、推理和工具调用均以不可变的“卡片”形式持久化，形成不可篡改的认知血缘（Cognitive Lineage）。这实现了 100% 可回溯的上下文工程（Context Engineering）与防污染。
-*   **无缝解耦的执行层 (Worker Agnostic)**
-    L0 协议与 L1 内核只规定“物理法则”，不关心 Agent 如何运行。只要遵守通用工具协议（UTP）与门铃契约，你可以用任意语言、任意大模型框架（如 LangChain/LlamaIndex）编写挂载到总线的 Worker。
-*   **动态拓扑 (Dynamic Topology)**
-    打破死板的 DAG 编排，Agent 可通过 L1 内核安全地衍生（Spawn）与并行调度（Fork-Join）数百个子节点，系统自动接管并发收敛。
-*   **人类也是智能体 (Humans are Agents)**
-    人类不再是高高在上的提词员。我们与 AI 共享同一套底层物理协议，作为异步节点参与协作。系统适应人类的节奏，允许你 mid-flight（飞行途中）跨系统注入意图、审查计划并实时授权。
-*   **零脑裂的物理定律 (PG + NATS Doorbell)**
-    我们彻底分离了状态与信号。以 Postgres 作为绝对真源强制执行 `turn_epoch` CAS 锁；以 NATS JetStream 作为纯粹的“门铃”（Wakeup）。彻底告别分布式消息乱序导致的系统脑裂。内置 L1 Watchdog 自动兜底死锁与超时。
+**边缘是独立 Agent。Kernel 保存持久公共工作记录。**
 
 ---
 
-## 我们正在用它构建什么？ (The OS in Action)
+## CommonGround 是什么？
 
-*以下基于 CGC 引擎构建的内部应用即将开源发布：*
+CommonGround 是 Agent runtime、记忆系统与编排框架之下的共享工作底座。
 
-1. **活体的社会技术沙盒 (Living Sociotechnical Simulation)**
-   看着数十个自治 Agent 在 3D 拓扑 UI 中实时脉动、动态链接、形成集群并演化状态。这是受严格协议约束的纯粹社会学涌现。
-2. **原生 Slack 工作流 (Slack Workspace)**
-   将 OS 直接接入团队 Slack。在日常聊天中审查深度研究计划，并与 AI 同侪在 mid-flight（飞行途中）进行异步协作。
-3. **直觉编程空间 (The "Vibe Coded" Workspace)**
-   一个由人类设计、由 AI 持续编码的实时协作 Chat App。AI 在这里是一个真正的共创者（Co-creator），而不仅仅是代码补全工具。
+这里的 **common ground（共同语境）** 指的是持续协作所需的公共基础：共享的任务状态、共享的交接事实、可供后续恢复的理由与证据，以及让工作在原始会话消失之后仍可检查、可恢复的边界输入输出。
 
----
+它保存工作的公共记录：
 
-## ⚠️ V1R4 发布边界与当前限制
+- 请求了什么；
+- 交接了什么；
+- 返回了什么；
+- 交付了什么；
+- 后续工作可以依赖什么。
 
-`V1R4` 是 `v1` 系列最终稳定版。它已经达到可发布状态，但并不等于未来 `v2` runtime model 的最终形态。
+它不试图拥有每个工作流、runtime、记忆系统、协作界面或业务决策。相反，CommonGround 只保存独立人类、Agent、工具、服务与外部 runtime 协作所需的最小持久事实。
 
-在您体验之前，请知悉以下限制：
+在 v3r1 preview 中，这个基础以 **Ledger Kernel** 形式暴露：一个围绕 Agent identity（Agent 身份）、Turn lifecycle（Turn 生命周期）、Turn-owned public semantics（归属于 Turn 的公共语义）、工作记录、claim fencing、causal lineage（因果谱系）与 pull-first inspection（拉取优先的检查方式）的小型 kernel。
 
-> ⚠️ **Security Warning**：本项目当前处于 Preview 阶段，api (8099) 和 nats (4222/8222/8080) 端口未开启任何鉴权，包含任意命令执行（RCE）能力（如沙箱、Skills）。绝对不要将其暴露在公网（0.0.0.0）生产环境中。
+## 为什么需要它
 
-1. **`V1R4` 是 `v1` 的最终稳定目标版本**：当前协议目标就是 `v1r4`；后续更大的 runtime model 变化会留到 `v2`，而不是继续做更多 `v1` preview 切片。
-2. **聚焦内核，组件精简**：当前发布仍以 kernel、Generic Worker、PMO orchestration 和少量核心 Demo Tools 为中心。
-3. **暂无权限控制 (No ACL in this release)**：为方便开发者本地跑通，当前的所有 API 与 NATS 接口**均为完全公开（Public）**。请勿将其直接暴露在公网环境。
-4. **沙箱与技能系统 (Experimental)**：系统目前内置了对 E2B / SRT 代码执行沙箱以及 Skills 体系的支持，但这部分目前处于实验阶段。
-5. **可观测性 (Experimental)**：框架的拓扑可观测性、组织上下文管理机制仍在迭代，目前处于实验阶段。
+AI Agent 正在从“回答问题”走向“参与真实工作”。
 
----
+但真实工作很少能装进一个 prompt。它会跨越人、Agent、工具、服务与时间。一个 Agent 研究市场，另一个 Agent 起草策略 memo，人类过后审查发生了什么，coding agent 接手其中一部分，未来的 Agent 又试图复用这次结果。
 
-## 快速开始 (Getting Started)
+当这些工作只留在聊天窗口、临时会话、工具日志与 runtime 私有上下文里，下一个参与者就只能从碎片重新开始。
 
-不到 5 分钟，在本地跑通你的多智能体操作系统内核。
+更深一层的问题，不只是 Agent 能不能给出一个好答案，而是这项工作能不能进入共享记忆、可复用经验、review 与下一轮工作的链条。
 
-开始前建议先看：
+CommonGround 为这些工作提供持久共享记录，让后续的人类和 Agent 可以检查、恢复、审计、复用并继续构建。
 
-- [`docs/CN/05_operations/v1r4_release_notes.md`](docs/CN/05_operations/v1r4_release_notes.md)
-- 如果你是从旧的 `v1r3` 部署升级，再看 [`docs/CN/05_operations/migration_v1r3_to_v1r4.md`](docs/CN/05_operations/migration_v1r3_to_v1r4.md)
+## 第一性原理
 
-### 1. 环境准备
-*   Docker & Docker Compose
-*   可用的 `GEMINI_API_KEY`（默认）；或按需切换到 OpenAI/Kimi（见下方“快速上手”说明）
+CommonGround 遵循一个第一性原理：
+
+> Assume nothing beyond what constraints demand.
+
+这个原则让 kernel 保持小。CommonGround 不应把当前产品形态、runtime 设计、拓扑偏好、记忆策略或编排风格冻结成永久的系统本体。
+
+v3r1 preview kernel 围绕几个宪法级承诺组织：
+
+- **Agent 是稳定逻辑执行主体**：它可以由 LLM、人类、服务、脚本、外部 runtime、组织流程或混合系统承载。
+- **Turn 是最小持久工作边界（durable work boundary）**：它是一项工作、一次委托、一次交互或一个恢复闭环，而不只是聊天回复或临时会话。
+- **Turn-owned semantics 保存公共工作事实**：输入、选定观察、过程记录、交接、交付物、终止原因与 artifact 引用都归属于拥有它们的 Turn。
+- **因果关系必须足以恢复工作**：parent/child 工作、完成、观察与吸收应该在会话、runtime 或通知消失后仍然可检查。
+- **已保存历史不会自动变成私有记忆或业务效果**：上层可以解释、总结、吸收或复用记录，但 kernel 默认不替上层做这些判断。
+
+## 从早期预览到 v3r1 Preview
+
+早期 CommonGround preview 更强调编排、类似 swarm 的执行方式，以及多 Agent 协作。
+
+v3r1 preview 保留这个方向，但移动了叙事重心。
+
+编排很重要，因为执行现场才是协作真正发生的地方。每当工作被委托、恢复、完成或跨 Agent 交接，就会产生一些应该跨越会话与编排器（orchestrator）生命周期继续存在的边界。
+
+基础变得更精确，不是因为愿景变小了，而是因为愿景更大了。CommonGround 不需要拥有每个工作流、runtime 或记忆系统；它需要保存让独立参与者能够协作的公共工作事实，而不是把所有人都压进同一个中央系统。
+
+Commons 是目的地。Kernel 是第一块持久地基（durable ground）。
+
+## Kernel 提供什么
+
+CommonGround Kernel 当前提供：
+
+- **Agent identity**：稳定逻辑执行主体，可由 LLM、人类、服务、脚本、外部 runtime、组织流程或混合系统承载。
+- **Turn boundaries**：面向任务、委托、交互与恢复闭环的持久工作边界。
+- **Turn-owned public semantics**：归属于 Turn 的输入、选定观察、交接、过程记录、最终交付物、终止原因与 artifact 引用。
+- **Claim fencing and lifecycle**：claim、heartbeat、renew、suspend、resume、stop、finish 与 lease-expiry handling。
+- **Causal lineage**：parent/child Turn 关系、child completion、parent observation 与 explicit absorption。
+- **Ledger and feed**：服务于 pull-first recovery、inspection、audit 与 projection 的持久公共事实。
+- **本地开发者接口**：CLI、HTTP 服务、Admin Service admission flow、BYOA 示例与 NanoBot 参考样例。
+
+## CommonGround 不是什么
+
+CommonGround Kernel 是刻意聚焦的。
+它不是完整的 Agent 记忆产品，不是 Agent 私有记忆系统，不是 chain-of-thought 记录器，不是 Agent runtime，不是中央调度器，不是自动编排框架，不是 Slack bot 发布包，也不是你现有 Agent 框架的替代品。
+
+记忆系统、编排框架、review 界面、知识蒸馏流水线、共享工作区、routine 与 playbook 都可以构建在 CommonGround records 之上。它们不是 kernel 本身。
+
+CommonGround 是 **memory-ready，而不是 memory-complete**：它保存可用于记忆和复用的公共工作事实，但不把上层记忆产品一次性做完。
+
+## 从 v1 升级的 Breaking Change
+
+CommonGround Kernel v3r1 与早期公开的 v1 preview 不兼容。包结构、runtime 假设、本地启动路径与 API surface 都已经变化。已有 v1 集成应把 v3r1 视为新的 preview 线，而不是原地升级。
+
+历史 v1 源码会保留在 [`legacy/v1`](https://github.com/Intelligent-Internet/CommonGround/tree/legacy/v1) branch。已有 v1 tags，包括 `v1r4` 与 `v1r4-hotfix`，保持不变。
+
+## 当前发布范围
+
+当前状态：**Initial Open Source Preview - v3r1**
+
+当前服务/API 实现版本：**v3r1**
+
+v3r1 preview 聚焦 Ledger Kernel 与本地优先的开发者路径。
+
+当前预览版支持：
+
+- 基于 PostgreSQL 的本地开发与测试执行。
+- 基于 `uv` 的安装与运行。
+- 通过 `cg local run` 启动单端口本地开发环境。
+- 通过 `cg service run` 与 `cg admission run` 启动分离的服务入口。
+- 以 CLI 为主的工作流：setup、profiles、dispatch、Turn inspection、project observation、reports、worker lifecycle 与 admission。
+- BYOA work-memory reporting。
+- BYOA conversation-worker examples。
+- NanoBot 集成参考样例，作为可选的高级参考。
+
+`v3r1` 是服务与客户端代码当前使用的预览 API 前缀。它不是长期兼容性承诺。
+
+## 从 PyPI 安装
+
+当公开包已经发布后，可直接安装：
 
 ```bash
-git clone --recursive https://github.com/Intelligent-Internet/CommonGround.git
-cd CommonGround
+uv tool install commonground-kernel
+cg --version
 ```
 
-如果你已经用非递归方式克隆过仓库，请补一次：
+如果要运行 `cg local run` 这类本地 service 命令，请安装 `server` extra：
 
 ```bash
-git submodule update --init --recursive
+uv tool install 'commonground-kernel[server]'
 ```
 
-### 2. 一次启动全部服务（含初始化）
+## 快速开始
+
+第一个循环刻意保持很小：
+
+1. 在本地运行 kernel；
+2. 提交一条公共工作报告；
+3. 检查保留下来的工作记录。
+
+### 前置依赖
+
+- Python `>=3.13`
+- `uv`
+- 一个可写入的本地 PostgreSQL database
+
+### 1. 安装
 
 ```bash
-export GEMINI_API_KEY="你的_key"
-# 或按需求改为 OpenAI/Kimi：
-# export CG__JUDGE__MODEL="gpt-5-mini"   # 或 moonshot/kimi-k2.5
-# export MOCK_SEARCH_LLM_PROVIDER="openai"
-# export MOCK_SEARCH_LLM_MODEL="gpt-5-mini" # 或 moonshot/kimi-k2.5
-# export OPENAI_API_KEY="..."
-# export MOONSHOT_API_KEY="..."
-docker compose up -d --build
+uv tool install 'commonground-kernel[server]'
 ```
 
-> 说明：Compose 服务默认使用项目内虚拟环境 `.venv.docker`（`UV_PROJECT_ENVIRONMENT=/app/.venv.docker`）。
+### 2. 准备数据库
 
-这条命令会自动启动并初始化：
-`nats`、`postgres`、`db-init`、`api`、`pmo`、`agent-worker`、`mock-search`。
-
-### 3. 运行 Demo（推荐在 api 容器内执行）
-如果宿主机没有安装 `uv`，直接在容器内运行：
+创建一个 PostgreSQL database，然后把 `PG_DSN` 指向它：
 
 ```bash
-docker compose exec api sh -lc '
-  export CG_CONFIG_TOML=/app/config.toml
-  uv run -m examples.quickstarts.demo_principal_fullflow_api \
-    --project "${PROJECT_ID:-proj_mvp_001}" \
-    --channel public \
-    "help me to do a research on k8s"
-'
+export PG_DSN=postgresql://USER:PASSWORD@HOST:PORT/DBNAME
 ```
 
-> 注意：`/projects/{project_id}/skills:upload` 与 `/projects/{project_id}/artifacts:upload` 依赖 `[gcs]` 配置。若未配置 `gcs.bucket`，API 会优雅降级并禁用相关能力。
+### 3. 初始化本地项目
 
-### 4. Observability 与 Report Viewer
+```bash
+cg setup project seed --default-local
+cg setup project status --default-local
 
-默认 `docker compose up -d --build` 已开启 OTel + Jaeger + tracking。
+cg setup project client-config --default-local \
+  --base-url http://127.0.0.1:8000 \
+  --admin-base-url http://127.0.0.1:8000
+```
 
-- Jaeger UI: `http://127.0.0.1:16686`
-- Report Viewer: `http://127.0.0.1:8099/observability/report-viewer/`
+这会准备默认本地 `cg-demo` project，并写入本地 CLI 配置。
 
-在 Report Viewer 顶部选择 project，点击 `Load Project`，API 会实时生成 report 并直接加载。
+### 4. 运行本地服务组合
 
-> 关于前端界面（Where is the UI?）
-> 当前仓库提供的是 OS Kernel（后端引擎与通信总线）与示例接入路径。`UI Worker` + `demo_ui_action.py` 展示了外部前端如何通过协议接入。开箱即用的 Web 聊天界面将在后续版本以独立仓库/模块发布；当前请通过 CLI、API 和示例脚本体验系统。
+在一个长期运行的终端中：
 
-### 5. 下一步探索
+```bash
+cg local run --project-id cg-demo --host 127.0.0.1 --port 8000
+```
 
-- [Docker 版完整说明与排障](docs/CN/01_getting_started/docker_quickstart_demo_principal_fullflow_api.md)
-- [本地 `uv` 方式](docs/CN/01_getting_started/quick_start.md)（手动启动服务与更多 demo）
+它会提供：
 
----
+- CommonGround Service API 位于 `/v3r1`
+- Admin Service admission API 位于 `/admin/v1`
 
-## 架构概览 (Architecture)
+检查存活状态：
 
-系统采用明确的数据流与控制流物理分离设计：
+```bash
+curl http://127.0.0.1:8000/healthz
+```
+
+### 5. 提交公共工作报告
+
+在另一个终端中：
+
+```bash
+cat > report.json <<'EOF'
+{
+  "kind": "agent_work_memory_report_manifest.v1",
+  "request_id": "local-agent-report-001",
+  "summary": "Local work completed and reported.",
+  "records": [
+    {
+      "role": "summary",
+      "payload": {
+        "summary": "Completed the local task and retained public evidence."
+      }
+    }
+  ]
+}
+EOF
+
+cg profile ensure-agent \
+  --profile cg-demo/local-agent \
+  --project-id cg-demo \
+  --requested-agent-id local-agent \
+  --profile-kind byoa.work_memory_reporter.v1 \
+  --runtime-kind local.cli.v1 \
+  --display-name "Local Agent"
+
+cg report work-memory \
+  --profile cg-demo/local-agent \
+  --project-id cg-demo \
+  --agent-id local-agent \
+  --manifest-file report.json
+```
+
+成功后，CLI 会打印一个 JSON envelope（封装响应）。复制 `result.turn.turn_id`。
+
+### 6. 检查保留下来的 Turn
+
+```bash
+cg turn context \
+  --profile cg-demo/local-agent \
+  --project-id cg-demo \
+  --turn-id <turn_id>
+```
+
+你应该能看到一个 closed `turn.work_memory_report.v1` Turn，包含提交的 manifest、公共工作记录与 final payload。
+
+完整指南见 [开源快速开始指南](docs/zh/guides/open-source-quickstart.md)。
+如果你要使用源码 checkout 和开发工作流，请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## Agent 集成路径
+
+选择与你的 Agent 和 CommonGround 关系最匹配、也最小的集成路径。
+
+| 目标 | 接收 CommonGround 分配的工作 | 上报公共工作记录 | 需要 NanoBot | 典型入口 |
+| --- | --- | --- | --- | --- |
+| 本地 Agent 已完成工作，只需要发布选定公共记录 | 否 | 是 | 否 | `cg profile ensure-agent` + `cg report work-memory` |
+| 外部 runtime 需要接收并完成 `turn.conversation.v1` 工作 | 是 | 可选 | 否 | `cg admission invite create` + `cg agent join` |
+| NanoBot gateway 或 companion 需要管理 claim、context、child dispatch、resume 与 final absorption | 是 | 可选 | 当前需要 | `examples/nanobot/` |
+
+先阅读 [Agent Integration Scenarios](docs/zh/guides/agent-integration-scenarios.md)，再选择：
+
+- [BYOA Work-Memory Reporter](docs/zh/guides/byoa-work-memory-reporter.md)
+- [BYOA Conversation Worker](docs/zh/guides/byoa-conversation-worker.md)
+- `examples/nanobot/` 下的 NanoBot 高级 runtime 参考样例
+
+NanoBot 适合作为参考集成，但前两个 BYOA 路径不依赖 NanoBot。
+
+## 架构概览
 
 ```mermaid
 flowchart LR
-    subgraph L2_User_Space [L2: 生态层]
-        CLI[Scripts / Demo]
-        API[Management API]
-        Tools[Tool Services]
+    subgraph External["外部人类、Agent、工具与 runtime"]
+        CLI["cg CLI"]
+        BYOA["BYOA agents"]
+        Worker["外部 workers"]
+        NanoBot["NanoBot 参考样例"]
     end
 
-    subgraph L1_Kernel [L1: 内核层]
-        PMO[PMO Service]
-        Batch[BatchManager - 调度]
-        Worker[Agent Worker - Agnostic]
-        PMO --> Batch
+    subgraph Surface["CommonGround 服务接口"]
+        HTTP["HTTP API /v3r1"]
+        Admin["Admin Service /admin/v1"]
+        SDK["SDK helpers / adapters"]
     end
 
-    subgraph L0_Physics [L0: 协议与物理层]
-        NATS((NATS Bus - 门铃))
-        PG[(Postgres - 状态真源)]
-        Cards[(CardStore - 记忆真源)]
+    subgraph Kernel["CommonGround Kernel"]
+        Agents["Agent identity"]
+        Turns["Turn lifecycle"]
+        Semantics["Turn-owned semantics"]
+        Claims["Claim fencing"]
+        Lineage["Causal lineage"]
+        Feed["Ledger and feed"]
     end
 
-    CLI --> API
-    API -- config/profile --> PG & Cards
+    subgraph Truth["持久事实层"]
+        PG[("PostgreSQL")]
+        CardBox[("CardBox schema")]
+    end
 
-    PMO <-- wakeup (doorbell) --> NATS
-    Worker <-- wakeup (doorbell) --> NATS
-    Tools -- tool_result --> NATS
+    CLI --> HTTP
+    CLI --> Admin
+    BYOA --> HTTP
+    Worker --> HTTP
+    NanoBot --> HTTP
 
-    PMO -- orchestrate --> PG
-    Worker -- CAS write (source of truth) --> PG
+    HTTP --> SDK
+    Admin --> SDK
+    SDK --> Kernel
+    Kernel --> PG
+    Kernel --> CardBox
 ```
 
-CardBox 的实现与 API 维持在 [CG-Cardbox](https://github.com/Intelligent-Internet/CG-Cardbox) 仓库。
+推送通知、dashboard、summary 与 projection 可以让工作更容易被看到。它们不替代正确性基线：后续读者必须能回到持久事实。
 
----
+## 仓库结构
 
-## 文档导航 (Documentation)
+```text
+CommonGround/          Kernel、contracts、infra adapters、SDK helpers、服务接口与 CLI
+Integrations/nanobot/  可选的高级 runtime / companion / provisioning 集成
+examples/              BYOA、work-memory reporter、skill 与 NanoBot 示例
+docs/                  当前架构、指南、参考文档与设计材料
+tests/                 回归测试与可执行契约
+CG-Cardbox/            PostgreSQL schema 重置路径使用的 CardBox submodule
+```
 
-文档库按照**开发者认知深度**精心组织，详情请见 [`docs/CN/README.md`](docs/CN/README.md)：
+## 文档
 
-| 模块 | 核心内容 | 适合受众 |
-| :--- | :--- | :--- |
-| **🧠 核心概念** | [架构总览](docs/CN/01_getting_started/architecture_intro.md) \| [开发入口](docs/CN/01_getting_started/quick_start.md) | 初学者、架构师 |
-| **🚀 生态与开发** |[快速上手](docs/CN/01_getting_started/quick_start.md) \| [工具开发指南](docs/CN/02_building_agents/creating_tools.md) | 应用/工具开发者 |
-| **🧩 CardBox参考** | [CG-Cardbox 仓库](https://github.com/Intelligent-Internet/CG-Cardbox) | 存储层开发 |
-| **⚙️ 内核实现** | [Worker 核心循环](docs/CN/03_kernel_l1/agent_worker.md) \| [Batch 编排引擎](docs/CN/03_kernel_l1/batch_manager.md) | 系统开发者 |
-| **🔬 物理协议** |[状态机契约](docs/CN/04_protocol_l0/state_machine.md) \| [NATS 规范](docs/CN/04_protocol_l0/nats_protocol.md) | 协议设计、排障人员 |
-| **📈 运维监控** | [V1R4 发布说明](docs/CN/05_operations/v1r4_release_notes.md) \| [迁移指南](docs/CN/05_operations/migration_v1r3_to_v1r4.md) \| [OTel 链路追踪](docs/CN/05_operations/observability.md) | SRE、运维监控 |
+从这里开始：
 
----
+- [Docs index](docs/index.md)
+- [English docs](docs/en/index.md)
+- [中文文档](docs/zh/index.md)
 
-## 路线图 (Coming Soon)
+核心阅读：
 
-“单机智能体 (Single-player Agent)” 的时代已经过去，我们正在全速推进以下特性：
+1. [什么是 CommonGround Kernel](docs/zh/introduction/what-is-commonground.md)
+2. [开源快速开始指南](docs/zh/guides/open-source-quickstart.md)
+3. [Agent 集成场景](docs/zh/guides/agent-integration-scenarios.md)
+4. [发布说明](docs/zh/release-notes.md)
+5. [CLI Reference](docs/zh/reference/cli.md)
+6. [HTTP Reference](docs/zh/reference/http.md)
+7. [环境变量](docs/zh/reference/environment.md)
 
-*   **Protocol 网络升级**：
-    *   提供更灵活的拓扑原语、模式模板和观测、自优化工具：探索Agent自组织群体智能的边界
-    *   提供更多接入管道：原生支持 A2A (Agent-to-Agent)、ACP 协议以及 Simple HTTP 接入。
-    *   企业级安全：完善的多租户与细粒度 ACL 权限控制。
-    *   官方 SDK 发布，降低跨语言接入成本。
-*   **开箱即用的 UI Demos**：
-    *   开源我们内部用于 Day-to-Day 生产力构建的交互界面。
-    *   以及一些 "Purely for fun" 的社会学涌现可视化工具。
-*   **更强悍的 Function**：
-    *   引入更多高智商的 Specialized Workers。
-    *   深度集成并稳定化 Skills 与 E2B 沙箱生态。
+设计参考：
 
----
+1. [宪法](docs/zh/01-constitution.md)
+2. [三平面模型](docs/zh/02-three-plane-model.md)
+3. [设计审查原则](docs/zh/03-design-review-principles.md)
 
-## 参与共建 (Contributing)
+## 开发与测试
 
-智能体的未来属于高度结构化、具有韧性的人机共生生态。我们正在将 AI 从孤立的智能循环，进化为真正运转的组织。我们非常欢迎社区的加入！
+如果你要使用源码 checkout、开发环境以及 release/test workflows，请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-*   修改 **L2**（工具、配置、脚本）通常不需要动底层协议。
-*   修改 **L1**（Worker/PMO 逻辑）需确保核心测试链路可跑通。
-*   修改 **L0**（协议/表结构）属于 Breaking Change，请先发起 Issue / RFC 讨论。
+## 安全与凭据
 
-请在提交 PR 前阅读仓库指南（`AGENTS.md`）了解代码规范。
+CommonGround Agent credentials 是 bearer secrets。
+
+不要把真实 token、provider API keys、private DSNs、local token files、workstation paths 或 generated credential output 粘贴进 prompt、issue、PR、log、doc、manifest 或 test fixture。
+
+公开材料中请使用 placeholder：
+
+```text
+<agent_credential_token>
+postgresql://USER:PASSWORD@HOST:PORT/DBNAME
+```
+
+不要在 public issue 中报告疑似漏洞。私密报告路径见 [SECURITY.md](SECURITY.md)。
+
+## 下一步
+
+持久工作记录不是终点。它们是原材料。
+
+CommonGround 记录可以成为这些上层能力的基础：
+
+- 记忆与审查；
+- 知识蒸馏；
+- 搜索与 dossier 界面；
+- 共享工作区；
+- routines 与 playbooks；
+- 编排层；
+- 组织学习。
+
+这些更高层应该建立在稳定的公共工作事实之上，而不是脆弱的会话碎片之上。
+
+## 贡献
+
+Agent 协作的未来应该可共享、可检查、可恢复，并且在公开环境中构建。
+
+欢迎社区贡献。
+
+提交 PR 前：
+
+- 阅读 [CONTRIBUTING.md](CONTRIBUTING.md)；
+- 保持变更范围清晰；
+- 当命令、行为、公开契约或环境变量改变时同步更新文档；
+- 避免提交本地路径、生成的 runtime 输出、真实凭据、private DSNs 或个人数据库名称；
+- 将 kernel、lifecycle、semantic-record、service 与 truth-schema 改动视为高风险设计工作。
 
 ## 社区与支持
 
-*   **Discord**: [加入我们的 Discord 社区](https://discord.com/invite/intelligentinternet) 参与架构讨论。
-*   **GitHub Issues**: 发现了 Bug 或者有新功能建议？请直接 [提交 Issue](https://github.com/Intelligent-Internet/CommonGround/issues)。
+- Discord: [Join our Discord community](https://discord.com/invite/intelligentinternet)
+- Issues: [Open a GitHub issue](https://github.com/Intelligent-Internet/CommonGround/issues)
+- Security: 报告安全问题前请阅读 [SECURITY.md](SECURITY.md)
 
-## License
+## 许可证
 
-Common Ground 基于 [Apache 2.0 许可证](https://www.apache.org/licenses/LICENSE-2.0) 开源，具体见仓库根目录的 [`LICENSE`](./LICENSE) 文件。
+CommonGround Kernel 使用 [Apache License 2.0](LICENSE)。

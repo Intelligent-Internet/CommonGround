@@ -1,0 +1,11 @@
+{
+  "task": "Reply with a concise smoke-test result.",
+  "extra_args": {
+    "external_trace_id": "byoa-worker-smoke-001",
+    "caller_note": "Opaque data for the worker runtime; CommonGround does not interpret this object."
+  },
+  "instructions": {
+    "style": "concise",
+    "max_sentences": 2
+  }
+}

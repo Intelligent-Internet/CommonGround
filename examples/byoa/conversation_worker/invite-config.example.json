@@ -1,0 +1,15 @@
+{
+  "invitations": [
+    {
+      "invite_id": "invite-local-conversation",
+      "project_id": "cg-demo",
+      "issued_by_user_id": "user-123",
+      "issuer_role": "project_owner",
+      "allowed_profile_kinds": [
+        "byoa.conversation_worker.v1"
+      ],
+      "code_sha256": "sha256:<64_hex_sha256_of_invitation_code>",
+      "enabled": true
+    }
+  ]
+}

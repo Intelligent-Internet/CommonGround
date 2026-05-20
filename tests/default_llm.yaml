@@ -1,5 +1,0 @@
-llm_config:
-  model: "gemini/gemini-3-flash-preview"
-  temperature: 1.0
-  reasoning_effort: "low"
-  provider: "gemini"

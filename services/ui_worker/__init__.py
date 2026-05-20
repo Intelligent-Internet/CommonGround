@@ -1,1 +1,0 @@
-"""UI Worker service package."""

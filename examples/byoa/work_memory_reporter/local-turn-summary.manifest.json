@@ -1,0 +1,24 @@
+{
+  "kind": "agent_work_memory_report_manifest.v1",
+  "request_id": "local-agent-report-001",
+  "summary": "Local work completed and reported.",
+  "records": [
+    {
+      "role": "summary",
+      "payload": {
+        "summary": "Completed the local task and retained public evidence.",
+        "evidence": [
+          "Prepared a runtime-neutral BYOA work-memory manifest",
+          "Submitted through cg report work-memory"
+        ],
+        "producer": {
+          "component": "examples/byoa/work_memory_reporter"
+        }
+      }
+    }
+  ],
+  "final_payload": {
+    "kind": "agent_work_memory_report_result.v1",
+    "summary": "Local work-memory report submitted."
+  }
+}

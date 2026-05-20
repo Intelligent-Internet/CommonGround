@@ -1,56 +1,59 @@
-# Python
+# Python-generated files
 __pycache__/
-*.pyc
-.venv/
-venv/
-env/
-exports/
-
-#uv 
-uv.lock
-
-# Database
-*.duckdb
-*.duckdb.wal
-commonground.db
-
-# Logs
-*.log
-debug.log
-worker.log
-
-# Backups
-*.bak
-local_temp_*.*
-
-# Editor
-.vscode/
-.idea/
-.DS_Store
-node_modules/
+*.py[oc]
+build/
 dist/
+wheels/
+*.egg-info
+*.egg-info.rootbak
 
-# Submodules (managed by git, but ignore contents if untracked)
-# card-box-cg/ is a submodule
-repomix-*
-config.toml
+# Virtual environments
+.venv
 
-# Environment files
+# Local config
 .env
+*.env
+!*.env.example
+*.env.local
+env.sh
+*.local.sh
+config.toml
+config.*.toml
+*.token
+*.cgac
+*.credential
+*.credentials
+*.secret
+*.secrets
+*.log
 
-# Ground Control local demo runtime artifacts
-.gc_demo/
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.aider.tags.cache.v4/
+.uv-cache/
 
-# skills cache for local development
-skills-cache/
-secrets/
-*.png
-examples/skills
+# Local exports / analysis artifacts
+exports/
+repomix-*.xml
 
-# Report artifacts
-*.report.json
+# Runtime scratch output
+.tmp/
+tmp/
+sessions/
+memory/
+cron/
+runtime-local/
+runtime_local/
+*.payload.json
+*.runtime.json
 
-# Local build metadata
-commonground_next.egg-info/
-.opencode/
-.aider*
+# NanoBot demo workspace runtime output
+examples/nanobot/**/workspace_*/HEARTBEAT.md
+examples/nanobot/**/workspace_*/SOUL.md
+examples/nanobot/**/workspace_*/TOOLS.md
+examples/nanobot/**/workspace_*/USER.md
+examples/nanobot/**/workspace_*/cg_payload_*.json
+examples/nanobot/**/workspace_*/cg_companion/
+examples/nanobot/**/workspace_*/.nanobot_cg_companion/

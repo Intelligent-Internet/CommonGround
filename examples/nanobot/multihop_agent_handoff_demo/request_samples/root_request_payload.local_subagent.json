@@ -1,0 +1,26 @@
+{
+  "kind": "common_ground.work_order.v1",
+  "objective": "Run the local-subagent reporting smoke test. Use exactly one NanoBot local spawn subagent and do not dispatch any CommonGround child turn.",
+  "input": {
+    "requester_message": "Verify runtime-local subagent reporting.",
+    "local_subagent_smoke_test": true,
+    "fixed_subagent_output": "CG_LOCAL_SUBAGENT_FIXED_OUTPUT_V1",
+    "instructions": [
+      "Call the local spawn tool exactly once.",
+      "The spawned subagent task must be: Return exactly CG_LOCAL_SUBAGENT_FIXED_OUTPUT_V1 and nothing else.",
+      "Do not call cg_dispatch_child.",
+      "After spawning, return JSON that says the local subagent smoke test was started."
+    ]
+  },
+  "expected_output": {
+    "type": "json",
+    "instructions": "Return JSON with status=local_subagent_smoke_started and expected_subagent_output=CG_LOCAL_SUBAGENT_FIXED_OUTPUT_V1."
+  },
+  "delegation_policy": {
+    "may_delegate": false,
+    "may_use_local_subagent": true
+  },
+  "provenance": {
+    "demo": "local_subagent_reporting_smoke"
+  }
+}

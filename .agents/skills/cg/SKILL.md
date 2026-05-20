@@ -1,0 +1,1 @@
+../../../examples/skills/cg/SKILL.md
