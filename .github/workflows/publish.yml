@@ -269,6 +269,7 @@ jobs:
       - name: Sync GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: Intelligent-Internet/CommonGround
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
         run: |
           set -euo pipefail
@@ -296,18 +297,18 @@ jobs:
           }
 
           ensure_release() {
-            if retry 3 5 gh release view "$RELEASE_TAG" --json url >/dev/null; then
+            if retry 3 5 gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json url >/dev/null; then
               echo "Release ${RELEASE_TAG} already exists."
               return 0
             fi
 
-            retry 3 5 gh release create "$RELEASE_TAG" --verify-tag --generate-notes
+            retry 3 5 gh release create "$RELEASE_TAG" --repo "$GH_REPO" --verify-tag --generate-notes
           }
 
           ensure_release
 
           mapfile -t existing_assets < <(
-            retry 3 5 gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name'
+            retry 3 5 gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json assets --jq '.assets[].name'
           )
 
           for asset in dist/*.tar.gz dist/*.whl; do
@@ -317,5 +318,5 @@ jobs:
               continue
             fi
 
-            retry 3 5 gh release upload "$RELEASE_TAG" "$asset"
+            retry 3 5 gh release upload "$RELEASE_TAG" --repo "$GH_REPO" "$asset"
           done
